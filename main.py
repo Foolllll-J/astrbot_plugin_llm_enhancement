@@ -304,26 +304,26 @@ class LLMEnhancement(Star):
                         logger.warning(f"获取被回复消息详情失败: {e}") 
                 
                 if forward_id or json_extracted_texts:
-                     image_urls = []
-                     try:
-                         if forward_id:
-                             extracted_texts, image_urls = await extract_forward_content(event.bot, forward_id)
-                         else:
-                             extracted_texts = json_extracted_texts
+                    image_urls = []
+                    try:
+                        if forward_id:
+                            extracted_texts, image_urls = await extract_forward_content(event.bot, forward_id)
+                        else:
+                            extracted_texts = json_extracted_texts
                          
-                         if extracted_texts or image_urls:
-                             chat_records = "\n".join(extracted_texts)
-                             user_question = req.prompt.strip() or "请总结一下这个聊天记录"
-                             context_prompt = (
-                                 f"\n\n用户是在吐槽以下聊天记录中的内容，请根据以下聊天记录内容来响应用户的吐槽。聊天记录如下：\n"
-                                 f"--- 聊天记录开始 ---\n"
-                                 f"{chat_records}\n"
-                                 f"--- 聊天记录结束 ---"
-                             )
-                             req.prompt = user_question + context_prompt
-                             req.image_urls.extend(image_urls)
-                             logger.info(f"成功注入转发内容 ({len(extracted_texts)} 条文本) 到 LLM 请求末尾。")
-                     except Exception as e:
+                        if extracted_texts or image_urls:
+                            chat_records = "\n".join(extracted_texts)
+                            user_question = req.prompt.strip() or "请总结一下这个聊天记录"
+                            context_prompt = (
+                                f"\n\n用户是在吐槽以下聊天记录中的内容，请根据以下聊天记录内容来响应用户的吐槽。聊天记录如下：\n"
+                                f"--- 聊天记录开始 ---\n"
+                                f"{chat_records}\n"
+                                f"--- 聊天记录结束 ---"
+                            )
+                            req.prompt = user_question + context_prompt
+                            req.image_urls.extend(image_urls)
+                            logger.info(f"成功注入转发内容 ({len(extracted_texts)} 条文本, {len(image_urls)} 张图片) 到 LLM 请求末尾。")
+                    except Exception as e:  
                          logger.warning(f"内容提取失败: {e}") 
     @filter.on_llm_response(priority=20)
     async def on_llm_response(self, event: AstrMessageEvent, resp: LLMResponse):

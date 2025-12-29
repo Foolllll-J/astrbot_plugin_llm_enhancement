@@ -191,6 +191,51 @@ class LLMEnhancement(Star):
         
         return additional_components
 
+    # ==================== LLM 工具注册 ====================
+
+    @filter.llm_tool(name="get_user_avatar")
+    async def get_user_avatar(self, event: AstrMessageEvent, user_id: str) -> str:
+        """
+        获取指定 QQ 号的头像并注入到当前对话中。
+        当用户要求查看某个人的头像，或者需要根据头像信息进行识别/描述时调用。
+
+        Args:
+            user_id (str): 用户的 QQ 号。
+        """
+        # 直接使用 QQ 头像 URL
+        avatar_url = f"https://q4.qlogo.cn/headimg_dl?dst_uin={user_id}&spec=640"
+        
+        try:
+            req: ProviderRequest = getattr(event, "_provider_req", None)
+            if not req:
+                req = getattr(event, "request", None)
+            
+            if not req:
+                logger.error("无法获取当前请求对象 ProviderRequest，注入失败。")
+                return f"获取头像成功，但内部错误导致无法注入到当前请求中。"
+
+            # 1. 合并转发的 Prompt 注入逻辑
+            user_question = req.prompt.strip()
+            context_prompt = (
+                f"\n\n以下是系统为你获取到的用户 {user_id} 的头像信息，请根据该头像内容来响应用户的要求。信息如下：\n"
+                f"--- 注入内容开始 ---\n"
+                f"[图片] 用户 {user_id} 的头像已作为图片附件注入到本次请求的 image_urls 中。\n"
+                f"--- 注入内容结束 ---"
+            )
+            req.prompt = user_question + context_prompt
+
+            # 2. 合并转发的图片注入逻辑
+            req.image_urls.append(avatar_url)
+            
+            logger.info(f"成功将用户 {user_id} 的头像注入到 LLM 请求中 (Prompt + URL)。")
+            logger.info(f"当前 LLM 请求 Prompt: {req.prompt}")
+            logger.info(f"当前 LLM 请求 Image URLs: {req.image_urls}")
+
+            return f"已成功获取用户 {user_id} 的头像并注入到请求上下文中。"
+        except Exception as e:
+            logger.error(f"注入头像到请求时发生错误: {e}")
+            return f"注入头像失败: {e}"
+
     # ==================== LLM 请求级别逻辑 ====================
 
     @filter.on_llm_request(priority=100)
@@ -198,6 +243,7 @@ class LLMEnhancement(Star):
         """
         整合了 WakePro 的防护/合并与 ForwardReader 的内容提取。
         """
+        setattr(event, "_provider_req", req)
         gid: str = event.get_group_id()
         uid: str = event.get_sender_id()
         if not gid or not uid: return
@@ -274,8 +320,8 @@ class LLMEnhancement(Star):
                         reply_seg = seg 
                 
                 if not forward_id and reply_seg:
-                    try: 
-                        client = event.bot 
+                    try:
+                        client = event.bot
                         original_msg = await client.api.call_action('get_msg', message_id=reply_seg.id)
                         if original_msg and 'message' in original_msg: 
                             original_message_chain = original_msg['message'] 

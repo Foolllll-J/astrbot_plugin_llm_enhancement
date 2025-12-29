@@ -13,6 +13,7 @@ from .modules.sentiment import Sentiment
 from .modules.similarity import Similarity
 from .modules.state_manager import StateManager, MemberState, GroupState
 from .modules.forward_parser import extract_forward_content
+from .modules.info_utils import process_group_members_info
 
 # 检查是否为 aiocqhttp 平台，因为合并转发是其特性 
 try: 
@@ -235,6 +236,16 @@ class LLMEnhancement(Star):
         except Exception as e:
             logger.error(f"注入头像到请求时发生错误: {e}")
             return f"注入头像失败: {e}"
+
+    @filter.llm_tool(name="get_group_members_info")
+    async def get_group_members(self, event: AstrMessageEvent) -> str:
+        """
+        获取QQ群成员信息的LLM工具。
+        需要判断是否为群聊时，以及当需要知道群里有哪些人，或者需要获取他们的昵称和用户ID，
+        或者需要知道群里是否有特定成员时，调用此工具。其中display_name是“群昵称”，username是用户“QQ名”
+        获取数据之后需要联系上下文，用符合prompt的方式回答用户的问题。
+        """
+        return await process_group_members_info(event)
 
     # ==================== LLM 请求级别逻辑 ====================
 

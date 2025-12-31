@@ -73,6 +73,19 @@ class Similarity:
     @classmethod
     def _extract_keywords(cls, s: str, group_id: str) -> list:
         """提取关键词并更新指定群的话题缓存"""
+        if not isinstance(s, str):
+            if isinstance(s, list):
+                # 如果是列表，尝试将其中的文本部分提取并拼接
+                texts = []
+                for item in s:
+                    if isinstance(item, str):
+                        texts.append(item)
+                    elif isinstance(item, dict) and "text" in item:
+                        texts.append(item["text"])
+                s = " ".join(texts)
+            else:
+                s = str(s)
+                
         s = re.sub(r"[^\w\s\u4e00-\u9fa5]", "", s)
         words = [w for w in jieba.lcut(s) if w.strip() and w not in cls.STOP]
 

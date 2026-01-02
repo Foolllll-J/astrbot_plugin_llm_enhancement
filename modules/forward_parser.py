@@ -2,15 +2,17 @@ import json
 from typing import List, Dict, Any, Tuple
 from astrbot.api import logger
 
-async def extract_content_recursively(message_nodes: List[Dict[str, Any]], extracted_texts: list[str], image_urls: list[str], depth: int = 0):
+async def extract_content_recursively(message_nodes: List[Dict[str, Any]], extracted_texts: list[str], image_urls: list[str], video_sources: list[str], depth: int = 0):
     """
-    核心递归解析器。遍历消息节点列表，提取文本、图片，并处理嵌套的 forward 结构。
+    核心递归解析器。遍历消息节点列表，提取文本、图片、视频，并处理嵌套的 forward 结构。
     """
     indent = "  " * depth
     for message_node in message_nodes: 
-        sender_name = message_node.get("sender", {}).get("nickname", "未知用户") 
-        raw_content = message_node.get("message") or message_node.get("content", []) 
-
+        sender_name = message_node.get("sender", {}).get("nickname", "未知用户")
+        raw_content = message_node.get("message") or message_node.get("content", [])
+        
+        logger.info(f"forward_parser: 正在解析消息节点 (深度: {depth}, 发送者: {sender_name})")
+        
         content_chain = [] 
         if isinstance(raw_content, str): 
             try: 
@@ -42,10 +44,20 @@ async def extract_content_recursively(message_nodes: List[Dict[str, Any]], extra
                         if url: 
                             image_urls.append(url) 
                             node_text_parts.append("[图片]") 
+                    elif seg_type == "video":
+                        url = seg_data.get("url")
+                        file = seg_data.get("file")
+                        if url:
+                            video_sources.append(url)
+                            node_text_parts.append("[视频]")
+                        elif file:
+                            video_sources.append(file)
+                            node_text_parts.append("[视频]")
                     elif seg_type == "forward":
                         nested_content = seg_data.get("content")
                         if isinstance(nested_content, list):
-                            await extract_content_recursively(nested_content, extracted_texts, image_urls, depth + 1)
+                            logger.info(f"forward_parser: 发现嵌套转发内容 (深度: {depth + 1}, 节点数: {len(nested_content)})")
+                            await extract_content_recursively(nested_content, extracted_texts, image_urls, video_sources, depth + 1)
                         else:
                             node_text_parts.append("[转发消息内容缺失或格式错误]")
 
@@ -53,20 +65,21 @@ async def extract_content_recursively(message_nodes: List[Dict[str, Any]], extra
         if full_node_text and not has_only_forward: 
             extracted_texts.append(f"{indent}{sender_name}: {full_node_text}")
 
-async def extract_forward_content(client: Any, forward_id: str) -> Tuple[list[str], list[str]]:
+async def extract_forward_content(client: Any, forward_id: str) -> Tuple[list[str], list[str], list[str]]:
     """
-    从合并转发消息中提取内容。
+    从合并转发消息中提取内容（文本、图片、视频源）。
     """
     extracted_texts = [] 
     image_urls = []
+    video_sources = []
     try: 
         forward_data = await client.api.call_action('get_forward_msg', id=forward_id) 
     except Exception as e: 
         logger.warning(f"调用 get_forward_msg API 失败 (ID: {forward_id}): {e}") 
-        return [], [] 
+        return [], [], [] 
 
     if not forward_data or "messages" not in forward_data: 
-        return [], [] 
+        return [], [], [] 
 
-    await extract_content_recursively(forward_data["messages"], extracted_texts, image_urls, depth=0)
-    return extracted_texts, image_urls 
+    await extract_content_recursively(forward_data["messages"], extracted_texts, image_urls, video_sources, depth=0)
+    return extracted_texts, image_urls, video_sources

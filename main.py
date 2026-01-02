@@ -13,7 +13,10 @@ from .modules.sentiment import Sentiment
 from .modules.similarity import Similarity
 from .modules.state_manager import StateManager, MemberState, GroupState
 from .modules.forward_parser import extract_forward_content
+from .modules.video_parser import extract_videos_from_chain, prepare_video_context, get_video_summary, extract_forward_video_keyframes, probe_duration_sec
 from .modules.info_utils import process_group_members_info
+import os
+import shutil
 
 # 检查是否为 aiocqhttp 平台，因为合并转发是其特性 
 try: 
@@ -47,8 +50,36 @@ class LLMEnhancement(Star):
     def __init__(self, context: Context, config: AstrBotConfig): 
         super().__init__(context) 
         self.config = config
+        self.cfg = {}
+        self._refresh_config()
         self.sent = Sentiment()
         self.similarity = Similarity()
+
+    def _refresh_config(self):
+        """将 template_list 格式的配置平铺到 self.cfg 中"""
+        # 基础配置直接复制
+        for k in ["group_whitelist", "group_blacklist", "user_blacklist"]:
+            self.cfg[k] = self.config.get(k)
+        
+        # 处理 modules 字段
+        modules = self.config.get("modules", [])
+        if isinstance(modules, list):
+            for item in modules:
+                # 获取模板 key
+                template_key = item.get("__template_key")
+                if not template_key: continue
+                
+                # 将该项下的所有属性平铺到 self.cfg
+                for k, v in item.items():
+                    if k != "__template_key":
+                        self.cfg[k] = v
+        
+
+    def _get_cfg(self, key: str, default: Any = None) -> Any:
+        """获取配置项，优先从平铺后的 self.cfg 获取，否则从 self.config 获取"""
+        if key in self.cfg:
+            return self.cfg[key]
+        return self.config.get(key, default)
 
     # ==================== WakePro 消息级别逻辑 ====================
 
@@ -57,6 +88,7 @@ class LLMEnhancement(Star):
         """
         【第一层: 消息级别 - 基础检查和唤醒判断】
         """
+        self._refresh_config() # 每次处理前刷新，确保配置实时生效
         bid: str = event.get_self_id()
         gid: str = event.get_group_id()
         uid: str = event.get_sender_id()
@@ -65,16 +97,21 @@ class LLMEnhancement(Star):
 
         # 1. 全局屏蔽检查
         if uid == bid: return
-        if self.config["group_whitelist"] and gid not in self.config["group_whitelist"]: return
-        if gid in self.config["group_blacklist"] and not event.is_admin():
+        whitelist = self._get_cfg("group_whitelist")
+        if whitelist and gid not in whitelist: return
+        
+        blacklist = self._get_cfg("group_blacklist")
+        if blacklist and gid in blacklist and not event.is_admin():
             event.stop_event()
             return
-        if uid in self.config.get("user_blacklist", []):
+            
+        u_blacklist = self._get_cfg("user_blacklist")
+        if u_blacklist and uid in u_blacklist:
             event.stop_event()
             return
 
         # 2. 内置指令屏蔽
-        if self.config["block_builtin"]:
+        if self._get_cfg("block_builtin"):
             if not event.is_admin() and msg in BUILT_CMDS:
                 event.stop_event()
                 return
@@ -90,8 +127,9 @@ class LLMEnhancement(Star):
         reason = "at_or_cmd"
 
         # 特殊处理：空 @ 机器人消息
-        if wake and not msg and self.config.get("empty_mention_pt"):
-            prompt = self.config["empty_mention_pt"].format(username=event.get_sender_name())
+        empty_pt = self._get_cfg("empty_mention_pt")
+        if wake and not msg and empty_pt:
+            prompt = empty_pt.format(username=event.get_sender_name())
             yield event.request_llm(prompt=prompt)
             return
 
@@ -99,8 +137,9 @@ class LLMEnhancement(Star):
             if not wake: return # 既没说话也没被唤醒，则返回
 
         # 提及唤醒
-        if not wake and self.config["mention_wake"]:
-            names = [n for n in self.config["mention_wake"] if n]
+        mention_wake = self._get_cfg("mention_wake")
+        if not wake and mention_wake:
+            names = [n for n in mention_wake if n]
             for n in names:
                 if n and n in msg:
                     wake = True
@@ -108,8 +147,9 @@ class LLMEnhancement(Star):
                     break
 
         # 唤醒延长
-        if (not wake and self.config["wake_extend"] and 
-            (now - member.last_response) <= int(self.config["wake_extend"] or 0)):
+        wake_extend = self._get_cfg("wake_extend")
+        if (not wake and wake_extend and 
+            (now - member.last_response) <= int(wake_extend or 0)):
             if bmsgs := await self._get_history_msg(event, count=3):
                 for bmsg in bmsgs:
                     simi = self.similarity.cosine(msg, bmsg, gid)
@@ -119,30 +159,34 @@ class LLMEnhancement(Star):
                         break
 
         # 话题相关性唤醒
-        if not wake and self.config["relevant_wake"]:
+        relevant_wake = self._get_cfg("relevant_wake")
+        if not wake and relevant_wake:
             if bmsgs := await self._get_history_msg(event, count=5):
                 for bmsg in bmsgs:
                     simi = self.similarity.cosine(msg, bmsg, gid)
-                    if simi > self.config["relevant_wake"]:
+                    if simi > relevant_wake:
                         wake = True
-                        reason = f"话题相关性{simi:.2f}>{self.config['relevant_wake']}"
+                        reason = f"话题相关性{simi:.2f}>{relevant_wake}"
                         break
 
         # 答疑唤醒
-        if not wake and self.config["ask_wake"]:
-            if self.sent.ask(msg) > self.config["ask_wake"]:
+        ask_wake = self._get_cfg("ask_wake")
+        if not wake and ask_wake:
+            if self.sent.ask(msg) > ask_wake:
                 wake = True
                 reason = "答疑唤醒"
 
         # 概率唤醒
-        if not wake and self.config["prob_wake"]:
-            if random.random() < self.config["prob_wake"]:
+        prob_wake = self._get_cfg("prob_wake")
+        if not wake and prob_wake:
+            if random.random() < prob_wake:
                 wake = True
                 reason = "概率唤醒"
 
         # 违禁词检查
-        if self.config["wake_forbidden_words"]:
-            for word in self.config["wake_forbidden_words"]:
+        forbidden_words = self._get_cfg("wake_forbidden_words")
+        if forbidden_words:
+            for word in forbidden_words:
                 if not event.is_admin() and word in event.message_str:
                     event.stop_event()
                     return
@@ -156,9 +200,10 @@ class LLMEnhancement(Star):
     async def _handle_message_merge(self, event: AstrMessageEvent, req: ProviderRequest, gid: str, uid: str, member: MemberState) -> List[Any]:
         message_buffer = [event.message_str]
         # 收集第一条消息中的组件
-        additional_components = [seg for seg in event.message_obj.message if isinstance(seg, (Comp.Forward, Comp.Reply))]
+        additional_components = [seg for seg in event.message_obj.message if isinstance(seg, (Comp.Forward, Comp.Reply, Comp.Video, Comp.File))]
         
-        @session_waiter(timeout=self.config["merge_delay"], record_history_chains=False)
+        merge_delay = self._get_cfg("merge_delay")
+        @session_waiter(timeout=merge_delay, record_history_chains=False)
         async def collect_messages(controller: SessionController, ev: AstrMessageEvent):
             nonlocal message_buffer, additional_components
             if ev.get_sender_id() != uid or ev.get_group_id() != gid: return
@@ -176,10 +221,10 @@ class LLMEnhancement(Star):
             message_buffer.append(ev.message_str)
             # 收集后续消息中的组件
             for seg in ev.message_obj.message:
-                if isinstance(seg, (Comp.Forward, Comp.Reply)):
+                if isinstance(seg, (Comp.Forward, Comp.Reply, Comp.Video, Comp.File)):
                     additional_components.append(seg)
 
-            controller.keep(timeout=self.config["merge_delay"], reset_timeout=True)
+            controller.keep(timeout=merge_delay, reset_timeout=True)
         
         try:
             await collect_messages(event)
@@ -269,19 +314,21 @@ class LLMEnhancement(Star):
         if member.in_merging: return
 
         # 1. WakePro 沉默触发检测
-        if self.config["shutup"]:
+        shutup_th_cfg = self._get_cfg("shutup")
+        if shutup_th_cfg:
             shut_th = self.sent.shut(msg)
-            if shut_th > self.config["shutup"]:
-                silence_sec = shut_th * self.config["silence_multiple"]
+            if shut_th > shutup_th_cfg:
+                silence_sec = shut_th * self._get_cfg("silence_multiple", 500)
                 g.shutup_until = now + silence_sec
                 logger.info(f"群({gid})触发闭嘴，沉默{silence_sec:.1f}秒")
                 event.stop_event()
                 return
 
-        if self.config["insult"]:
+        insult_th_cfg = self._get_cfg("insult")
+        if insult_th_cfg:
             insult_th = self.sent.insult(msg)
-            if insult_th > self.config["insult"]:
-                silence_sec = insult_th * self.config["silence_multiple"]
+            if insult_th > insult_th_cfg:
+                silence_sec = insult_th * self._get_cfg("silence_multiple", 500)
                 member.silence_until = now + silence_sec
                 logger.info(f"用户({uid})触发辱骂沉默{silence_sec:.1f}秒(下次生效)")
 
@@ -293,7 +340,7 @@ class LLMEnhancement(Star):
             event.stop_event()
             return
         
-        request_cd_value = self.config.get("request_cd", 0)
+        request_cd_value = self._get_cfg("request_cd", 0)
         if request_cd_value > 0:
             if now - member.last_request < request_cd_value:
                 event.stop_event()
@@ -303,7 +350,8 @@ class LLMEnhancement(Star):
         
         # 3. WakePro 消息合并与组件收集
         all_components: List[Any] = []
-        if self.config["merge_delay"] and self.config["merge_delay"] > 0:
+        merge_delay = self._get_cfg("merge_delay")
+        if merge_delay and merge_delay > 0:
             if not member.in_merging:
                 member.in_merging = True
                 try:
@@ -312,7 +360,7 @@ class LLMEnhancement(Star):
                     member.in_merging = False
         else:
             # 不合并时，只拿当前消息的组件
-            all_components = [seg for seg in event.message_obj.message if isinstance(seg, (Comp.Forward, Comp.Reply))]
+            all_components = [seg for seg in event.message_obj.message if isinstance(seg, (Comp.Forward, Comp.Reply, Comp.Video, Comp.File))]
 
         # 4. ForwardReader 内容提取与注入
         if IS_AIOCQHTTP and isinstance(event, AiocqhttpMessageEvent):
@@ -330,6 +378,7 @@ class LLMEnhancement(Star):
                     elif isinstance(seg, Comp.Reply): 
                         reply_seg = seg 
                 
+
                 if not forward_id and reply_seg:
                     try:
                         client = event.bot
@@ -362,13 +411,81 @@ class LLMEnhancement(Star):
                 
                 if forward_id or json_extracted_texts:
                     image_urls = []
+                    forward_video_sources = []
                     try:
                         if forward_id:
-                            extracted_texts, image_urls = await extract_forward_content(event.bot, forward_id)
+                            extracted_texts, image_urls, forward_video_sources = await extract_forward_content(event.bot, forward_id)
                         else:
                             extracted_texts = json_extracted_texts
                          
-                        if extracted_texts or image_urls:
+                        if extracted_texts or image_urls or forward_video_sources:
+                            # 处理转发消息中的视频关键帧
+                            if forward_video_sources and self._get_cfg("forward_video_keyframe_enable", True):
+                                f_frames, f_cleanup, f_local_videos = await extract_forward_video_keyframes(
+                                    event,
+                                    forward_video_sources,
+                                    max_count=self._get_cfg("forward_video_max_count", 2),
+                                    ffmpeg_path=self._get_cfg("ffmpeg_path", ""),
+                                    max_mb=self._get_cfg("video_max_size_mb", 50),
+                                    max_duration=self._get_cfg("video_max_duration_sec", 120),
+                                    timeout_sec=10
+                                )
+                                if f_frames:
+                                    image_urls.extend(f_frames)
+                                    
+                                    # 处理转发视频的 ASR
+                                    if self._get_cfg("video_asr_enable", True) and f_local_videos:
+                                        for idx, lv_path in enumerate(f_local_videos):
+                                            try:
+                                                from .modules.video_parser import extract_audio_wav
+                                                wav_path = await extract_audio_wav(self._get_cfg("ffmpeg_path", ""), lv_path)
+                                                if wav_path and os.path.exists(wav_path):
+                                                    stt = None
+                                                    asr_pid = self._get_cfg("asr_provider_id")
+                                                    if asr_pid:
+                                                        try:
+                                                            all_stt = self.context.get_all_stt_providers()
+                                                            asr_pid_l = asr_pid.lower()
+                                                            for p in all_stt:
+                                                                candidates = []
+                                                                for attr in ("id", "provider_id", "name"):
+                                                                    val = getattr(p, attr, None)
+                                                                    if isinstance(val, str) and val: candidates.append(val)
+                                                                if any(str(c).lower() == asr_pid_l for c in candidates):
+                                                                    stt = p
+                                                                    break
+                                                        except: pass
+                                                    if not stt:
+                                                        try: stt = self.context.get_using_stt_provider(umo=event.unified_msg_origin)
+                                                        except: pass
+                                                    
+                                                    if stt:
+                                                        f_asr_text = None
+                                                        try:
+                                                            if hasattr(stt, "get_text"): f_asr_text = await stt.get_text(wav_path)
+                                                            elif hasattr(stt, "speech_to_text"):
+                                                                res = await stt.speech_to_text(wav_path)
+                                                                f_asr_text = res.get("text", "") if isinstance(res, dict) else str(res)
+                                                            
+                                                            if f_asr_text:
+                                                                extracted_texts.append(f" [视频语音转写 {idx+1}] {f_asr_text}")
+                                                                logger.info(f"转发视频 {idx+1} ASR 成功: {f_asr_text[:50]}...")
+                                                        except: pass
+                                                    
+                                                    try: os.remove(wav_path)
+                                                    except: pass
+                                            except: pass
+
+                                    if f_cleanup:
+                                        async def cleanup_f():
+                                            await asyncio.sleep(60)
+                                            for p in f_cleanup:
+                                                try:
+                                                    if os.path.isdir(p): shutil.rmtree(p)
+                                                    elif os.path.isfile(p): os.remove(p)
+                                                except: pass
+                                        asyncio.create_task(cleanup_f())
+
                             chat_records = "\n".join(extracted_texts)
                             user_question = req.prompt.strip() or "请总结一下这个聊天记录"
                             context_prompt = (
@@ -382,6 +499,143 @@ class LLMEnhancement(Star):
                             logger.info(f"成功注入转发内容 ({len(extracted_texts)} 条文本, {len(image_urls)} 张图片) 到 LLM 请求末尾。")
                     except Exception as e:  
                          logger.warning(f"内容提取失败: {e}") 
+
+                # 5. 视频解析增强
+                if self._get_cfg("video_detect_enable", True):
+                    video_sources = extract_videos_from_chain(all_components)
+                    
+                    # 如果当前消息没视频，尝试从被回复的消息中获取
+                    if not video_sources and reply_seg:
+                        try:
+                            client = event.bot
+                            original_msg = await client.api.call_action('get_msg', message_id=reply_seg.id)
+                            if original_msg and 'message' in original_msg:
+                                video_sources = extract_videos_from_chain(original_msg['message'])
+                        except Exception as e:
+                            logger.warning(f"video_parser: 从引用消息提取视频失败: {e}")
+                    
+                    if video_sources:
+                        try:
+                            # 探测时长（取第一个视频的）
+                            duration = 0
+                            try:
+                                duration = probe_duration_sec(self._get_cfg("ffmpeg_path", ""), video_sources[0]) or 0
+                            except: pass
+
+                            # 计算抽帧数量
+                            interval = self._get_cfg("video_frame_interval_sec", 6)
+                            if duration > 0:
+                                sample_count = max(1, int(duration / interval))
+                            else:
+                                sample_count = self._get_cfg("video_sample_count", 3)
+
+                            frames, cleanup_paths, local_video_path = await prepare_video_context(
+                                event,
+                                video_sources,
+                                max_mb=self._get_cfg("video_max_size_mb", 50),
+                                max_duration=self._get_cfg("video_max_duration_sec", 120),
+                                sample_count=sample_count,
+                                ffmpeg_path=self._get_cfg("ffmpeg_path", ""),
+                                process_timeout=30
+                            )
+                            
+                            if frames:
+                                # 可选 ASR：由 video_asr_enable + asr_provider_id 控制
+                                asr_text = None
+                                if self._get_cfg("video_asr_enable", True) and local_video_path:
+                                    logger.info(f"video_parser: ASR enabled, starting processing for {local_video_path}")
+                                    try:
+                                        from .modules.video_parser import extract_audio_wav
+                                        wav_path = await extract_audio_wav(self._get_cfg("ffmpeg_path", ""), local_video_path)
+                                        if wav_path and os.path.exists(wav_path):
+                                            # 选择 ASR Provider
+                                            stt = None
+                                            asr_pid = self._get_cfg("asr_provider_id")
+                                            if asr_pid:
+                                                try:
+                                                    all_p = self.context.get_all_stt_providers()
+                                                    asr_pid_l = asr_pid.lower()
+                                                    for p in all_p:
+                                                        candidates = []
+                                                        for attr in ("id", "provider_id", "name"):
+                                                            val = getattr(p, attr, None)
+                                                            if isinstance(val, str) and val: candidates.append(val)
+                                                        if any(str(c).lower() == asr_pid_l for c in candidates):
+                                                            stt = p
+                                                            break
+                                                except: pass
+                                            
+                                            if not stt:
+                                                try:
+                                                    stt = self.context.get_using_stt_provider(umo=event.unified_msg_origin)
+                                                except: pass
+                                            
+                                            if stt:
+                                                try:
+                                                    if hasattr(stt, "get_text"):
+                                                        asr_text = await stt.get_text(wav_path)
+                                                    elif hasattr(stt, "speech_to_text"):
+                                                        res = await stt.speech_to_text(wav_path)
+                                                        asr_text = res.get("text", "") if isinstance(res, dict) else str(res)
+                                                    
+                                                    if asr_text:
+                                                        logger.info(f"video_parser: ASR 成功: {asr_text[:50]}...")
+                                                except Exception as e:
+                                                    logger.warning(f"video_parser: ASR 调用失败: {e}")
+                                            else:
+                                                logger.warning("video_parser: ASR enabled but no STT provider found.")
+                                            
+                                            try: os.remove(wav_path)
+                                            except: pass
+                                        else:
+                                            logger.warning("video_parser: ASR failed to extract audio wav.")
+                                    except Exception as e:
+                                        logger.warning(f"video_parser: ASR 处理失败: {e}")
+                                else:
+                                    logger.info("video_parser: ASR disabled or no local video path available.")
+
+                                # 逐帧描述 -> 汇总文本
+                                summary = await get_video_summary(
+                                    self.context,
+                                    event,
+                                    frames,
+                                    duration=duration,
+                                    video_name="用户发送的视频",
+                                    image_provider_id=self._get_cfg("image_provider_id"),
+                                    asr_text=asr_text
+                                )
+                                
+                                if summary:
+                                    logger.info(f"video_parser: 视频总结完成: {summary}")
+                                    user_question = req.prompt.strip()
+                                    context_prompt = (
+                                        f"\n\n以下是系统为你分析的视频内容总结，请结合此总结来响应用户的要求。信息如下：\n"
+                                        f"--- 注入内容开始 ---\n"
+                                        f"[视频总结] {summary}\n"
+                                        f"--- 注入内容结束 ---"
+                                    )
+                                    req.prompt = user_question + context_prompt
+                                    logger.info(f"成功注入视频总结到 LLM 请求。")
+                                else:
+                                    logger.warning("video_parser: 视频总结为空")
+                                    # 回退到直接注入图片帧（或者报错）
+                                    req.image_urls.extend(frames)
+                                    logger.info(f"视频总结失败，回退到直接注入视频帧 ({len(frames)} 张图片)。")
+                                
+                                # 注册清理任务
+                                if cleanup_paths:
+                                    async def cleanup():
+                                        await asyncio.sleep(60) # 延迟清理，给 LLM 留出读取时间
+                                        for p in cleanup_paths:
+                                            try:
+                                                if os.path.isdir(p): shutil.rmtree(p)
+                                                elif os.path.isfile(p): os.remove(p)
+                                            except: pass
+                                    asyncio.create_task(cleanup())
+                        except Exception as e:
+                            logger.warning(f"视频解析失败: {e}")
+
+
     @filter.on_llm_response(priority=20)
     async def on_llm_response(self, event: AstrMessageEvent, resp: LLMResponse):
         gid: str = event.get_group_id()

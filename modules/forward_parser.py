@@ -11,7 +11,7 @@ async def extract_content_recursively(message_nodes: List[Dict[str, Any]], extra
         sender_name = message_node.get("sender", {}).get("nickname", "未知用户")
         raw_content = message_node.get("message") or message_node.get("content", [])
         
-        logger.info(f"forward_parser: 正在解析消息节点 (深度: {depth}, 发送者: {sender_name})")
+        logger.debug(f"forward_parser: 正在解析消息节点 (深度: {depth}, 发送者: {sender_name})")
         
         content_chain = [] 
         if isinstance(raw_content, str): 

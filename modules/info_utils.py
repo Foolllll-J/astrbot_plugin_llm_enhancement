@@ -82,3 +82,62 @@ async def process_group_members_info(event: AstrMessageEvent) -> str:
         elapsed_time = time.time() - start_time 
         logger.info(f"获取群成员信息时发生错误: {e}，耗时 {elapsed_time:.2f}s") 
         return json.dumps({"error": f"获取群成员信息时发生内部错误: {str(e)}"})
+
+async def set_group_ban_logic(event: AstrMessageEvent, user_id: str, duration: int, user_name: str) -> str:
+    """
+    在群聊中禁言某用户的逻辑。
+    """
+    try:
+        # 1. 平台和环境检查
+        if not IS_AIOCQHTTP or not isinstance(event, AiocqhttpMessageEvent):
+            return json.dumps({
+                "success": False,
+                "message": "此功能仅支持 QQ 平台 (aiocqhttp)。"
+            }, ensure_ascii=False)
+
+        group_id = event.get_group_id()
+        if not group_id:
+            return json.dumps({
+                "success": False,
+                "message": "此工具只能在群聊中使用。"
+            }, ensure_ascii=False)
+
+        # 2. 权限检查：仅限 Bot 管理员或 Bot 自身调用
+        sender_id = event.get_sender_id()
+        self_id = event.get_self_id()
+        
+        if sender_id != self_id and not event.is_admin():
+            logger.warning(f"用户 {sender_id} 尝试使用禁言工具，但权限不足。")
+            return json.dumps({
+                "success": False,
+                "message": "权限不足。只有 Bot 管理员可以执行禁言操作。"
+            }, ensure_ascii=False)
+
+        # 3. 执行禁言
+        client = event.bot
+        params = {
+            "group_id": int(group_id),
+            "user_id": int(user_id),
+            "duration": duration
+        }
+        
+        await client.api.call_action('set_group_ban', **params)
+        
+        logger.info(f"管理员 {event.get_sender_id()} 通过工具禁言了用户 {user_id} ({user_name})，时长 {duration} 秒。")
+        
+        return json.dumps({
+            "success": True,
+            "message": f"用户 {user_name} ({user_id}) 已被禁言 {duration} 秒。",
+            "user_id": user_id,
+            "user_name": user_name,
+            "duration": duration,
+            "timestamp": int(time.time())
+        }, ensure_ascii=False, indent=2)
+
+    except Exception as e:
+        logger.error(f"禁言用户 {user_id} 失败: {e}")
+        return json.dumps({
+            "success": False,
+            "message": f"操作失败：无法禁言用户 {user_name}",
+            "error": str(e)
+        }, ensure_ascii=False, indent=2)

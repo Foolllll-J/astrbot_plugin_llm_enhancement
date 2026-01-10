@@ -26,7 +26,7 @@ from .modules.video_parser import (
     VideoFrameProcessor,
     is_gif_file
 )
-from .modules.info_utils import process_group_members_info
+from .modules.info_utils import process_group_members_info, set_group_ban_logic
 import os
 import shutil
 from pathlib import Path
@@ -286,7 +286,19 @@ class LLMEnhancement(Star):
         """
         return await process_group_members_info(event)
 
-    # ==================== 【核心】媒体场景判断 ====================
+    @filter.llm_tool(name="set_group_ban")
+    async def set_group_ban(self, event: AstrMessageEvent, user_id: str, duration: int, user_name: str) -> str:
+        """
+        在群聊中禁言某用户。被禁言的用户在禁言期间将无法发送消息。
+        
+        Args:
+            user_id (str): 被禁言用户的 QQ 号。
+            duration (int): 禁言时长（秒），0 表示取消禁言。
+            user_name (str): 被禁言用户的昵称。
+        """
+        return await set_group_ban_logic(event, user_id, duration, user_name)
+
+    # ==================== LLM 请求级别逻辑 ====================
     
     async def _detect_media_scenario(self, req: ProviderRequest, video_sources: List[str] = None, reply_seg: Optional[Comp.Reply] = None) -> MediaContext:
         """

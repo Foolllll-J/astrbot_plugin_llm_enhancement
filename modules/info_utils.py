@@ -102,15 +102,21 @@ async def set_group_ban_logic(event: AstrMessageEvent, user_id: str, duration: i
                 "message": "此工具只能在群聊中使用。"
             }, ensure_ascii=False)
 
-        # 2. 权限检查：仅限 Bot 管理员或 Bot 自身调用
-        sender_id = event.get_sender_id()
-        self_id = event.get_self_id()
+        # 2. 权限检查
+        sender_id = str(event.get_sender_id())
+        self_id = str(event.get_self_id())
+        is_admin = event.is_admin()
         
-        if sender_id != self_id and not event.is_admin():
-            logger.warning(f"用户 {sender_id} 尝试使用禁言工具，但权限不足。")
+        # 1. 如果是管理员在操作，允许
+        # 2. 如果是 Bot 自身发起的决策（针对当前对话者），允许（即 target_id == sender_id，即“自卫”逻辑）
+        # 3. 如果是 Bot 自身 ID 发起的调用，允许
+        is_self_defense = (str(user_id) == sender_id)
+        
+        if not is_admin and not is_self_defense and sender_id != self_id:
+            logger.warning(f"用户 {sender_id} 尝试禁言 {user_id}，权限不足。")
             return json.dumps({
                 "success": False,
-                "message": "权限不足。只有 Bot 管理员可以执行禁言操作。"
+                "message": f"权限不足。只有管理员可以执行对他人的禁言操作。您的 ID: {sender_id}"
             }, ensure_ascii=False)
 
         # 3. 执行禁言
@@ -123,7 +129,8 @@ async def set_group_ban_logic(event: AstrMessageEvent, user_id: str, duration: i
         
         await client.api.call_action('set_group_ban', **params)
         
-        logger.info(f"管理员 {event.get_sender_id()} 通过工具禁言了用户 {user_id} ({user_name})，时长 {duration} 秒。")
+        operator_title = "管理员" if is_admin else "机器人"
+        logger.info(f"{operator_title} {sender_id} 通过工具禁言了用户 {user_id} ({user_name})，时长 {duration} 秒。")
         
         return json.dumps({
             "success": True,

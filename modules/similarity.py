@@ -1,164 +1,214 @@
-import math
-import jieba
-from collections import defaultdict, deque
-import re
+# \modules\similarity.py
 
+import math
+import re
+from collections import defaultdict, deque
+from typing import Any, List, Dict, Optional
+
+import jieba
 
 class Similarity:
-    """按群号隔离的动态话题关联性检测器"""
+    """
+    最终稳定版话题相关性检测
+    - 群号隔离
+    - TF-IDF 稳定无膨胀
+    - 内置 bot 消息预处理（去噪、去重、过滤模板）
+    """
 
-    # 基础停用词表
-    STOP = {
-        "的",
-        "了",
-        "在",
-        "是",
-        "和",
-        "与",
-        "或",
-        "这",
-        "那",
-        "我",
-        "你",
-        "他",
-        "她",
-        "它",
-        "啊",
-        "吧",
-        "吗",
-        "嘛",
-    }
+    def __init__(
+        self,
+        history_limit: int = 120,
+        stopwords=None,
+        bot_template_threshold: int = 2,
+        early_stop: float = 0.92,
+    ):
+        """
+        :param history_limit: 每个群最大历史窗口
+        :param stopwords: 停用词
+        :param bot_template_threshold: bot token 数 ≤ N 时视为模板句
+        :param early_stop: 若相似度超该值，提前返回
+        """
+        self._GROUP_DATA = defaultdict(
+            lambda: {
+                "history": deque(maxlen=history_limit),
+                "idf": defaultdict(int),
+                "total_docs": 0,
+            }
+        )
 
-    # 每个群维护自己的状态
-    _GROUP_DATA = defaultdict(
-        lambda: {
-            "cache": deque(maxlen=20),
-            "weights": defaultdict(float),
+        self.stopwords = stopwords or {
+            "的", "了", "吗", "吧", "啊", "哦", "嗯", "恩",
+            "你", "我", "他", "她", "它", "这", "那", "就",
+            "都", "又",
         }
-    )
-    DECAY_FACTOR = 0.95  # 权重衰减因子（全局统一）
 
+        self.bot_template_threshold = bot_template_threshold
+        self.early_stop = early_stop
 
-    # 内部工具
-    @classmethod
-    def _state(cls, group_id: str):
-        """根据群号拿到该群的独立数据"""
-        return cls._GROUP_DATA[group_id]
+    def _to_plain_text(self, msg: Any) -> str:
+        """将消息（可能是字符串、列表或字典）转换为纯文本"""
+        if isinstance(msg, str):
+            return msg
+        if isinstance(msg, list):
+            texts = []
+            for item in msg:
+                if isinstance(item, str):
+                    texts.append(item)
+                elif isinstance(item, dict) and "text" in item:
+                    texts.append(item["text"])
+                elif hasattr(item, "text"): # 处理可能的消息对象
+                    texts.append(getattr(item, "text"))
+            return " ".join(texts)
+        return str(msg)
 
-    @classmethod
-    def _update_topic_cache(cls, words, group_id: str):
-        """更新指定群的话题缓存和权重"""
-        st = cls._state(group_id)
+    # ---------------------------------------------------------
+    # 分词
+    # ---------------------------------------------------------
+    def _tokenize(self, text: Any):
+        text = self._to_plain_text(text)
+        text = re.sub(r"[^\w\u4e00-\u9fa5]", " ", text)
+        tokens = jieba.lcut(text)
+        return [t for t in tokens if t not in self.stopwords and t.strip()]
 
-        # 更新缓存
-        for word in words:
-            if (
-                word not in cls.STOP
-                and len(word) > 1
-                and re.match(r"^[\u4e00-\u9fa5]+$", word)
-            ):
-                st["cache"].append(word) # type: ignore
+    # ---------------------------------------------------------
+    # 噪音检测（表情、纯符号、纯引用等）
+    # ---------------------------------------------------------
+    def _is_noise_msg(self, text: Any) -> bool:
+        s = self._to_plain_text(text).strip()
 
-        # 计算频率
-        freq = defaultdict(int)
-        for w in st["cache"]:
-            freq[w] += 1
+        # 空消息
+        if not s:
+            return True
 
-        # 更新权重
-        for w, cnt in freq.items():
-            decayed = st["weights"].get(w, 0) * cls.DECAY_FACTOR  # type: ignore
-            current = cnt * (1.0 + math.log(len(w) or 1))
-            st["weights"][w] = max(decayed, current)
+        # 纯 CQ 码，如 [CQ:reply,id=xxx]
+        if re.fullmatch(r"\[CQ:[^\]]+]", s):
+            return True
 
-    @classmethod
-    def _extract_keywords(cls, s: str, group_id: str) -> list:
-        """提取关键词并更新指定群的话题缓存"""
-        if not isinstance(s, str):
-            if isinstance(s, list):
-                # 如果是列表，尝试将其中的文本部分提取并拼接
-                texts = []
-                for item in s:
-                    if isinstance(item, str):
-                        texts.append(item)
-                    elif isinstance(item, dict) and "text" in item:
-                        texts.append(item["text"])
-                s = " ".join(texts)
-            else:
-                s = str(s)
-                
-        s = re.sub(r"[^\w\s\u4e00-\u9fa5]", "", s)
-        words = [w for w in jieba.lcut(s) if w.strip() and w not in cls.STOP]
+        # 纯 emoji / 符号
+        if re.fullmatch(r"[\W_]+", s):
+            return True
 
-        # 合并连续数字/单字
-        merged = []
-        for w in words:
-            if merged and (
-                (w.isdigit() and merged[-1][-1].isdigit())
-                or (len(merged[-1]) == 1 and len(w) == 1)
-            ):
-                merged[-1] += w
-            else:
-                merged.append(w)
+        # 纯数字和标点（如“123。。。!!”）
+        if re.fullmatch(r"[\d\W_]+", s):
+            return True
 
-        cls._update_topic_cache(merged, group_id)
-        return merged
+        return False
 
+    # ---------------------------------------------------------
+    # bot 消息预处理
+    # ---------------------------------------------------------
+    def _preprocess_bot_msgs(self, msgs: list) -> list[str]:
+        cleaned = []
+        seen = set()
 
-    # 公共 API
-    @classmethod
-    def _tokens(cls, s: str, group_id: str) -> dict[str, float]:
-        """生成带权重的词向量（群内）"""
-        words = cls._extract_keywords(s, group_id)
-        st = cls._state(group_id)
-        tf = defaultdict(float)
+        for m_raw in msgs:
+            if not m_raw:
+                continue
+            
+            m = self._to_plain_text(m_raw)
 
-        # 一元词
-        for w in words:
-            weight = 1.0 + st["weights"].get(w, 0)  # type: ignore
-            tf[w] += weight
+            # 去重
+            if m in seen:
+                continue
+            seen.add(m)
 
-        # 二元词
-        for i in range(len(words) - 1):
-            bigram = words[i] + words[i + 1]
-            tf[bigram] += 1.5
+            # 噪音过滤
+            if self._is_noise_msg(m):
+                continue
 
-        total = max(sum(tf.values()), 1)
-        return {w: c / total for w, c in tf.items()}
+            # token 数过滤（模板句过滤）
+            tokens = self._tokenize(m)
+            if len(tokens) <= self.bot_template_threshold:
+                continue
 
-    @classmethod
-    def cosine(cls, a: str, b: str, group_id: str = "default") -> float:
-        """计算同一群内两条文本的相似度"""
-        v1 = cls._tokens(a, group_id)
-        v2 = cls._tokens(b, group_id)
-        all_w = set(v1) | set(v2)
+            cleaned.append(m)
 
-        dot = 0
-        for w in all_w:
-            x, y = v1.get(w, 0), v2.get(w, 0)
-            if x > 0 and y > 0:
-                dot += x * y * (2.0 + cls._state(group_id)["weights"].get(w, 0))  # type: ignore
-            else:
-                dot += x * y
+        return cleaned
 
+    # ---------------------------------------------------------
+    # TF-IDF 构建
+    # ---------------------------------------------------------
+    def _update_idf(self, group_id: str, tokens: set):
+        data = self._GROUP_DATA[group_id]
+        for t in tokens:
+            data["idf"][t] += 1 # type: ignore
+        data["total_docs"] += 1  # type: ignore
+
+    def _tfidf_vector(self, group_id: str, tokens: list):
+        data = self._GROUP_DATA[group_id]
+        total_docs = data["total_docs"] or 1
+
+        tf = defaultdict(int)
+        for t in tokens:
+            tf[t] += 1
+
+        vec = {}
+        for t, c in tf.items():
+            idf = math.log((total_docs + 1) / (data["idf"][t] + 1)) + 1  # type: ignore
+            vec[t] = c * idf
+
+        return vec
+
+    # ---------------------------------------------------------
+    # Cosine
+    # ---------------------------------------------------------
+    def _cosine(self, v1, v2):
+        if not v1 or not v2:
+            return 0.0
+
+        dot = sum(v * v2.get(k, 0) for k, v in v1.items())
         norm1 = math.sqrt(sum(v * v for v in v1.values()))
         norm2 = math.sqrt(sum(v * v for v in v2.values()))
-        raw = dot / (norm1 * norm2 + 1e-8)
-        return 1 / (1 + math.exp(-8 * (raw - 0.6)))
 
-    @classmethod
-    def get_current_topics(cls, group_id: str = "default", top_n: int = 5):
-        """获取指定群当前最重要的 top_n 个话题"""
-        st = cls._state(group_id)
-        return sorted(st["weights"].items(), key=lambda kv: kv[1], reverse=True)[:top_n]  # type: ignore
+        if norm1 == 0 or norm2 == 0:
+            return 0.0
 
+        return dot / (norm1 * norm2)
 
-    # 管理工具（可选）
-    @classmethod
-    def clear_group(cls, group_id: str):
-        """清空某个群的所有话题数据"""
-        cls._GROUP_DATA.pop(group_id, None)
+    # ---------------------------------------------------------
+    # 主接口
+    # ---------------------------------------------------------
+    def similarity(
+        self,
+        group_id: str,
+        user_msg: str,
+        bot_msgs: list[str],
+        update_history: bool = True,
+    ) -> float:
+        """
+        计算用户消息与一组 bot 消息的最大相似度
+        """
+        # 分词
+        user_tokens = self._tokenize(user_msg)
+        if not user_tokens:
+            return 0.0
 
-    @classmethod
-    def list_groups(cls):
-        """返回当前有数据的群号列表"""
-        return list(cls._GROUP_DATA.keys())
+        # 更新历史（可关闭）
+        if update_history:
+            # entry = " ".join(user_tokens)
+            # self._GROUP_DATA[group_id]["history"].append(entry)  # type: ignore
+            self._update_idf(group_id, set(user_tokens))
+
+        # 用户向量
+        user_vec = self._tfidf_vector(group_id, user_tokens)
+
+        # bot 消息预处理 + 最近优先
+        bot_list = self._preprocess_bot_msgs(bot_msgs)[::-1]
+
+        best = 0.0
+        for bm in bot_list:
+            bm_tokens = self._tokenize(bm)
+            if not bm_tokens:
+                continue
+
+            bm_vec = self._tfidf_vector(group_id, bm_tokens)
+
+            sim = self._cosine(user_vec, bm_vec)
+            if sim > best:
+                best = sim
+
+            # 提前返回
+            if sim >= self.early_stop:
+                return sim
+
+        return best

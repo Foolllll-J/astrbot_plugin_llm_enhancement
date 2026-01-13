@@ -153,23 +153,19 @@ class LLMEnhancement(Star):
         if (not wake and wake_extend and 
             (now - member.last_response) <= int(wake_extend or 0)):
             if bmsgs := await self._get_history_msg(event, count=3):
-                for bmsg in bmsgs:
-                    simi = self.similarity.cosine(msg, bmsg, gid)
-                    if simi > 0.3:
-                        wake = True
-                        reason = f"唤醒延长(相关性{simi:.2f})"
-                        break
+                simi = self.similarity.similarity(gid, msg, bmsgs)
+                if simi > 0.3:
+                    wake = True
+                    reason = f"唤醒延长(相关性{simi:.2f})"
 
         # 话题相关性唤醒
         relevant_wake = self._get_cfg("relevant_wake")
         if not wake and relevant_wake:
             if bmsgs := await self._get_history_msg(event, count=5):
-                for bmsg in bmsgs:
-                    simi = self.similarity.cosine(msg, bmsg, gid)
-                    if simi > relevant_wake:
-                        wake = True
-                        reason = f"话题相关性{simi:.2f}>{relevant_wake}"
-                        break
+                simi = self.similarity.similarity(gid, msg, bmsgs)
+                if simi > relevant_wake:
+                    wake = True
+                    reason = f"话题相关性{simi:.2f}>{relevant_wake}"
 
         # 答疑唤醒
         ask_wake = self._get_cfg("ask_wake")

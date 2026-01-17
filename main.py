@@ -4,7 +4,7 @@ import time
 import random
 from typing import List, Dict, Any, Optional, Tuple 
 from astrbot.api.event import filter, AstrMessageEvent
-from astrbot.api.star import Context, Star, register
+from astrbot.api.star import Context, Star, register, StarTools
 from astrbot.api import logger, AstrBotConfig 
 import astrbot.api.message_components as Comp 
 from astrbot.api. provider import LLMResponse, ProviderRequest 
@@ -26,15 +26,69 @@ from .modules.video_parser import (
     VideoFrameProcessor,
     is_gif_file
 )
-from .modules.info_utils import process_group_members_info, set_group_ban_logic
 import os
 import shutil
+import aiosqlite
+from datetime import datetime
 from pathlib import Path
+from .modules.info_utils import process_group_members_info, set_group_ban_logic
 try:
-    from astrbot.core.platform. sources. aiocqhttp. aiocqhttp_message_event import AiocqhttpMessageEvent 
-    IS_AIOCQHTTP = True 
+    from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import AiocqhttpMessageEvent
+    IS_AIOCQHTTP = True
 except ImportError:
-    IS_AIOCQHTTP = False 
+    IS_AIOCQHTTP = False
+
+# ==================== 黑名单插件桥接 ====================
+
+def _get_blacklist_db_path() -> Optional[Path]:
+    """获取黑名单插件数据库路径"""
+    try:
+        target_data_dir = StarTools.get_data_dir("astrbot_plugin_blacklist_tools")
+        db_path = Path(target_data_dir) / "blacklist.db"
+        
+        if db_path.exists():
+            return db_path
+        else:
+            logger.debug(f"[LLMEnhancement] 未找到黑名单数据库。目标路径: {db_path}")
+    except Exception as e:
+        logger.error(f"[LLMEnhancement] 获取黑名单插件数据目录失败: {e}")
+    return None
+
+async def is_user_blacklisted_via_blacklist_plugin(user_id: str) -> bool:
+    """通过黑名单插件查询用户是否在黑名单中"""
+    db_path = _get_blacklist_db_path()
+    if db_path is None:
+        return False
+        
+    try:
+        async with aiosqlite.connect(str(db_path)) as db:
+            cursor = await db.execute(
+                "SELECT * FROM blacklist WHERE user_id = ?", 
+                (user_id,)
+            )
+            user = await cursor.fetchone()
+            if user:
+                # user[2] 是 expire_time
+                expire_time_str = user[2]
+                if expire_time_str:
+                    try:
+                        expire_datetime = datetime.fromisoformat(expire_time_str)
+                        if datetime.now() > expire_datetime:
+                            # 已过期，逻辑上不视为黑名单（由原插件负责删除）
+                            return False
+                        else:
+                            logger.info(f"[LLMEnhancement] 用户 {user_id} 在黑名单中 (到期时间: {expire_time_str})")
+                            return True
+                    except ValueError:
+                        return True
+                else:
+                    # expire_time 为空表示永久黑名单
+                    logger.info(f"[LLMEnhancement] 用户 {user_id} 在永久黑名单中")
+                    return True
+            return False
+    except Exception as e:
+        logger.error(f"[LLMEnhancement] 查询 blacklist 插件数据库失败: {e}")
+        return False
 
 # ==================== 常量定义 ====================
 
@@ -97,6 +151,11 @@ class LLMEnhancement(Star):
 
         # 1. 全局屏蔽检查
         if uid == bid: return
+        
+        # 1.0 黑名单插件拦截
+        if await is_user_blacklisted_via_blacklist_plugin(uid):
+            event.stop_event()
+            return
         whitelist = self._get_cfg("group_whitelist")
         if whitelist and gid not in whitelist:
             return

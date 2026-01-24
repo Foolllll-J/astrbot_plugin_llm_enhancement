@@ -7,18 +7,16 @@ from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.star import Context, Star, register, StarTools
 from astrbot.api import logger, AstrBotConfig 
 import astrbot.api.message_components as Comp 
-from astrbot.api. provider import LLMResponse, ProviderRequest 
-from astrbot.core.utils. session_waiter import session_waiter, SessionController
-from . modules.sentiment import Sentiment
+from astrbot.api.provider import LLMResponse, ProviderRequest 
+from astrbot.core.utils.session_waiter import session_waiter, SessionController
+from .modules.sentiment import Sentiment
 from .modules.similarity import Similarity
-from .modules. state_manager import StateManager, MemberState, GroupState
+from .modules.state_manager import StateManager, MemberState, GroupState
 from .modules.forward_parser import extract_forward_content
 from .modules.video_parser import (
     extract_videos_from_chain, 
-    prepare_video_context, 
     extract_forward_video_keyframes, 
     probe_duration_sec,
-    sample_frames_equidistant,
     download_video_to_temp,
     extract_audio_wav,
     MediaScenario,
@@ -138,15 +136,15 @@ class LLMEnhancement(Star):
         return self.config.get(key, default)
 
     # ==================== WakePro 消息级别逻辑 ====================
-
-    @filter. event_message_type(filter. EventMessageType.GROUP_MESSAGE, priority=1)
+    
+    @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE, priority=1)
     async def on_group_msg(self, event: AstrMessageEvent):
-        """【第一层:  消息级别 - 基础检查和唤醒判断】"""
+        """处理群消息的初步过滤、黑白名单检查及唤醒逻辑。"""
         self._refresh_config()
-        bid:  str = event.get_self_id()
+        bid: str = event.get_self_id()
         gid: str = event.get_group_id()
         uid: str = event.get_sender_id()
-        msg:  str = event.message_str. strip() if event.message_str else ""
+        msg: str = event.message_str.strip() if event.message_str else ""
         g = StateManager.get_group(gid)
 
         # 1. 全局屏蔽检查
@@ -189,7 +187,7 @@ class LLMEnhancement(Star):
         # 特殊处理：空 @ 机器人消息
         empty_pt = self._get_cfg("empty_mention_pt")
         if wake and not msg and empty_pt:
-            prompt = empty_pt. format(username=event.get_sender_name())
+            prompt = empty_pt.format(username=event.get_sender_name())
             yield event.request_llm(prompt=prompt)
             return
 
@@ -229,7 +227,7 @@ class LLMEnhancement(Star):
         # 答疑唤醒
         ask_wake = self._get_cfg("ask_wake")
         if not wake and ask_wake:  
-            if self. sent.ask(msg) > ask_wake:
+            if self.sent.ask(msg) > ask_wake:
                 wake = True
                 reason = "答疑唤醒"
 
@@ -250,22 +248,33 @@ class LLMEnhancement(Star):
 
         if wake:
             event.is_at_or_wake_command = True
-            logger.info(f"群({gid})用户({uid}) {reason}:  {msg[: 50]}")
+            logger.info(f"群({gid})用户({uid}) {reason}: {msg[:50]}")
 
     # ==================== 消息合并处理 ====================
     
     async def _handle_message_merge(self, event: AstrMessageEvent, req: ProviderRequest, gid: str, uid: str, member: MemberState) -> List[Any]:
-        message_buffer = [event.message_str]
-        additional_components = [seg for seg in event.message_obj.message if isinstance(seg, (Comp. Forward, Comp.Reply, Comp.Video, Comp.File))]
+        """执行消息合并逻辑，根据配置决定是否收集多用户消息并格式化。"""
+        # buffer 结构: List[Tuple[sender_name, message_str]]
+        message_buffer = [(event.get_sender_name(), event.message_str)]
+        additional_components = [seg for seg in event.message_obj.message if isinstance(seg, (Comp.Forward, Comp.Reply, Comp.Video, Comp.File))]
         
         merge_delay = self._get_cfg("merge_delay")
+        allow_multi_user = self._get_cfg("merge_multi_user")
+
         @session_waiter(timeout=merge_delay, record_history_chains=False)
         async def collect_messages(controller: SessionController, ev: AstrMessageEvent):
             nonlocal message_buffer, additional_components
-            if ev.get_sender_id() != uid or ev.get_group_id() != gid:
+            
+            # 基础检查：必须是同个群
+            if ev.get_group_id() != gid:
+                return
+
+            # 如果不允许跨用户合并，则检查发送者是否一致
+            if not allow_multi_user and ev.get_sender_id() != uid:
                 return
             
-            if len(message_buffer) == 1 and ev.message_str == message_buffer[0]:  
+            # 去重：如果只有一条且内容相同（防止重复触发）
+            if len(message_buffer) == 1 and ev.message_str == message_buffer[0][1] and ev.get_sender_id() == uid:  
                 ev.stop_event()
                 return
             
@@ -275,7 +284,7 @@ class LLMEnhancement(Star):
                 controller.stop()
                 return
             
-            message_buffer.append(ev.message_str)
+            message_buffer.append((ev.get_sender_name(), ev.message_str))
             for seg in ev.message_obj.message:
                 if isinstance(seg, (Comp.Forward, Comp.Reply, Comp.Video, Comp.File)):
                     additional_components.append(seg)
@@ -286,10 +295,19 @@ class LLMEnhancement(Star):
             await collect_messages(event)
         except TimeoutError:
             if len(message_buffer) > 1:
-                merged_msg = " ".join(message_buffer)
+                # 检查是否涉及多个用户
+                senders = set(name for name, _ in message_buffer)
+                
+                if len(senders) > 1:
+                    # 多人模式：[用户A]: 消息1 \n [用户B]: 消息2
+                    merged_msg = "\n".join([f"[{name}]: {msg}" for name, msg in message_buffer])
+                else:
+                    # 单人模式：直接空格连接
+                    merged_msg = " ".join([msg for _, msg in message_buffer])
+
                 event.message_str = merged_msg
                 req.prompt = merged_msg
-                logger.info(f"合并：用户({uid})合并了{len(message_buffer)}条消息")
+                logger.info(f"合并：用户({uid})触发，共合并了{len(message_buffer)}条消息 (涉及{len(senders)}人)")
         
         return additional_components
 
@@ -460,10 +478,10 @@ class LLMEnhancement(Star):
     # ==================== LLM 请求级别逻辑 ====================
 
     @filter.on_llm_request(priority=15)
-    async def on_llm_request(self, event:  AstrMessageEvent, req: ProviderRequest):
-        """整合了 WakePro 的防护/合并与 ForwardReader 的内容提取。"""
+    async def on_llm_request(self, event: AstrMessageEvent, req: ProviderRequest):
+        """在请求发送给 LLM 前执行，处理防护、合并及多媒体注入。"""
         setattr(event, "_provider_req", req)
-        gid:  str = event.get_group_id()
+        gid: str = event.get_group_id()
         uid: str = event.get_sender_id()
         if not gid or not uid:
             return
@@ -803,9 +821,10 @@ class LLMEnhancement(Star):
         
         return None
 
-    @filter. on_llm_response(priority=20)
+    @filter.on_llm_response(priority=20)
     async def on_llm_response(self, event: AstrMessageEvent, resp: LLMResponse):
-        gid:  str = event.get_group_id()
+        """在 LLM 返回结果后执行，用于更新会话状态。"""
+        gid: str = event.get_group_id()
         uid: str = event.get_sender_id()
         if not gid or not uid:
             return

@@ -37,6 +37,12 @@
                         "type": "float",
                         "default": 10.0
                     },
+                    "merge_multi_user": {
+                        "description": "允许合并多人消息",
+                        "hint": "开启后，合并延迟期间若有其他群成员发送消息，也会被一并收集。消息格式将变为“[昵称]: 消息内容”。",
+                        "type": "bool",
+                        "default": false
+                    },
                     "wake_extend": {
                         "description": "唤醒延长(秒)",
                         "hint": "LLM响应后，在此时间内将持续保持唤醒状态(每个用户单独计时)。设为0时关闭检测",

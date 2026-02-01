@@ -516,7 +516,8 @@ class LLMEnhancement(Star):
         if first_path.startswith(("http://", "https://")):
             logger.debug(f"[场景判断] 检测到远程 URL，尝试下载: {first_path}")
             try:
-                local_path = await download_video_to_temp(first_path, 20)
+                max_size = self._get_cfg("video_max_size_mb", 50)
+                local_path = await download_video_to_temp(first_path, max_size)
                 if local_path: 
                     ctx.media_path = local_path
                     ctx.cleanup_paths.append(local_path)
@@ -695,6 +696,7 @@ class LLMEnhancement(Star):
                                 original_message_chain = original_msg['message']
                                 if isinstance(original_message_chain, list):
                                     has_extracted_media = False
+                                    max_size = self._get_cfg("video_max_size_mb", 50)
                                     for segment in original_message_chain:  
                                         seg_type = segment.get("type")
                                         if seg_type == "forward":
@@ -710,7 +712,7 @@ class LLMEnhancement(Star):
                                                 
                                                 if url.startswith(("http://", "https://")):
                                                     try:
-                                                        local_path = await download_video_to_temp(url, 20)
+                                                        local_path = await download_video_to_temp(url, max_size)
                                                         if local_path:  
                                                             if local_path not in req.image_urls:
                                                                 req.image_urls.append(local_path)

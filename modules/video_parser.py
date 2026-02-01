@@ -496,7 +496,7 @@ class VideoFrameProcessor:
         self.event = event
         self._get_cfg = config_getter
     
-    async def process_long_video(self, req: ProviderRequest, video_path: str, duration: float) -> bool:
+    async def process_long_video(self, req: ProviderRequest, video_path: str, duration: float, sender_name: str = None) -> bool:
         """【场景：视频】多帧抽取 + ASR → 帧聚合汇总"""
         try:  
             frames, cleanup_paths, local_video_path = await self._extract_video_frames(video_path, duration)
@@ -522,7 +522,8 @@ class VideoFrameProcessor:
             )
             
             if summary:
-                self._inject_summary(req, summary, "视频转述")
+                self._inject_summary(req, summary, "视频转述", sender_name=sender_name)
+                logger.info(f"[VideoFrameProcessor] 视频总结成功并注入，来源: {sender_name or '当前消息'}")
                 # 注册清理
                 for frame in frames:
                     req._cleanup_paths = req._cleanup_paths or []
@@ -539,7 +540,7 @@ class VideoFrameProcessor:
             logger.warning(f"[VideoFrameProcessor] 视频处理失败: {e}")
             return False
     
-    async def process_gif(self, req: ProviderRequest, gif_path: str) -> bool:
+    async def process_gif(self, req: ProviderRequest, gif_path: str, sender_name: str = None) -> bool:
         """【场景：GIF 动图】强制抽帧 → 帧聚合汇总"""
         try:
             logger.info(f"[VideoFrameProcessor] GIF 处理: {gif_path}")
@@ -580,7 +581,7 @@ class VideoFrameProcessor:
             )
             
             if summary:
-                self._inject_summary(req, summary, "内容摘要")
+                self._inject_summary(req, summary, "内容摘要", sender_name=sender_name)
                 # 只保留最后一帧
                 req.image_urls = [frames[-1]]
                 logger.info("[VideoFrameProcessor] GIF 总结成功")
@@ -791,13 +792,14 @@ class VideoFrameProcessor:
         
         return None
     
-    def _inject_summary(self, req: ProviderRequest, summary: str, label: str):
+    def _inject_summary(self, req: ProviderRequest, summary: str, label: str, sender_name: str = None):
         """注入总结"""
         user_question = req.prompt.strip()
+        sender_prefix = f"该媒体消息由 {sender_name} 发送/提供。\n" if sender_name else ""
         context_prompt = (
             f"\n\n以下是系统为你分析的{label}，请结合此{label}来响应用户的要求。信息如下：\n"
             f"--- 注入内容开始 ---\n"
-            f"[{label}] {summary}\n"
+            f"{sender_prefix}[{label}] {summary}\n"
             f"--- 注入内容结束 ---"
         )
         req.prompt = user_question + context_prompt

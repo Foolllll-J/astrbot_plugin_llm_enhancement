@@ -1,5 +1,5 @@
 import asyncio
-from typing import Dict
+from typing import Dict, Optional
 from pydantic import BaseModel, ConfigDict, Field
 
 
@@ -11,6 +11,9 @@ class MemberState(BaseModel):
     last_response: float = 0.0                            # 最后一次LLM响应的时间（时间戳）
     lock: asyncio.Lock = Field(default_factory=asyncio.Lock)  # 异步锁
     in_merging: bool = False                              # 是否正在消息合并状态中
+    pending_msg_ids: set = Field(default_factory=set)     # 正在合并中的消息ID集合
+    cancel_merge: bool = False                            # 是否取消当前的合并流程
+    trigger_msg_id: Optional[str] = None                  # 触发当前流程的首条消息ID
     
     model_config = ConfigDict(arbitrary_types_allowed=True)
 

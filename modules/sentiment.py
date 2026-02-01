@@ -216,7 +216,7 @@ class Sentiment:
         for word in jieba.lcut(text):
             if word.strip() and word not in cls.STOP:
                 words.append(word)
-        logger.debug(f"[wakepro] {words}")
+        logger.debug(f"[sentiment] {words}")
         return words
 
     @classmethod

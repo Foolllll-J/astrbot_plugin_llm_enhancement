@@ -43,16 +43,16 @@ async def extract_content_recursively(message_nodes: List[Dict[str, Any]], extra
                         url = seg_data.get("url") 
                         if url: 
                             image_urls.append(url) 
-                            node_text_parts.append("[图片]") 
+                            node_text_parts.append(f"[图片(来自:{sender_name})]") 
                     elif seg_type == "video":
                         url = seg_data.get("url")
                         file = seg_data.get("file")
                         if url:
                             video_sources.append(url)
-                            node_text_parts.append("[视频]")
+                            node_text_parts.append(f"[视频(来自:{sender_name})]")
                         elif file:
                             video_sources.append(file)
-                            node_text_parts.append("[视频]")
+                            node_text_parts.append(f"[视频(来自:{sender_name})]")
                     elif seg_type == "forward":
                         nested_content = seg_data.get("content")
                         if isinstance(nested_content, list):

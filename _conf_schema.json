@@ -185,9 +185,9 @@
                         "default": 2,
                         "hint": "仅对合并转发聊天记录生效；每个视频默认仅抽 1 张关键帧，避免图片过多导致模型调用失败"
                     },
-                    "quote_self_video_block_prob": {
-                        "description": "引用 Bot 所发视频的请求屏蔽概率",
-                        "hint": "当引用了 Bot 自身发送的视频时，以此概率屏蔽该请求",
+                    "quote_self_media_block_prob": {
+                        "description": "引用 Bot 所发媒体/文件的请求屏蔽概率",
+                        "hint": "当引用了 Bot 自身发送的视频或文件时，以此概率屏蔽该请求",
                         "type": "float",
                         "slider": {
                             "min": 0,

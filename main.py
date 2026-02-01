@@ -664,11 +664,11 @@ class LLMEnhancement(Star):
             if IS_AIOCQHTTP and isinstance(event, AiocqhttpMessageEvent):
                 for seg in all_components:
                     if isinstance(seg, Comp.Forward):
-                        forward_id = seg.id 
+                        forward_id = seg.id
                         break
                     elif isinstance(seg, Comp.Reply):
-                        reply_seg = seg 
-            
+                        reply_seg = seg
+        
                 if event.is_at_or_wake_command:  
                     if not forward_id and reply_seg:
                         try:
@@ -680,13 +680,14 @@ class LLMEnhancement(Star):
                                 original_sender = str(sender_info.get("user_id", ""))
                                 original_sender_name = sender_info.get("nickname", "未知用户")
                                 self_id = str(event.get_self_id())
-                                block_prob = self._get_cfg("quote_self_video_block_prob", 0)
+                                block_prob = self._get_cfg("quote_self_media_block_prob", 0)
                                 
                                 if original_sender == self_id and block_prob > 0:
                                     has_video = any(s.get("type") == "video" for s in original_msg['message'])
-                                    if has_video:
+                                    has_file = any(s.get("type") == "file" for s in original_msg['message'])
+                                    if has_video or has_file:
                                         if random.random() < block_prob:
-                                            logger.info(f"[LLMEnhancement] 检测到引用了 Bot 自身发送的视频，且命中屏蔽概率 ({block_prob})，已拦截请求。")
+                                            logger.info(f"[LLMEnhancement] 检测到引用了 Bot 自身发送的视频或文件，且命中屏蔽概率 ({block_prob})，已拦截请求。")
                                             event.stop_event()
                                             return
 
@@ -696,6 +697,7 @@ class LLMEnhancement(Star):
                                 original_message_chain = original_msg['message']
                                 if isinstance(original_message_chain, list):
                                     has_extracted_media = False
+                                    quoted_file_names = []
                                     max_size = self._get_cfg("video_max_size_mb", 50)
                                     for segment in original_message_chain:  
                                         seg_type = segment.get("type")
@@ -725,6 +727,11 @@ class LLMEnhancement(Star):
                                                 if url not in req.image_urls:
                                                     req.image_urls.append(url)
                                                     logger.debug(f"[LLMEnhancement] 从引用消息中提取到媒体 URL: {url}")
+                                        elif seg_type == "file":
+                                            file_name = segment.get("data", {}).get("file")
+                                            if file_name:
+                                                quoted_file_names.append(file_name)
+                                                logger.debug(f"[LLMEnhancement] 从引用消息中提取到文件名: {file_name}")
                                         elif seg_type == "json":
                                             try:  
                                                 inner_data_str = segment.get("data", {}).get("data")
@@ -744,12 +751,19 @@ class LLMEnhancement(Star):
                                             except:  
                                                 continue
                                     
-                                    if has_extracted_media:
+                                    if has_extracted_media or quoted_file_names:
                                         quoted_sender = getattr(req, "_quoted_sender", "未知用户")
-                                        # 注入到 prompt 中，告知 LLM 这些图片是谁发的
-                                        context_desc = f"\n\n[补充信息] 以上图片提取自用户 {quoted_sender} 的引用消息，请在回复时参考该上下文。"
+                                        # 注入到 prompt 中，告知 LLM 这些内容是谁发的
+                                        context_parts = []
+                                        if has_extracted_media:
+                                            context_parts.append(f"以上图片提取自用户 {quoted_sender} 的引用消息")
+                                        if quoted_file_names:
+                                            file_list_str = "、".join(quoted_file_names)
+                                            context_parts.append(f"用户 {quoted_sender} 的引用消息中包含文件: {file_list_str}")
+                                        
+                                        context_desc = f"\n\n[补充信息] {'；'.join(context_parts)}，请在回复时参考该上下文。"
                                         req.prompt += context_desc
-                                        logger.debug(f"[LLMEnhancement] 已为引用图片注入发送者信息: {quoted_sender}")
+                                        logger.debug(f"[LLMEnhancement] 已为引用内容注入发送者/文件信息: {quoted_sender}")
                                     
                                     # 如果有视频
                                     has_video_in_quote = any(s.get("type") == "video" for s in original_message_chain)

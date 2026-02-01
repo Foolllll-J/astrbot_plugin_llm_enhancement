@@ -356,7 +356,11 @@ async def extract_forward_video_keyframes(
             
         # 3. 探测时长
         duration = probe_duration_sec(ffmpeg_path, video_path)
-        if duration is None or duration > max_duration or duration <= 0:
+        
+        # 安全限制：硬编码 120 分钟 (7200秒)
+        safety_max_duration = 7200
+        
+        if duration is None or duration > safety_max_duration or duration <= 0:
             if is_temp_video and video_path in cleanup_paths:
                 os.remove(video_path)
                 cleanup_paths.remove(video_path)
@@ -423,13 +427,14 @@ async def prepare_video_context(
     sample_count: int,
     ffmpeg_path: str,
     process_timeout: int = 30
-) -> Tuple[List[str], List[str], Optional[str]]:
+) -> Tuple[List[str], List[str], Optional[str], Optional[str]]:
     """
-    处理视频源，返回抽取的帧路径列表、待清理的路径列表、以及最终使用的视频本地路径。
+    处理视频源，返回抽取的帧路径列表、待清理的路径列表、最终使用的视频本地路径，以及处理状态（失败原因）。
     """
     frames = []
     cleanup_paths = []
     final_video_path = None
+    status = None # 记录失败原因
     
     start_time = time.time()
     
@@ -437,6 +442,7 @@ async def prepare_video_context(
         # 检查总耗时
         if time.time() - start_time > process_timeout:
             logger.warning("video_parser: processing timeout")
+            status = "timeout"
             break
 
         video_path = src
@@ -448,11 +454,13 @@ async def prepare_video_context(
             if resolved:
                 video_path = resolved
             else:
+                status = "file_not_found"
                 continue
             
         # 2. 下载远程视频
         if video_path.startswith(("http://", "https://")):
             try:
+                # 注意：download_video_to_temp 内部已经处理了大小限制
                 downloaded = await asyncio.wait_for(
                     download_video_to_temp(video_path, max_mb),
                     timeout=process_timeout - (time.time() - start_time)
@@ -462,20 +470,29 @@ async def prepare_video_context(
                     is_temp_video = True
                     cleanup_paths.append(video_path)
                 else:
+                    # 如果返回 None，很可能是因为文件过大
+                    status = "too_large"
                     continue
             except Exception:
+                status = "download_failed"
                 continue
                 
         if not os.path.exists(video_path):
+            status = "file_not_found"
             continue
             
         # 3. 探测时长
         duration = probe_duration_sec(ffmpeg_path, video_path)
-        if duration is None or (max_duration > 0 and duration > max_duration) or duration <= 0:
+        
+        # 安全限制：硬编码 120 分钟 (7200秒)
+        safety_max_duration = 7200
+        
+        if duration is None or duration > safety_max_duration or duration <= 0:
             if is_temp_video and video_path in cleanup_paths:
                 try: os.remove(video_path)
                 except: pass
                 cleanup_paths.remove(video_path)
+            status = "too_long"
             continue
             
         # 4. 抽帧
@@ -484,9 +501,12 @@ async def prepare_video_context(
             frames.extend(sampled)
             cleanup_paths.extend(sampled)
             final_video_path = video_path
+            status = "success"
             break
+        else:
+            status = "sample_failed"
                 
-    return frames, cleanup_paths, final_video_path
+    return frames, cleanup_paths, final_video_path, status
 
 class VideoFrameProcessor:
     """统一的视频/GIF 帧处理器"""
@@ -499,8 +519,15 @@ class VideoFrameProcessor:
     async def process_long_video(self, req: ProviderRequest, video_path: str, duration: float, sender_name: str = None) -> bool:
         """【场景：视频】多帧抽取 + ASR → 帧聚合汇总"""
         try:  
-            frames, cleanup_paths, local_video_path = await self._extract_video_frames(video_path, duration)
+            frames, cleanup_paths, local_video_path, status = await self._extract_video_frames(video_path, duration)
+            
             if not frames:
+                if status == "too_large":
+                    self._inject_summary(req, "用户发送/引用了一个视频消息，但是文件太大了，我懒得看（已跳过解析）。", "系统提示", sender_name=sender_name)
+                    return True
+                elif status == "too_long":
+                    self._inject_summary(req, "用户发送/引用了一个视频消息，但是时间太长了，我没耐心看（已跳过解析）。", "系统提示", sender_name=sender_name)
+                    return True
                 return False
             
             # 注册清理路径
@@ -614,38 +641,46 @@ class VideoFrameProcessor:
             return 0
     
 
-    async def _extract_video_frames(self, video_path: str, duration: float) -> Tuple[List[str], List[str], Optional[str]]:
+    async def _extract_video_frames(self, video_path: str, duration: float) -> Tuple[List[str], List[str], Optional[str], Optional[str]]:
         """多帧抽取（读取配置参数）"""
-        interval = self._get_cfg("video_frame_interval_sec", 1)
+        interval = self._get_cfg("video_frame_interval_sec", 12)
+        max_frame_count = self._get_cfg("video_max_frame_count", 10)
+        
         sample_count = 1
         if duration > 0:
-            # 向上取整计算抽帧数，例如 12.5s / 12s = 1.04 -> 2 帧
-            sample_count = max(1, min(math.ceil(duration / interval), 15))
+            # 动态计算抽帧数：取 (时长/间隔) 和 (抽帧上限) 的较小值
+            ideal_count = math.ceil(duration / interval) if interval > 0 else 1
+            sample_count = max(1, min(ideal_count, max_frame_count))
+            
+            # 如果实际抽帧数因为达到上限而被压缩，日志记录一下
+            if ideal_count > max_frame_count:
+                actual_interval = duration / sample_count
+                logger.info(f"[VideoFrameProcessor] 视频时长 {duration:.1f}s 超过间隔覆盖范围，调整抽帧间隔: {interval}s -> {actual_interval:.1f}s (上限 {max_frame_count} 帧)")
         else:
             sample_count = self._get_cfg("video_sample_count", 3)
         
         logger.info(f"[VideoFrameProcessor] 视频多帧抽取: {sample_count} 帧")
         
         try:
-            frames, cleanup_paths, local_video_path = await prepare_video_context(
+            frames, cleanup_paths, local_video_path, status = await prepare_video_context(
                 self.event,
                 [video_path],
                 max_mb=self._get_cfg("video_max_size_mb", 50),
-                max_duration=self._get_cfg("video_max_duration_sec", 120),
+                max_duration=7200, # 硬编码安全限制 120 分钟
                 sample_count=sample_count,
                 ffmpeg_path=self._get_cfg("ffmpeg_path", ""),
                 process_timeout=30
             )
             
-            return frames or [], cleanup_paths or [], local_video_path
+            return frames or [], cleanup_paths or [], local_video_path, status
         except Exception as e:
             logger.warning(f"[VideoFrameProcessor] 帧抽取失败: {e}")
-            return [], [], None
+            return [], [], None, "error"
     
     async def _extract_and_transcribe_audio(self, video_path: str) -> Optional[str]:
         """ASR：提取音频并转录"""
         try:
-            logger.info(f"[VideoFrameProcessor] ASR: 正在从视频中提取音频...")
+            logger.debug(f"[VideoFrameProcessor] ASR: 正在从视频中提取音频...")
             ffmpeg_path = self._get_cfg("ffmpeg_path", "")
             wav_path = await extract_audio_wav(ffmpeg_path, video_path)
             
@@ -664,7 +699,7 @@ class VideoFrameProcessor:
             
             asr_text = None
             try:
-                logger.info(f"[VideoFrameProcessor] ASR: 正在请求转录...")
+                logger.debug(f"[VideoFrameProcessor] ASR: 正在请求转录...")
                 if hasattr(stt, "get_text"):
                     asr_text = await stt.get_text(wav_path)
                 elif hasattr(stt, "speech_to_text"):
@@ -803,7 +838,7 @@ class VideoFrameProcessor:
             f"--- 注入内容结束 ---"
         )
         req.prompt = user_question + context_prompt
-        logger.info(f"[VideoFrameProcessor] 成功注入{label}")
+        logger.debug(f"[VideoFrameProcessor] 成功注入{label}")
     
     def _find_provider(self, provider_id: str):
         """通用方法：从所有 Provider（包含 LLM 和 STT）中查找匹配的 ID/Name"""
@@ -841,7 +876,7 @@ class VideoFrameProcessor:
         provider_id = self._get_cfg("image_provider_id")
         p = self._find_provider(provider_id)
         if p:
-            logger.info(f"[VideoFrameProcessor] 使用指定 Vision Provider: {provider_id}")
+            logger.debug(f"[VideoFrameProcessor] 使用指定 Vision Provider: {provider_id}")
             return p
         
         if provider_id:
@@ -851,7 +886,7 @@ class VideoFrameProcessor:
         try:
             default_p = self.context.get_using_provider(umo=self.event.unified_msg_origin)
             if default_p:
-                logger.info(f"[VideoFrameProcessor] 使用当前会话 Provider 进行识图")
+                logger.debug(f"[VideoFrameProcessor] 使用当前会话 Provider 进行识图")
                 return default_p
         except:
             pass

@@ -143,11 +143,11 @@
                         "type": "int",
                         "default": 50
                     },
-                    "video_max_duration_sec": {
-                        "description": "视频解析最大时长(秒)",
-                        "hint": "超过此时长的视频将不予解析。默认 120s。",
+                    "video_max_frame_count": {
+                        "description": "抽帧数量上限",
                         "type": "int",
-                        "default": 120
+                        "default": 10,
+                        "hint": "单个视频最多抽取的帧数。若根据抽帧间隔计算出的帧数超过此值，将自动调整间隔以匹配此上限。"
                     },
                     "video_frame_interval_sec": {
                         "description": "抽帧间隔（秒）",

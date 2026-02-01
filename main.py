@@ -514,7 +514,7 @@ class LLMEnhancement(Star):
         
         # 远程 URL → 尝试下载到本地
         if first_path.startswith(("http://", "https://")):
-            logger.info(f"[场景判断] 检测到远程 URL，尝试下载: {first_path}")
+            logger.debug(f"[场景判断] 检测到远程 URL，尝试下载: {first_path}")
             try:
                 local_path = await download_video_to_temp(first_path, 20)
                 if local_path: 
@@ -776,7 +776,7 @@ class LLMEnhancement(Star):
                                         max_count=self._get_cfg("forward_video_max_count", 2),
                                         ffmpeg_path=self._get_cfg("ffmpeg_path", ""),
                                         max_mb=self._get_cfg("video_max_size_mb", 50),
-                                        max_duration=self._get_cfg("video_max_duration_sec", 120),
+                                        max_duration=7200, # 硬编码安全限制 120 分钟
                                         timeout_sec=10
                                     )
                                     if f_frames:
@@ -884,7 +884,7 @@ class LLMEnhancement(Star):
                 
                 # 【场景 1】视频 → 统一抽帧流程
                 if media_ctx.scenario == MediaScenario.VIDEO:  
-                    logger.info("[分支] 执行视频处理")
+                    logger.debug("[分支] 执行视频处理")
                     quoted_sender = getattr(req, "_quoted_sender", None) if reply_seg else None
                     success = await processor.process_long_video(req, media_ctx.media_path, media_ctx.duration, sender_name=quoted_sender)
                     if not success:  
@@ -892,7 +892,7 @@ class LLMEnhancement(Star):
                 
                 # 【场景 2】GIF 动图 → 固定参数
                 elif media_ctx.scenario == MediaScenario.GIF_ANIMATED:
-                    logger.info("[分支] 执行 GIF 处理")
+                    logger.debug("[分支] 执行 GIF 处理")
                     quoted_sender = getattr(req, "_quoted_sender", None) if reply_seg else None
                     success = await processor.process_gif(req, media_ctx.media_path, sender_name=quoted_sender)
                     if not success: 

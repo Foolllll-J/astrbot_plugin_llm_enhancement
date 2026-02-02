@@ -278,12 +278,24 @@ class LLMEnhancement(Star):
                     if member.pending_msg_ids:
                         logger.debug(f" [LLMEnhancement] 正在检查用户 {member.uid} 的待处理消息: {member.pending_msg_ids}")
                     
-                    # 只有当被撤回的是“触发消息”（第一条）时，才取消整个合并/请求流程
-                    trigger_id = getattr(member, "trigger_msg_id", None)
-                    if trigger_id and msg_id == trigger_id:
-                        member.cancel_merge = True
-                        found = True
-                        logger.info(f" [LLMEnhancement] 检测到【触发消息】撤回 (ID: {msg_id})，正在取消用户 {member.uid} 的合并/请求流程。")
+                    # 检查撤回的消息是否在待处理列表中
+                    if member.pending_msg_ids and msg_id in member.pending_msg_ids:
+                        in_merging = getattr(member, "in_merging", False)
+                        
+                        # 如果正在合并中，交由 collect_messages 处理（它会负责从 pending_msg_ids 移除）
+                        if in_merging:
+                             logger.debug(f" [LLMEnhancement] 检测到消息撤回 (ID: {msg_id})，但当前处于合并期，交由合并器处理。")
+                             continue
+                        
+                        # 如果不在合并期（即 LLM 处理期），则移除该 ID
+                        member.pending_msg_ids.remove(msg_id)
+                        logger.info(f" [LLMEnhancement] 检测到部分消息撤回 (ID: {msg_id})，已从用户 {member.uid} 的上下文中移除。剩余: {len(member.pending_msg_ids)}")
+                        
+                        # 如果所有消息都撤回了，则取消任务
+                        if not member.pending_msg_ids:
+                            member.cancel_merge = True
+                            found = True
+                            logger.info(f" [LLMEnhancement] 用户 {member.uid} 的所有请求消息均已被撤回，正在取消合并/请求流程。")
                     
                     # 如果是后续消息被撤回，on_notice 不做处理，交给 collect_messages 在合并窗口期处理
                     # 如果已经过了合并窗口期（即在 LLM 生成中），后续消息撤回无法影响已发送的 prompt，故忽略
@@ -299,6 +311,7 @@ class LLMEnhancement(Star):
         member.pending_msg_ids.clear()
         member.cancel_merge = False
         member.trigger_msg_id = None
+        member.in_merging = True  # 标记正在合并中，防止 on_notice 误判
         
         # 获取初始消息 ID
         current_msg_id = None
@@ -326,27 +339,27 @@ class LLMEnhancement(Star):
             if raw.get("post_type") == "notice" and raw.get("notice_type") == "group_recall":
                 recalled_msg_id = str(raw.get("message_id"))
                 
-                # 情况 1: 撤回的是第一条消息（触发消息）
-                if recalled_msg_id == member.trigger_msg_id:
-                    member.cancel_merge = True
-                    logger.info(f" [LLMEnhancement] 合并期间检测到【触发消息】撤回 (ID: {recalled_msg_id})，取消合并。")
-                    controller.stop()
-                    return
-
-                # 情况 2: 撤回的是后续消息
-                # 从 buffer 中查找并移除
+                # 无论撤回的是触发消息还是后续消息，都从 buffer 中查找并移除
+                found_in_buffer = False
                 for i, (mid, name, content) in enumerate(message_buffer):
                     if mid == recalled_msg_id:
-                        logger.info(f" [LLMEnhancement] 合并期间检测到后续消息撤回 (ID: {recalled_msg_id})，已从合并列表中移除。")
+                        logger.info(f" [LLMEnhancement] 合并期间检测到消息撤回 (ID: {recalled_msg_id})，已从合并列表中移除。")
                         message_buffer.pop(i)
+                        found_in_buffer = True
                         # 同时也从 pending_msg_ids 中移除
                         if recalled_msg_id in member.pending_msg_ids:
                             member.pending_msg_ids.remove(recalled_msg_id)
-                        # 刷新等待时间，继续收集
-                        controller.keep(timeout=merge_delay, reset_timeout=True)
-                        return
                 
-                return # 其他消息撤回，忽略
+                # 如果队列空了，立即终止会话
+                if not message_buffer:
+                    logger.info(f" [LLMEnhancement] 合并队列已空，终止合并流程。")
+                    member.cancel_merge = True
+                    controller.stop()
+                    return
+
+                # 刷新等待时间，继续收集
+                controller.keep(timeout=merge_delay, reset_timeout=True)
+                return
 
             # 检查是否已取消
             if member.cancel_merge:
@@ -396,6 +409,8 @@ class LLMEnhancement(Star):
             await collect_messages(event)
         except TimeoutError:
             pass # 继续后续处理
+        finally:
+            member.in_merging = False # 合并结束
             
         # 无论是否超时，如果已取消，直接返回
         if member.cancel_merge:

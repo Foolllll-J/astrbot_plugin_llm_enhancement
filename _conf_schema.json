@@ -17,192 +17,188 @@
         "type": "list",
         "default": []
     },
-    "modules": {
-        "type": "template_list",
-        "description": "功能模块配置",
-        "templates": {
-            "intelligent_wake": {
-                "name": "智能唤醒",
-                "hint": "配置智能唤醒相关参数",
-                "items": {
-                    "request_cd": {
-                        "description": "请求CD(秒)",
-                        "hint": "防止频繁发送LLM请求的冷却时间。距离上次发送请求小于此时间的所有消息会被阻止。设为0时关闭检测",
-                        "type": "float",
-                        "default": 1.0
-                    },
-                    "merge_delay": {
-                        "description": "合并延迟(秒)",
-                        "hint": "用户快速连续发送多条消息时，等待此时间后合并为一条发给LLM，用空格连接。最多合并10条消息。设为0时关闭合并",
-                        "type": "float",
-                        "default": 10.0
-                    },
-                    "merge_multi_user": {
-                        "description": "允许合并多人消息",
-                        "hint": "开启后，合并延迟期间若有其他群成员发送消息，也会被一并收集。消息格式将变为“[昵称]: 消息内容”。",
-                        "type": "bool",
-                        "default": false
-                    },
-                    "wake_extend": {
-                        "description": "唤醒延长(秒)",
-                        "hint": "LLM响应后，在此时间内将持续保持唤醒状态(每个用户单独计时)。设为0时关闭检测",
-                        "type": "float",
-                        "default": 20.0
-                    },
-                    "wake_extend_similarity": {
-                        "description": "唤醒延长相关性阈值",
-                        "hint": "唤醒延长期间，当前消息与上文的相关性阈值。降低阈值可更容易保持对话连续性",
-                        "type": "float",
-                        "default": 0.1
-                    },
-                    "empty_mention_pt": {
-                        "description": "空@消息提示模版",
-                        "hint": "使用此配置时请关闭Astrbot消息平台配置里的 “只@机器人是否触发等待” 和 “只@机器人触发等待时是否需要回复提醒”。 另外{username}会自动解析成用户昵称。 不填表示不启用空@回复",
-                        "type": "string",
-                        "default": "{username}@了一下你，请你用非常简洁的话问问要干嘛"
-                    },
-                    "mention_wake": {
-                        "description": "提及唤醒的昵称",
-                        "hint": "提及到bot的昵称时，唤醒bot。不填时关闭提及检测",
-                        "type": "list",
-                        "default": []
-                    },
-                    "relevant_wake": {
-                        "description": "相关性唤醒阈值",
-                        "hint": "当前消息与上文bot的消息相关性大时，唤醒bot。降低阈值可更容易唤醒，保持对话连续性。设为0时关闭检测",
-                        "type": "float",
-                        "default": 0.71
-                    },
-                    "ask_wake": {
-                        "description": "答疑唤醒阈值",
-                        "hint": "当群里有人问专业性问题时，唤醒bot。建议阈值高一点，日常聊天疑问句出现的频率非常高。设为0时关闭检测",
-                        "type": "float",
-                        "default": 0.88
-                    },
-                    "shutup": {
-                        "description": "闭嘴检测阈值",
-                        "hint": "有人感觉bot太多话时，bot自动闭嘴一段时间。低阈值更容易让bot闭嘴。设为0时关闭检测",
-                        "type": "float",
-                        "default": 0.69
-                    },
-                    "insult": {
-                        "description": "辱骂检测阈值",
-                        "hint": "有人辱骂bot时，bot自动沉默一段时间。低阈值更容易让bot沉默，玻璃心更重。设为0时关闭检测",
-                        "type": "float",
-                        "default": 0.69
-                    },
-                    "silence_multiple": {
-                        "description": "沉默时间倍数",
-                        "hint": "触发bot沉默时的阈值（0~1） * 沉默时间倍数 = 沉默时间",
-                        "type": "float",
-                        "default": 500
-                    },
-                    "prob_wake": {
-                        "description": "兜底唤醒概率",
-                        "hint": "上述所有唤醒机制都没能唤醒bot时，最后会按照此概率尝试唤醒bot(相当于Astrbot框架中的主动唤醒概率)。概率越大越容易唤醒，建议设置得非常小",
-                        "type": "float",
-                        "default": 0.0005
-                    },
-                    "wake_forbidden_words": {
-                        "description": "唤醒词屏蔽词",
-                        "hint": "唤醒词屏蔽词，如果用户输入的唤醒词包含这些词，则不会唤醒bot(但bot管理员不受影响)",
-                        "type": "list",
-                        "default": [
-                            "政治",
-                            "键证",
-                            "党"
-                        ]
-                    },
-                    "block_builtin": {
-                        "description": "屏蔽内置指令",
-                        "hint": "内置指令即指Astrbot自带的命令，如help, tts, llm等，内置指令被屏蔽后不再会唤醒bot(但bot管理员不受影响), 从而让你的bot更像真人",
-                        "type": "bool",
-                        "default": false
-                    }
-                }
+    "intelligent_wake": {
+        "type": "object",
+        "description": "智能唤醒",
+        "hint": "配置智能唤醒相关参数",
+        "items": {
+            "request_cd": {
+                "description": "请求CD(秒)",
+                "hint": "防止频繁发送LLM请求的冷却时间。距离上次发送请求小于此时间的所有消息会被阻止。设为0时关闭检测",
+                "type": "float",
+                "default": 1.0
             },
-            "video_injection": {
-                "name": "视频解析增强",
-                "hint": "配置视频解析与 ASR 相关参数",
-                "items": {
-                    "video_detect_enable": {
-                        "description": "视频解析增强",
-                        "hint": "开启后，若用户发送或回复视频，将自动解析并描述视频内容。",
-                        "type": "bool",
-                        "default": true
-                    },
-                    "video_asr_enable": {
-                        "description": "视频语音识别 (ASR)",
-                        "type": "bool",
-                        "default": true,
-                        "hint": "开启后，将提取视频音频并转写为文本，辅助模型理解视频内容。"
-                    },
-                    "ffmpeg_path": {
-                        "description": "FFmpeg 路径",
-                        "hint": "FFmpeg 可执行文件路径，不填则自动尝试从系统环境变量中寻找。",
-                        "type": "string",
-                        "default": ""
-                    },
-                    "video_max_size_mb": {
-                        "description": "视频解析最大大小(MB)",
-                        "hint": "超过此大小的视频将不予解析。默认 50MB。",
-                        "type": "int",
-                        "default": 50
-                    },
-                    "video_max_frame_count": {
-                        "description": "抽帧数量上限",
-                        "type": "int",
-                        "default": 10,
-                        "hint": "单个视频最多抽取的帧数。若根据抽帧间隔计算出的帧数超过此值，将自动调整间隔以匹配此上限。"
-                    },
-                    "video_frame_interval_sec": {
-                        "description": "抽帧间隔（秒）",
-                        "hint": "每隔 N 秒取 1 帧。间隔越小描述越细腻，但会消耗更多 Token 和时间。",
-                        "type": "int",
-                        "default": 12
-                    },
-                    "video_sample_count": {
-                        "description": "视频抽帧数量",
-                        "type": "int",
-                        "default": 3,
-                        "hint": "若无法获取时长，默认抽取这么多张图片"
-                    },
-                    "image_provider_id": {
-                        "description": "图片转述优先使用的 Provider ID",
-                        "type": "string",
-                        "_special": "select_provider",
-                        "hint": "留空则自动选择具备图片能力的 Provider"
-                    },
-                    "asr_provider_id": {
-                        "description": "ASR 提供商 ID",
-                        "type": "string",
-                        "_special": "select_provider_stt",
-                        "hint": "留空则使用当前会话 STT 提供商"
-                    },
-                    "forward_video_keyframe_enable": {
-                        "description": "合并转发：视频关键帧参与聊天记录解释",
-                        "type": "bool",
-                        "default": true,
-                        "hint": "开启后，若合并转发聊天记录中包含视频，将尝试抽取少量关键帧作为图片输入参与同一次解释；失败则回退为仅标记[视频]"
-                    },
-                    "forward_video_max_count": {
-                        "description": "合并转发：最多处理的视频数量",
-                        "type": "int",
-                        "default": 2,
-                        "hint": "仅对合并转发聊天记录生效；每个视频默认仅抽 1 张关键帧，避免图片过多导致模型调用失败"
-                    },
-                    "quote_self_media_block_prob": {
-                        "description": "引用 Bot 所发媒体/文件的请求屏蔽概率",
-                        "hint": "当引用了 Bot 自身发送的视频或文件时，以此概率屏蔽该请求",
-                        "type": "float",
-                        "slider": {
-                            "min": 0,
-                            "max": 1,
-                            "step": 0.01
-                        },
-                        "default": 0
-                    }
-                }
+            "merge_delay": {
+                "description": "合并延迟(秒)",
+                "hint": "用户快速连续发送多条消息时，等待此时间后合并为一条发给LLM，用空格连接。最多合并10条消息。设为0时关闭合并",
+                "type": "float",
+                "default": 10.0
+            },
+            "merge_multi_user": {
+                "description": "允许合并多人消息",
+                "hint": "开启后，合并延迟期间若有其他群成员发送消息，也会被一并收集。消息格式将变为“[昵称]: 消息内容”。",
+                "type": "bool",
+                "default": false
+            },
+            "wake_extend": {
+                "description": "唤醒延长(秒)",
+                "hint": "LLM响应后，在此时间内将持续保持唤醒状态(每个用户单独计时)。设为0时关闭检测",
+                "type": "float",
+                "default": 20.0
+            },
+            "wake_extend_similarity": {
+                "description": "唤醒延长相关性阈值",
+                "hint": "唤醒延长期间，当前消息与上文的相关性阈值。降低阈值可更容易保持对话连续性",
+                "type": "float",
+                "default": 0.1
+            },
+            "empty_mention_pt": {
+                "description": "空@消息提示模版",
+                "hint": "使用此配置时请关闭Astrbot消息平台配置里的 “只@机器人是否触发等待” 和 “只@机器人触发等待时是否需要回复提醒”。 另外{username}会自动解析成用户昵称。 不填表示不启用空@回复",
+                "type": "string",
+                "default": "{username}@了一下你，请你用非常简洁的话问问要干嘛"
+            },
+            "mention_wake": {
+                "description": "提及唤醒的昵称",
+                "hint": "提及到bot的昵称时，唤醒bot。不填时关闭提及检测",
+                "type": "list",
+                "default": []
+            },
+            "relevant_wake": {
+                "description": "相关性唤醒阈值",
+                "hint": "当前消息与上文bot的消息相关性大时，唤醒bot。降低阈值可更容易唤醒，保持对话连续性。设为0时关闭检测",
+                "type": "float",
+                "default": 0.71
+            },
+            "ask_wake": {
+                "description": "答疑唤醒阈值",
+                "hint": "当群里有人问专业性问题时，唤醒bot。建议阈值高一点，日常聊天疑问句出现的频率非常高。设为0时关闭检测",
+                "type": "float",
+                "default": 0.88
+            },
+            "shutup": {
+                "description": "闭嘴检测阈值",
+                "hint": "有人感觉bot太多话时，bot自动闭嘴一段时间。低阈值更容易让bot闭嘴。设为0时关闭检测",
+                "type": "float",
+                "default": 0.69
+            },
+            "insult": {
+                "description": "辱骂检测阈值",
+                "hint": "有人辱骂bot时，bot自动沉默一段时间。低阈值更容易让bot沉默，玻璃心更重。设为0时关闭检测",
+                "type": "float",
+                "default": 0.69
+            },
+            "silence_multiple": {
+                "description": "沉默时间倍数",
+                "hint": "触发bot沉默时的阈值（0~1） * 沉默时间倍数 = 沉默时间",
+                "type": "float",
+                "default": 500
+            },
+            "prob_wake": {
+                "description": "兜底唤醒概率",
+                "hint": "上述所有唤醒机制都没能唤醒bot时，最后会按照此概率尝试唤醒bot(相当于Astrbot框架中的主动唤醒概率)。概率越大越容易唤醒，建议设置得非常小",
+                "type": "float",
+                "default": 0.0005
+            },
+            "wake_forbidden_words": {
+                "description": "唤醒词屏蔽词",
+                "hint": "唤醒词屏蔽词，如果用户输入的唤醒词包含这些词，则不会唤醒bot(但bot管理员不受影响)",
+                "type": "list",
+                "default": [
+                    "政治",
+                    "键证",
+                    "党"
+                ]
+            },
+            "block_builtin": {
+                "description": "屏蔽内置指令",
+                "hint": "内置指令即指Astrbot自带的命令，如help, tts, llm等，内置指令被屏蔽后不再会唤醒bot(但bot管理员不受影响), 从而让你的bot更像真人",
+                "type": "bool",
+                "default": false
+            }
+        }
+    },
+    "video_injection": {
+        "type": "object",
+        "description": "视频解析增强",
+        "hint": "配置视频解析与 ASR 相关参数",
+        "items": {
+            "video_detect_enable": {
+                "description": "视频解析增强",
+                "hint": "开启后，若用户发送或回复视频，将自动解析并描述视频内容。",
+                "type": "bool",
+                "default": true
+            },
+            "video_asr_enable": {
+                "description": "视频语音识别 (ASR)",
+                "type": "bool",
+                "default": true,
+                "hint": "开启后，将提取视频音频并转写为文本，辅助模型理解视频内容。"
+            },
+            "ffmpeg_path": {
+                "description": "FFmpeg 路径",
+                "hint": "FFmpeg 可执行文件路径，不填则自动尝试从系统环境变量中寻找。",
+                "type": "string",
+                "default": ""
+            },
+            "video_max_size_mb": {
+                "description": "视频解析最大大小(MB)",
+                "hint": "超过此大小的视频将不予解析。默认 50MB。",
+                "type": "int",
+                "default": 50
+            },
+            "video_max_frame_count": {
+                "description": "抽帧数量上限",
+                "type": "int",
+                "default": 10,
+                "hint": "单个视频最多抽取的帧数。若根据抽帧间隔计算出的帧数超过此值，将自动调整间隔以匹配此上限。"
+            },
+            "video_frame_interval_sec": {
+                "description": "抽帧间隔（秒）",
+                "hint": "每隔 N 秒取 1 帧。间隔越小描述越细腻，但会消耗更多 Token 和时间。",
+                "type": "int",
+                "default": 12
+            },
+            "video_sample_count": {
+                "description": "视频抽帧数量",
+                "type": "int",
+                "default": 3,
+                "hint": "若无法获取时长，默认抽取这么多张图片"
+            },
+            "image_provider_id": {
+                "description": "图片转述优先使用的 Provider ID",
+                "type": "string",
+                "_special": "select_provider",
+                "hint": "留空则自动选择具备图片能力的 Provider"
+            },
+            "asr_provider_id": {
+                "description": "ASR 提供商 ID",
+                "type": "string",
+                "_special": "select_provider_stt",
+                "hint": "留空则使用当前会话 STT 提供商"
+            },
+            "forward_video_keyframe_enable": {
+                "description": "合并转发：视频关键帧参与聊天记录解释",
+                "type": "bool",
+                "default": true,
+                "hint": "开启后，若合并转发聊天记录中包含视频，将尝试抽取少量关键帧作为图片输入参与同一次解释；失败则回退为仅标记[视频]"
+            },
+            "forward_video_max_count": {
+                "description": "合并转发：最多处理的视频数量",
+                "type": "int",
+                "default": 2,
+                "hint": "仅对合并转发聊天记录生效；每个视频默认仅抽 1 张关键帧，避免图片过多导致模型调用失败"
+            },
+            "quote_self_media_block_prob": {
+                "description": "引用 Bot 所发媒体/文件的请求屏蔽概率",
+                "hint": "当引用了 Bot 自身发送的视频或文件时，以此概率屏蔽该请求",
+                "type": "float",
+                "slider": {
+                    "min": 0,
+                    "max": 1,
+                    "step": 0.01
+                },
+                "default": 0
             }
         }
     }

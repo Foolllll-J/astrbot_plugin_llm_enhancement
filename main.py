@@ -115,20 +115,23 @@ class LLMEnhancement(Star):
         logger.info(f"[LLMEnhancement] 插件初始化完成。IS_AIOCQHTTP: {IS_AIOCQHTTP}")
 
     def _refresh_config(self):
-        """将 template_list 格式的配置平铺到 self.cfg 中"""
+        """将 object 格式的配置平铺到 self.cfg 中"""
+        # 1. 获取顶级配置项
         for k in ["group_whitelist", "group_blacklist", "user_blacklist"]:
             self.cfg[k] = self.config.get(k)
         
-        modules = self.config.get("modules", [])
-        if isinstance(modules, list):
-            for item in modules:
-                template_key = item.get("__template_key")
-                if not template_key:
-                    continue
+        # 2. 处理智能唤醒
+        wake_cfg = self.config.get("intelligent_wake", {})
+        if isinstance(wake_cfg, dict):
+            for k, v in wake_cfg.items():
+                self.cfg[k] = v
+        
+        # 3. 处理视频解析
+        video_cfg = self.config.get("video_injection", {})
+        if isinstance(video_cfg, dict):
+            for k, v in video_cfg.items():
+                self.cfg[k] = v
                 
-                for k, v in item.items():
-                    if k != "__template_key":
-                        self.cfg[k] = v
 
     def _get_cfg(self, key: str, default: Any = None) -> Any:
         """获取配置项"""
@@ -327,8 +330,8 @@ class LLMEnhancement(Star):
         message_buffer = [(current_msg_id, event.get_sender_name(), event.message_str)]
         additional_components = [seg for seg in event.message_obj.message if isinstance(seg, (Comp.Forward, Comp.Reply, Comp.Video, Comp.File))]
         
-        merge_delay = self._get_cfg("merge_delay")
-        allow_multi_user = self._get_cfg("merge_multi_user")
+        merge_delay = self._get_cfg("merge_delay", 10.0)
+        allow_multi_user = self._get_cfg("merge_multi_user", False)
 
         @session_waiter(timeout=merge_delay, record_history_chains=False)
         async def collect_messages(controller: SessionController, ev: AstrMessageEvent):

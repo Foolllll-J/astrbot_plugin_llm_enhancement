@@ -49,6 +49,12 @@
                         "type": "float",
                         "default": 20.0
                     },
+                    "wake_extend_similarity": {
+                        "description": "唤醒延长相关性阈值",
+                        "hint": "唤醒延长期间，当前消息与上文的相关性阈值。降低阈值可更容易保持对话连续性",
+                        "type": "float",
+                        "default": 0.1
+                    },
                     "empty_mention_pt": {
                         "description": "空@消息提示模版",
                         "hint": "使用此配置时请关闭Astrbot消息平台配置里的 “只@机器人是否触发等待” 和 “只@机器人触发等待时是否需要回复提醒”。 另外{username}会自动解析成用户昵称。 不填表示不启用空@回复",

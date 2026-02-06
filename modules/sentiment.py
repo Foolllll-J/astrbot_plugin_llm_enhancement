@@ -1,3 +1,4 @@
+import asyncio
 import math
 import jieba
 import re
@@ -209,11 +210,17 @@ class Sentiment:
     RHETORICAL_WORDS = {"难道", "何必", "怎么可以", "怎么可能", "哪能", "岂能", "谁还"}
 
     @classmethod
-    def _seg(cls, text: str) -> list:
+    async def _seg(cls, text: str) -> list:
         """分词并保留位置信息"""
         text = re.sub(r"[^\w\s\u4e00-\u9fa5]", "", text.lower())
         words = []
-        for word in jieba.lcut(text):
+        # jieba.lcut 是 CPU 密集型操作，在大文本下可能阻塞事件循环
+        if len(text) > 500:
+            lcut_res = await asyncio.to_thread(jieba.lcut, text)
+        else:
+            lcut_res = jieba.lcut(text)
+            
+        for word in lcut_res:
             if word.strip() and word not in cls.STOP:
                 words.append(word)
         logger.debug(f"[sentiment] {words}")
@@ -273,33 +280,33 @@ class Sentiment:
 
     # 对外接口
     @classmethod
-    def shut(cls, text: str) -> float:
+    async def shut(cls, text: str) -> float:
         """判断是否要闭嘴"""
-        words = cls._seg(text)
+        words = await cls._seg(text)
         return cls._calculate_confidence(words, cls.SHUT_WORDS)
 
     @classmethod
-    def insult(cls, text: str) -> float:
+    async def insult(cls, text: str) -> float:
         """判断是否辱骂"""
-        words = cls._seg(text)
+        words = await cls._seg(text)
         return cls._calculate_confidence(words, cls.INSULT_WORDS)
 
     @classmethod
-    def bored(cls, text: str) -> float:
+    async def bored(cls, text: str) -> float:
         """判断是否无聊"""
-        words = cls._seg(text)
+        words = await cls._seg(text)
         return cls._calculate_confidence(words, cls.BORED_WORDS)
 
     @classmethod
-    def ask(cls, text: str) -> float:
+    async def ask(cls, text: str) -> float:
         """判断是否疑惑"""
-        words = cls._seg(text)
+        words = await cls._seg(text)
         return cls._calculate_confidence(words, cls.ASK_WORDS)
 
     @classmethod
-    def is_ai(cls, text: str) -> float:
+    async def is_ai(cls, text: str) -> float:
         """
         判断是否为AI口吻
         """
-        words = cls._seg(text)
+        words = await cls._seg(text)
         return cls._calculate_confidence(words, cls.AI_WORDS)

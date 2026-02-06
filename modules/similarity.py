@@ -1,5 +1,6 @@
 # \modules\similarity.py
 
+import asyncio
 import math
 import re
 from collections import defaultdict, deque
@@ -64,10 +65,13 @@ class Similarity:
     # ---------------------------------------------------------
     # 分词
     # ---------------------------------------------------------
-    def _tokenize(self, text: Any):
+    async def _tokenize(self, text: Any):
         text = self._to_plain_text(text)
         text = re.sub(r"[^\w\u4e00-\u9fa5]", " ", text)
-        tokens = jieba.lcut(text)
+        if len(text) > 500:
+            tokens = await asyncio.to_thread(jieba.lcut, text)
+        else:
+            tokens = jieba.lcut(text)
         return [t for t in tokens if t not in self.stopwords and t.strip()]
 
     # ---------------------------------------------------------
@@ -97,7 +101,7 @@ class Similarity:
     # ---------------------------------------------------------
     # bot 消息预处理
     # ---------------------------------------------------------
-    def _preprocess_bot_msgs(self, msgs: list) -> list[str]:
+    async def _preprocess_bot_msgs(self, msgs: list) -> list[str]:
         cleaned = []
         seen = set()
 
@@ -117,7 +121,7 @@ class Similarity:
                 continue
 
             # token 数过滤（模板句过滤）
-            tokens = self._tokenize(m)
+            tokens = await self._tokenize(m)
             if len(tokens) <= self.bot_template_threshold:
                 continue
 
@@ -168,7 +172,7 @@ class Similarity:
     # ---------------------------------------------------------
     # 主接口
     # ---------------------------------------------------------
-    def similarity(
+    async def similarity(
         self,
         group_id: str,
         user_msg: str,
@@ -179,7 +183,7 @@ class Similarity:
         计算用户消息与一组 bot 消息的最大相似度
         """
         # 分词
-        user_tokens = self._tokenize(user_msg)
+        user_tokens = await self._tokenize(user_msg)
         if not user_tokens:
             return 0.0
 
@@ -193,22 +197,15 @@ class Similarity:
         user_vec = self._tfidf_vector(group_id, user_tokens)
 
         # bot 消息预处理 + 最近优先
-        bot_list = self._preprocess_bot_msgs(bot_msgs)[::-1]
+        bot_list = (await self._preprocess_bot_msgs(bot_msgs))[::-1]
 
         best = 0.0
         for bm in bot_list:
-            bm_tokens = self._tokenize(bm)
-            if not bm_tokens:
-                continue
-
-            bm_vec = self._tfidf_vector(group_id, bm_tokens)
-
-            sim = self._cosine(user_vec, bm_vec)
+            btokens = await self._tokenize(bm)
+            bvec = self._tfidf_vector(group_id, btokens)
+            sim = self._cosine(user_vec, bvec)
             if sim > best:
                 best = sim
-
-            # 提前返回
-            if sim >= self.early_stop:
-                return sim
-
+            if best >= self.early_stop:
+                break
         return best

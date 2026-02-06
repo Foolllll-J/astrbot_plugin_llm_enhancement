@@ -72,7 +72,7 @@ def is_gif_file(path: str) -> bool:
             return False
         with p.open("rb") as f:
             header = f.read(6)
-    except Exception:
+    except OSError:
         return False
 
     # GIF87a, GIF89a
@@ -355,7 +355,7 @@ async def extract_forward_video_keyframes(
             continue
             
         # 3. 探测时长
-        duration = probe_duration_sec(ffmpeg_path, video_path)
+        duration = await asyncio.to_thread(probe_duration_sec, ffmpeg_path, video_path)
         
         # 安全限制：硬编码 120 分钟 (7200秒)
         safety_max_duration = 7200
@@ -482,7 +482,7 @@ async def prepare_video_context(
             continue
             
         # 3. 探测时长
-        duration = probe_duration_sec(ffmpeg_path, video_path)
+        duration = await asyncio.to_thread(probe_duration_sec, ffmpeg_path, video_path)
         
         # 安全限制：硬编码 120 分钟 (7200秒)
         safety_max_duration = 7200

@@ -2,10 +2,17 @@ import json
 from typing import List, Dict, Any, Tuple
 from astrbot.api import logger
 
+MAX_RECURSION_DEPTH = 5  # 最大递归深度，防止恶意嵌套
+
 async def extract_content_recursively(message_nodes: List[Dict[str, Any]], extracted_texts: list[str], image_urls: list[str], video_sources: list[str], depth: int = 0):
     """
     核心递归解析器。遍历消息节点列表，提取文本、图片、视频，并处理嵌套的 forward 结构。
     """
+    if depth > MAX_RECURSION_DEPTH:
+        logger.warning(f"forward_parser: 达到最大递归深度 ({MAX_RECURSION_DEPTH})，停止解析。")
+        extracted_texts.append("  " * depth + "[已达到最大转发嵌套深度，后续内容略]")
+        return
+
     indent = "  " * depth
     for message_node in message_nodes: 
         sender_name = message_node.get("sender", {}).get("nickname", "未知用户")

@@ -193,11 +193,10 @@ class LLMEnhancement(Star):
         reason = "at_or_cmd"
 
         # 特殊处理：空 @ 机器人消息
-        empty_pt = self._get_cfg("empty_mention_pt")
-        if wake and not msg and empty_pt:
-            prompt = empty_pt.format(username=event.get_sender_name())
-            yield event.request_llm(prompt=prompt)
-            return
+        if wake and not msg:
+            msg = f"{event.get_sender_name()}@了你"
+            event.message_str = msg
+            reason = "空@唤醒"
 
         if not msg:
             if not wake:
@@ -219,7 +218,7 @@ class LLMEnhancement(Star):
             wake_extend = self._get_cfg("wake_extend")
             if (wake_extend and (now - member.last_response) <= int(wake_extend or 0)):
                 if bmsgs := await self._get_history_msg(event, count=3):
-                    simi = self.similarity.similarity(gid, msg, bmsgs)
+                    simi = await self.similarity.similarity(gid, msg, bmsgs)
                     threshold = self._get_cfg("wake_extend_similarity", 0.1)
                     logger.debug(f" [LLMEnhancement] 唤醒延长检查: 相关系数={simi:.4f}, 阈值={threshold:.4f}, 历史参考={len(bmsgs)}条")
                     if simi >= threshold:
@@ -231,7 +230,7 @@ class LLMEnhancement(Star):
             relevant_wake = self._get_cfg("relevant_wake")
             if relevant_wake:
                 if bmsgs := await self._get_history_msg(event, count=5):
-                    simi = self.similarity.similarity(gid, msg, bmsgs)
+                    simi = await self.similarity.similarity(gid, msg, bmsgs)
                     if simi >= relevant_wake:
                         wake = True
                         reason = f"话题相关性{simi:.2f}>={relevant_wake}"
@@ -240,7 +239,7 @@ class LLMEnhancement(Star):
         if gid and not wake:
             ask_wake = self._get_cfg("ask_wake")
             if ask_wake:  
-                if self.sent.ask(msg) >= ask_wake:
+                if (await self.sent.ask(msg)) >= ask_wake:
                     wake = True
                     reason = "答疑唤醒"
 
@@ -292,28 +291,29 @@ class LLMEnhancement(Star):
                 # 遍历该群所有成员
                 found = False
                 for member in g.members.values():
-                    # 增加调试日志
-                    if member.pending_msg_ids:
-                        logger.debug(f" [LLMEnhancement] 正在检查用户 {member.uid} 的待处理消息: {member.pending_msg_ids}")
-                    
-                    # 检查撤回的消息是否在待处理列表中
-                    if member.pending_msg_ids and msg_id in member.pending_msg_ids:
-                        in_merging = getattr(member, "in_merging", False)
+                    async with member.lock:
+                        # 增加调试日志
+                        if member.pending_msg_ids:
+                            logger.debug(f" [LLMEnhancement] 正在检查用户 {member.uid} 的待处理消息: {member.pending_msg_ids}")
                         
-                        # 如果正在合并中，交由 collect_messages 处理（它会负责从 pending_msg_ids 移除）
-                        if in_merging:
-                             logger.debug(f" [LLMEnhancement] 检测到消息撤回 (ID: {msg_id})，但当前处于合并期，交由合并器处理。")
-                             continue
-                        
-                        # 如果不在合并期（即 LLM 处理期），则移除该 ID
-                        member.pending_msg_ids.remove(msg_id)
-                        logger.info(f" [LLMEnhancement] 检测到部分消息撤回 (ID: {msg_id})，已从用户 {member.uid} 的上下文中移除。剩余: {len(member.pending_msg_ids)}")
-                        
-                        # 如果所有消息都撤回了，则取消任务
-                        if not member.pending_msg_ids:
-                            member.cancel_merge = True
-                            found = True
-                            logger.info(f" [LLMEnhancement] 用户 {member.uid} 的所有请求消息均已被撤回，正在取消合并/请求流程。")
+                        # 检查撤回的消息是否在待处理列表中
+                        if member.pending_msg_ids and msg_id in member.pending_msg_ids:
+                            in_merging = getattr(member, "in_merging", False)
+                            
+                            # 如果正在合并中，交由 collect_messages 处理（它会负责从 pending_msg_ids 移除）
+                            if in_merging:
+                                 logger.debug(f" [LLMEnhancement] 检测到消息撤回 (ID: {msg_id})，但当前处于合并期，交由合并器处理。")
+                                 continue
+                            
+                            # 如果不在合并期（即 LLM 处理期），则移除该 ID
+                            member.pending_msg_ids.remove(msg_id)
+                            logger.info(f" [LLMEnhancement] 检测到部分消息撤回 (ID: {msg_id})，已从用户 {member.uid} 的上下文中移除。剩余: {len(member.pending_msg_ids)}")
+                            
+                            # 如果所有消息都撤回了，则取消任务
+                            if not member.pending_msg_ids:
+                                member.cancel_merge = True
+                                found = True
+                                logger.info(f" [LLMEnhancement] 用户 {member.uid} 的所有请求消息均已被撤回，正在取消合并/请求流程。")
                     
                     # 如果是后续消息被撤回，on_notice 不做处理，交给 collect_messages 在合并窗口期处理
                     # 如果已经过了合并窗口期（即在 LLM 生成中），后续消息撤回无法影响已发送的 prompt，故忽略
@@ -325,18 +325,19 @@ class LLMEnhancement(Star):
     
     async def _handle_message_merge(self, event: AstrMessageEvent, req: ProviderRequest, gid: str, uid: str, member: MemberState) -> List[Any]:
         """执行消息合并逻辑，根据配置决定是否收集多用户消息并格式化。"""
-        # 初始化状态
-        member.pending_msg_ids.clear()
-        member.cancel_merge = False
-        member.trigger_msg_id = None
-        member.in_merging = True  # 标记正在合并中，防止 on_notice 误判
-        
-        # 获取初始消息 ID
-        current_msg_id = None
-        if hasattr(event, "message_obj") and hasattr(event.message_obj, "message_id"):
-            current_msg_id = str(event.message_obj.message_id)
-            member.pending_msg_ids.add(current_msg_id)
-            member.trigger_msg_id = current_msg_id # 记录触发消息 ID
+        async with member.lock:
+            # 初始化状态
+            member.pending_msg_ids.clear()
+            member.cancel_merge = False
+            member.trigger_msg_id = None
+            member.in_merging = True  # 标记正在合并中，防止 on_notice 误判
+            
+            # 获取初始消息 ID
+            current_msg_id = None
+            if hasattr(event, "message_obj") and hasattr(event.message_obj, "message_id"):
+                current_msg_id = str(event.message_obj.message_id)
+                member.pending_msg_ids.add(current_msg_id)
+                member.trigger_msg_id = current_msg_id # 记录触发消息 ID
 
         # buffer 结构: List[Tuple[msg_id, sender_name, message_str]]
         # 注意：这里改为存储三元组，以便后续按 ID 删除
@@ -359,22 +360,23 @@ class LLMEnhancement(Star):
             if is_recall:
                 recalled_msg_id = str(raw.get("message_id"))
                 
-                # 无论撤回的是触发消息还是后续消息，都从 buffer 中查找并移除
-                for i, (mid, name, content) in enumerate(message_buffer):
-                    if mid == recalled_msg_id:
-                        logger.info(f" [LLMEnhancement] 合并期间检测到消息撤回 (ID: {recalled_msg_id})，已从合并列表中移除。")
-                        message_buffer.pop(i)
-                        # 同时也从 pending_msg_ids 中移除
-                        if recalled_msg_id in member.pending_msg_ids:
-                            member.pending_msg_ids.remove(recalled_msg_id)
-                        break
-                
-                # 如果队列空了，立即终止会话
-                if not message_buffer:
-                    logger.info(f" [LLMEnhancement] 合并队列已空，终止合并流程。")
-                    member.cancel_merge = True
-                    controller.stop()
-                    return
+                async with member.lock:
+                    # 无论撤回的是触发消息还是后续消息，都从 buffer 中查找并移除
+                    for i, (mid, name, content) in enumerate(message_buffer):
+                        if mid == recalled_msg_id:
+                            logger.info(f" [LLMEnhancement] 合并期间检测到消息撤回 (ID: {recalled_msg_id})，已从合并列表中移除。")
+                            message_buffer.pop(i)
+                            # 同时也从 pending_msg_ids 中移除
+                            if recalled_msg_id in member.pending_msg_ids:
+                                member.pending_msg_ids.remove(recalled_msg_id)
+                            break
+                    
+                    # 如果队列空了，立即终止会话
+                    if not message_buffer:
+                        logger.info(f" [LLMEnhancement] 合并队列已空，终止合并流程。")
+                        member.cancel_merge = True
+                        controller.stop()
+                        return
 
                 # 刷新等待时间，继续收集
                 controller.keep(timeout=merge_delay, reset_timeout=True)
@@ -420,7 +422,8 @@ class LLMEnhancement(Star):
             
             # 记录消息 ID
             if new_msg_id:
-                member.pending_msg_ids.add(new_msg_id)
+                async with member.lock:
+                    member.pending_msg_ids.add(new_msg_id)
 
             message_buffer.append((new_msg_id, ev.get_sender_name(), ev.message_str))
             for seg in ev.message_obj.message:
@@ -434,7 +437,8 @@ class LLMEnhancement(Star):
         except TimeoutError:
             pass # 继续后续处理
         finally:
-            member.in_merging = False # 合并结束
+            async with member.lock:
+                member.in_merging = False # 合并结束
             
         # 无论是否超时，如果已取消，直接返回
         if member.cancel_merge:
@@ -656,7 +660,7 @@ class LLMEnhancement(Star):
         if gid:
             shutup_th_cfg = self._get_cfg("shutup")
             if shutup_th_cfg:
-                shut_th = self.sent.shut(msg)
+                shut_th = await self.sent.shut(msg)
                 if shut_th > shutup_th_cfg:
                     silence_sec = shut_th * self._get_cfg("silence_multiple", 500)
                     g.shutup_until = now + silence_sec
@@ -666,7 +670,7 @@ class LLMEnhancement(Star):
 
         insult_th_cfg = self._get_cfg("insult")
         if insult_th_cfg:
-            insult_th = self.sent.insult(msg)
+            insult_th = await self.sent.insult(msg)
             if insult_th > insult_th_cfg:
                 silence_sec = insult_th * self._get_cfg("silence_multiple", 500)
                 member.silence_until = now + silence_sec

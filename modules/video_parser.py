@@ -511,14 +511,54 @@ async def prepare_video_context(
 class VideoFrameProcessor:
     """统一的视频/GIF 帧处理器"""
     
+    # 视频总结缓存: {message_id: {"summary": str, "expire": float}}
+    _summary_cache: Dict[str, Dict[str, Any]] = {}
+    _cache_lock = asyncio.Lock()
+    
     def __init__(self, context, event, config_getter):
         self.context = context
         self.event = event
         self._get_cfg = config_getter
     
-    async def process_long_video(self, req: ProviderRequest, video_path: str, duration: float, sender_name: str = None) -> bool:
+    @classmethod
+    async def get_cached_summary(cls, video_key: str) -> Optional[str]:
+        """获取缓存的视频总结"""
+        async with cls._cache_lock:
+            if video_key in cls._summary_cache:
+                item = cls._summary_cache[video_key]
+                if time.time() < item["expire"]:
+                    logger.debug(f"[VideoFrameProcessor] 视频总结缓存命中: {video_key[:50]}...")
+                    return item["summary"]
+                else:
+                    del cls._summary_cache[video_key]
+        return None
+
+    @classmethod
+    async def set_cached_summary(cls, video_key: str, summary: str, ttl: int = 3600):
+        """设置视频总结缓存，默认有效期 1 小时"""
+        async with cls._cache_lock:
+            # 简单的容量清理：如果缓存超过 100 条，清空全部
+            if len(cls._summary_cache) > 100:
+                cls._summary_cache.clear()
+            
+            cls._summary_cache[video_key] = {
+                "summary": summary,
+                "expire": time.time() + ttl
+            }
+            logger.debug(f"[VideoFrameProcessor] 视频总结已缓存: {video_key}")
+
+    async def process_long_video(self, req: ProviderRequest, video_path: str, duration: float, sender_name: str = None, msg_id: str = None) -> bool:
         """【场景：视频】多帧抽取 + ASR → 帧聚合汇总"""
-        try:  
+        logger.debug(f"[VideoFrameProcessor] 开始处理视频: {video_path}, msg_id: {msg_id}")
+        try:
+            # 1. 尝试从缓存获取
+            cached_summary = None
+            if msg_id:
+                cached_summary = await self.get_cached_summary(msg_id)
+                if cached_summary:
+                    self._inject_summary(req, cached_summary, "视频转述(缓存复用)", sender_name=sender_name)
+                    return True
+
             frames, cleanup_paths, local_video_path, status = await self._extract_video_frames(video_path, duration)
             
             if not frames:
@@ -549,6 +589,11 @@ class VideoFrameProcessor:
             )
             
             if summary:
+                if msg_id:
+                    await self.set_cached_summary(msg_id, summary)
+                else:
+                    logger.warning("[VideoFrameProcessor] msg_id 为空，跳过缓存写入")
+                
                 self._inject_summary(req, summary, "视频转述", sender_name=sender_name)
                 logger.info(f"[VideoFrameProcessor] 视频总结成功并注入，来源: {sender_name or '当前消息'}")
                 # 注册清理
@@ -567,9 +612,18 @@ class VideoFrameProcessor:
             logger.warning(f"[VideoFrameProcessor] 视频处理失败: {e}")
             return False
     
-    async def process_gif(self, req: ProviderRequest, gif_path: str, sender_name: str = None) -> bool:
+    async def process_gif(self, req: ProviderRequest, gif_path: str, sender_name: str = None, msg_id: str = None) -> bool:
         """【场景：GIF 动图】强制抽帧 → 帧聚合汇总"""
+        logger.debug(f"[VideoFrameProcessor] 开始处理 GIF: {gif_path}, msg_id: {msg_id}")
         try:
+            # 1. 尝试从缓存获取
+            cached_summary = None
+            if msg_id:
+                cached_summary = await self.get_cached_summary(msg_id)
+                if cached_summary:
+                    self._inject_summary(req, cached_summary, "内容摘要(缓存复用)", sender_name=sender_name)
+                    return True
+
             logger.info(f"[VideoFrameProcessor] GIF 处理: {gif_path}")
             
             ffmpeg_path = self._get_cfg("ffmpeg_path")
@@ -608,6 +662,11 @@ class VideoFrameProcessor:
             )
             
             if summary:
+                if msg_id:
+                    await self.set_cached_summary(msg_id, summary)
+                else:
+                    logger.warning("[VideoFrameProcessor] GIF msg_id 为空，跳过缓存写入")
+                
                 self._inject_summary(req, summary, "内容摘要", sender_name=sender_name)
                 # 只保留最后一帧
                 req.image_urls = [frames[-1]]

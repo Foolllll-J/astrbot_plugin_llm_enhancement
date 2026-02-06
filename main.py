@@ -141,15 +141,16 @@ class LLMEnhancement(Star):
 
     # ==================== 唤醒消息级别 ====================
     
-    @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE, priority=1)
+    @filter.event_message_type(filter.EventMessageType.ALL, priority=1)
     async def on_group_msg(self, event: AstrMessageEvent):
-        """处理群消息的初步过滤、黑白名单检查及唤醒逻辑。"""
+        """处理消息的初步过滤、黑白名单检查及唤醒逻辑。支持群聊和私聊。"""
         self._refresh_config()
         bid: str = event.get_self_id()
-        gid: str = event.get_group_id()
+        gid: str = event.get_group_id() # 私聊下为 None
         uid: str = event.get_sender_id()
         msg: str = event.message_str.strip() if event.message_str else ""
-        g = StateManager.get_group(gid)
+        
+        g = StateManager.get_group(gid or f"private_{uid}")
 
         # 1. 全局屏蔽检查
         if uid == bid: return
@@ -158,14 +159,17 @@ class LLMEnhancement(Star):
         if await is_user_blacklisted_via_blacklist_plugin(uid):
             event.stop_event()
             return
-        whitelist = self._get_cfg("group_whitelist")
-        if whitelist and gid not in whitelist:
-            return
-        
-        blacklist = self._get_cfg("group_blacklist")
-        if blacklist and gid in blacklist and not event.is_admin():
-            event.stop_event()
-            return
+
+        # 仅在群聊环境下检查群黑白名单
+        if gid:
+            whitelist = self._get_cfg("group_whitelist")
+            if whitelist and gid not in whitelist:
+                return
+            
+            blacklist = self._get_cfg("group_blacklist")
+            if blacklist and gid in blacklist and not event.is_admin():
+                event.stop_event()
+                return
             
         u_blacklist = self._get_cfg("user_blacklist")
         if u_blacklist and uid in u_blacklist:
@@ -199,50 +203,54 @@ class LLMEnhancement(Star):
             if not wake:
                 return
 
-        # 提及唤醒
-        mention_wake = self._get_cfg("mention_wake")
-        if not wake and mention_wake:
-            names = [n for n in mention_wake if n]
-            for n in names:
-                if n and n in msg:
+        # 提及唤醒 (仅群聊)
+        if gid and not wake:
+            mention_wake = self._get_cfg("mention_wake")
+            if mention_wake:
+                names = [n for n in mention_wake if n]
+                for n in names:
+                    if n and n in msg:
+                        wake = True
+                        reason = f"提及唤醒({n})"
+                        break
+
+        # 唤醒延长 (仅群聊)
+        if gid and not wake:
+            wake_extend = self._get_cfg("wake_extend")
+            if (wake_extend and (now - member.last_response) <= int(wake_extend or 0)):
+                if bmsgs := await self._get_history_msg(event, count=3):
+                    simi = self.similarity.similarity(gid, msg, bmsgs)
+                    threshold = self._get_cfg("wake_extend_similarity", 0.1)
+                    logger.debug(f" [LLMEnhancement] 唤醒延长检查: 相关系数={simi:.4f}, 阈值={threshold:.4f}, 历史参考={len(bmsgs)}条")
+                    if simi >= threshold:
+                        wake = True
+                        reason = f"唤醒延长(相关性{simi:.2f})"
+
+        # 话题相关性唤醒 (仅群聊)
+        if gid and not wake:
+            relevant_wake = self._get_cfg("relevant_wake")
+            if relevant_wake:
+                if bmsgs := await self._get_history_msg(event, count=5):
+                    simi = self.similarity.similarity(gid, msg, bmsgs)
+                    if simi >= relevant_wake:
+                        wake = True
+                        reason = f"话题相关性{simi:.2f}>={relevant_wake}"
+
+        # 答疑唤醒 (仅群聊)
+        if gid and not wake:
+            ask_wake = self._get_cfg("ask_wake")
+            if ask_wake:  
+                if self.sent.ask(msg) >= ask_wake:
                     wake = True
-                    reason = f"提及唤醒({n})"
-                    break
+                    reason = "答疑唤醒"
 
-        # 唤醒延长
-        wake_extend = self._get_cfg("wake_extend")
-        if (not wake and wake_extend and 
-            (now - member.last_response) <= int(wake_extend or 0)):
-            if bmsgs := await self._get_history_msg(event, count=3):
-                simi = self.similarity.similarity(gid, msg, bmsgs)
-                threshold = self._get_cfg("wake_extend_similarity", 0.1)
-                logger.debug(f" [LLMEnhancement] 唤醒延长检查: 相关系数={simi:.4f}, 阈值={threshold:.4f}, 历史参考={len(bmsgs)}条")
-                if simi >= threshold:
+        # 概率唤醒 (仅群聊)
+        if gid and not wake:
+            prob_wake = self._get_cfg("prob_wake")
+            if prob_wake:  
+                if random.random() < prob_wake:
                     wake = True
-                    reason = f"唤醒延长(相关性{simi:.2f})"
-
-        # 话题相关性唤醒
-        relevant_wake = self._get_cfg("relevant_wake")
-        if not wake and relevant_wake:
-            if bmsgs := await self._get_history_msg(event, count=5):
-                simi = self.similarity.similarity(gid, msg, bmsgs)
-                if simi >= relevant_wake:
-                    wake = True
-                    reason = f"话题相关性{simi:.2f}>={relevant_wake}"
-
-        # 答疑唤醒
-        ask_wake = self._get_cfg("ask_wake")
-        if not wake and ask_wake:  
-            if self.sent.ask(msg) >= ask_wake:
-                wake = True
-                reason = "答疑唤醒"
-
-        # 概率唤醒
-        prob_wake = self._get_cfg("prob_wake")
-        if not wake and prob_wake:  
-            if random.random() < prob_wake:
-                wake = True
-                reason = "概率唤醒"
+                    reason = "概率唤醒"
 
         # 违禁词检查
         forbidden_words = self._get_cfg("wake_forbidden_words")
@@ -254,7 +262,8 @@ class LLMEnhancement(Star):
 
         if wake:
             event.is_at_or_wake_command = True
-            logger.info(f"群({gid})用户({uid}) {reason}: {msg[:50]}")
+            log_prefix = f"群({gid})" if gid else "私聊"
+            logger.info(f"{log_prefix}用户({uid}) {reason}: {msg[:50]}")
 
     @filter.platform_adapter_type(PlatformAdapterType.AIOCQHTTP)
     @filter.event_message_type(filter.EventMessageType.ALL, priority=10)
@@ -270,12 +279,16 @@ class LLMEnhancement(Star):
         post_type = raw_message.get("post_type")
         notice_type = raw_message.get("notice_type")
         
-        if post_type == "notice" and notice_type == "group_recall":
+        if post_type == "notice" and notice_type in ["group_recall", "friend_recall"]:
             gid = str(raw_message.get("group_id", ""))
+            user_id = str(raw_message.get("user_id", ""))
             msg_id = str(raw_message.get("message_id", ""))
             
-            if gid and msg_id:
-                g = StateManager.get_group(gid)
+            # 如果没有群 ID，则认为是私聊撤回，使用 private_{user_id} 作为虚拟群组 ID
+            target_id = gid if gid else (f"private_{user_id}" if user_id else "")
+            
+            if target_id and msg_id:
+                g = StateManager.get_group(target_id)
                 # 遍历该群所有成员
                 found = False
                 for member in g.members.values():
@@ -341,19 +354,20 @@ class LLMEnhancement(Star):
             raw = ev.message_obj.raw_message if (ev.message_obj and hasattr(ev.message_obj, "raw_message")) else {}
             if not raw and hasattr(ev, "event") and isinstance(ev.event, dict): raw = ev.event
             
-            if raw.get("post_type") == "notice" and raw.get("notice_type") == "group_recall":
+            # 处理撤回事件 (支持群聊和私聊)
+            is_recall = raw.get("post_type") == "notice" and raw.get("notice_type") in ["group_recall", "friend_recall"]
+            if is_recall:
                 recalled_msg_id = str(raw.get("message_id"))
                 
                 # 无论撤回的是触发消息还是后续消息，都从 buffer 中查找并移除
-                found_in_buffer = False
                 for i, (mid, name, content) in enumerate(message_buffer):
                     if mid == recalled_msg_id:
                         logger.info(f" [LLMEnhancement] 合并期间检测到消息撤回 (ID: {recalled_msg_id})，已从合并列表中移除。")
                         message_buffer.pop(i)
-                        found_in_buffer = True
                         # 同时也从 pending_msg_ids 中移除
                         if recalled_msg_id in member.pending_msg_ids:
                             member.pending_msg_ids.remove(recalled_msg_id)
+                        break
                 
                 # 如果队列空了，立即终止会话
                 if not message_buffer:
@@ -371,13 +385,18 @@ class LLMEnhancement(Star):
                 controller.stop()
                 return
 
-            # 基础检查：必须是同个群
-            if ev.get_group_id() != gid:
-                return
-
-            # 如果不允许跨用户合并，则检查发送者是否一致
-            if not allow_multi_user and ev.get_sender_id() != uid:
-                return
+            # 环境检查
+            if gid:
+                # 群聊环境：必须是同个群
+                if ev.get_group_id() != gid:
+                    return
+                # 如果不允许跨用户合并，则检查发送者是否一致
+                if not allow_multi_user and ev.get_sender_id() != uid:
+                    return
+            else:
+                # 私聊环境：必须是同个发送者
+                if ev.get_sender_id() != uid:
+                    return
             
             # 检查是否是消息（排除 notice 等）
             if not ev.message_str and not any(isinstance(seg, (Comp.Image, Comp.Video, Comp.File, Comp.Forward)) for seg in ev.message_obj.message):
@@ -436,7 +455,8 @@ class LLMEnhancement(Star):
 
             event.message_str = merged_msg
             req.prompt = merged_msg
-            logger.info(f"合并：用户({uid})触发，共合并了{len(message_buffer)}条消息 (涉及{len(senders)}人)")
+            log_prefix = f"群({gid})" if gid else "私聊"
+            logger.info(f"{log_prefix}合并：用户({uid})触发，共合并了{len(message_buffer)}条消息 (涉及{len(senders)}人)")
         else:
             # 如果所有消息都被撤回了
             logger.info(f" [LLMEnhancement] 所有消息均已被撤回，取消请求。")
@@ -619,10 +639,10 @@ class LLMEnhancement(Star):
         setattr(event, "_provider_req", req)
         gid: str = event.get_group_id()
         uid: str = event.get_sender_id()
-        if not gid or not uid:
+        if not uid:
             return
         
-        g = StateManager.get_group(gid)
+        g = StateManager.get_group(gid or f"private_{uid}")
         if uid not in g.members:
             g.members[uid] = MemberState(uid=uid)
         member = g.members[uid]
@@ -632,16 +652,17 @@ class LLMEnhancement(Star):
         if member.in_merging:
             return
 
-        # ==================== 1. 防护机制 ====================
-        shutup_th_cfg = self._get_cfg("shutup")
-        if shutup_th_cfg:
-            shut_th = self.sent.shut(msg)
-            if shut_th > shutup_th_cfg:
-                silence_sec = shut_th * self._get_cfg("silence_multiple", 500)
-                g.shutup_until = now + silence_sec
-                logger.info(f"群({gid})触发闭嘴，沉默{silence_sec:.1f}秒")
-                event.stop_event()
-                return
+        # ==================== 1. 防护机制 (仅群聊) ====================
+        if gid:
+            shutup_th_cfg = self._get_cfg("shutup")
+            if shutup_th_cfg:
+                shut_th = self.sent.shut(msg)
+                if shut_th > shutup_th_cfg:
+                    silence_sec = shut_th * self._get_cfg("silence_multiple", 500)
+                    g.shutup_until = now + silence_sec
+                    logger.info(f"群({gid})触发闭嘴，沉默{silence_sec:.1f}秒")
+                    event.stop_event()
+                    return
 
         insult_th_cfg = self._get_cfg("insult")
         if insult_th_cfg:
@@ -651,7 +672,7 @@ class LLMEnhancement(Star):
                 member.silence_until = now + silence_sec
                 logger.info(f"用户({uid})触发辱骂沉默{silence_sec:.1f}秒(下次生效)")
 
-        if g.shutup_until > now:
+        if gid and g.shutup_until > now:
             event.stop_event()
             return
         if not event.is_admin() and member.silence_until > now:
@@ -922,7 +943,11 @@ class LLMEnhancement(Star):
                 if media_ctx.scenario == MediaScenario.VIDEO:  
                     logger.debug("[分支] 执行视频处理")
                     quoted_sender = getattr(req, "_quoted_sender", None) if reply_seg else None
-                    success = await processor.process_long_video(req, media_ctx.media_path, media_ctx.duration, sender_name=quoted_sender)
+                    # 获取引用消息的 ID 或当前消息 ID 作为缓存键
+                    msg_id = str(reply_seg.id) if reply_seg else str(event.message_obj.message_id)
+                    
+                    logger.debug(f"[LLMEnhancement] 视频处理最终 msg_id: {msg_id}")
+                    success = await processor.process_long_video(req, media_ctx.media_path, media_ctx.duration, sender_name=quoted_sender, msg_id=msg_id)
                     if not success:  
                         logger.warning("[分支] 视频处理失败")
                 
@@ -930,7 +955,11 @@ class LLMEnhancement(Star):
                 elif media_ctx.scenario == MediaScenario.GIF_ANIMATED:
                     logger.debug("[分支] 执行 GIF 处理")
                     quoted_sender = getattr(req, "_quoted_sender", None) if reply_seg else None
-                    success = await processor.process_gif(req, media_ctx.media_path, sender_name=quoted_sender)
+                    # 获取引用消息的 ID 或当前消息 ID 作为缓存键
+                    msg_id = str(reply_seg.id) if reply_seg else str(event.message_obj.message_id)
+                        
+                    logger.debug(f"[LLMEnhancement] GIF 处理最终 msg_id: {msg_id}")
+                    success = await processor.process_gif(req, media_ctx.media_path, sender_name=quoted_sender, msg_id=msg_id)
                     if not success: 
                         logger.warning("[分支] GIF 处理失败")
                 

@@ -475,11 +475,11 @@ class LLMEnhancement(Star):
     @filter.llm_tool(name="get_user_avatar")
     async def get_user_avatar(self, event: AstrMessageEvent, user_id: str) -> str:
         """
-        获取指定 QQ 号的头像并注入到当前对话中。
-        当用户要求查看某个人的头像，或者需要根据头像信息进行识别/描述时调用。
+        获取指定 QQ 用户的头像并将其作为图片附件注入到当前对话中。
+        当你需要识别、描述某个人头像特征，或者用户明确要求“看看某人的头像”时使用。
 
         Args:
-            user_id (str): 用户的 QQ 号。
+            user_id (str): 目标用户的 QQ 号。必须是纯数字字符串。
         """
         avatar_url = f"https://q4.qlogo.cn/headimg_dl?dst_uin={user_id}&spec=640"
         
@@ -509,24 +509,31 @@ class LLMEnhancement(Star):
             return f"注入头像失败:  {e}"
 
     @filter.llm_tool(name="get_group_members_info")
-    async def get_group_members(self, event: AstrMessageEvent) -> str:
+    async def get_group_members(self, event: AstrMessageEvent, group_id: str = None) -> str:
         """
-        获取QQ群成员信息的LLM工具。
-        需要判断是否为群聊时，以及当需要知道群里有哪些人，或者需要获取他们的昵称和用户ID，
-        或者需要知道群里是否有特定成员时，调用此工具。其中display_name是“群昵称”，username是用户“QQ名”
-        获取数据之后需要联系上下文，用符合prompt的方式回答用户的问题。
+        获取指定 QQ 群的成员列表。
+        当需要了解群成员构成、获取成员昵称/ID、统计人数或确认某人是否在群内时调用。
+        返回数据包含：
+        - user_id: QQ 号
+        - nickname: 账户昵称
+        - card: 群名片/备注
+        - role: 权限角色 (owner/admin/member)
+
+        Args:
+            group_id (str, optional): 目标 QQ 群号。如果未提供，将默认获取当前所在群聊的成员。
         """
-        return await process_group_members_info(event)
+        return await process_group_members_info(event, group_id)
 
     @filter.llm_tool(name="set_group_ban")
     async def set_group_ban(self, event: AstrMessageEvent, user_id: str, duration: int, user_name: str) -> str:
         """
-        在群聊中禁言某用户。被禁言的用户在禁言期间将无法发送消息。
+        在当前群聊中禁言或解除禁言某位成员。
+        仅在当前环境为群聊且你拥有管理员权限时有效。
         
         Args:
-            user_id (str): 被禁言用户的 QQ 号。
-            duration (int): 禁言时长（秒），0 表示取消禁言。
-            user_name (str): 被禁言用户的昵称。
+            user_id (str): 目标用户的 QQ 号。必须是纯数字字符串。
+            duration (int): 禁言时长（秒）。0 为解禁；60-600 为警告级；3600-86400 为惩罚级；最大为 2592000 (30天)。请根据违规严重程度灵活选择。
+            user_name (str): 目标用户的昵称或称呼，用于回复确认。
         """
         return await set_group_ban_logic(event, user_id, duration, user_name)
 

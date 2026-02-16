@@ -75,7 +75,7 @@ async def process_group_members_info(event: AstrMessageEvent, group_id: Optional
         logger.info(f"获取群成员信息时发生错误: {e}，耗时 {elapsed_time:.2f}s") 
         return json.dumps({"error": f"获取群成员信息时发生内部错误: {str(e)}"})
 
-async def set_group_ban_logic(event: AstrMessageEvent, user_id: str, duration: int, user_name: str) -> str:
+async def set_group_ban_logic(event: AstrMessageEvent, user_id: str, duration: int, user_name: str, group_id: str = None) -> str:
     """
     在群聊中禁言某用户的逻辑。
     """
@@ -87,11 +87,11 @@ async def set_group_ban_logic(event: AstrMessageEvent, user_id: str, duration: i
                 "message": "此功能仅支持 QQ 平台 (aiocqhttp)。"
             }, ensure_ascii=False)
 
-        group_id = event.get_group_id()
-        if not group_id:
+        target_group_id = group_id or event.get_group_id()
+        if not target_group_id:
             return json.dumps({
                 "success": False,
-                "message": "此工具只能在群聊中使用。"
+                "message": "未识别到群聊环境，请提供目标群号(group_id)。"
             }, ensure_ascii=False)
 
         # 2. 权限检查
@@ -114,7 +114,7 @@ async def set_group_ban_logic(event: AstrMessageEvent, user_id: str, duration: i
         # 3. 执行禁言
         client = event.bot
         params = {
-            "group_id": int(group_id),
+            "group_id": int(target_group_id),
             "user_id": int(user_id),
             "duration": duration
         }

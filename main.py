@@ -525,17 +525,18 @@ class LLMEnhancement(Star):
         return await process_group_members_info(event, group_id)
 
     @filter.llm_tool(name="set_group_ban")
-    async def set_group_ban(self, event: AstrMessageEvent, user_id: str, duration: int, user_name: str) -> str:
+    async def set_group_ban(self, event: AstrMessageEvent, user_id: str, duration: int, user_name: str, group_id: str = None) -> str:
         """
-        在当前群聊中禁言或解除禁言某位成员。
-        仅在当前环境为群聊且你拥有管理员权限时有效。
+        在群聊中禁言或解除禁言某位成员。
+        支持在群聊中直接使用，或在私聊中指定 group_id 使用。
         
         Args:
             user_id (str): 目标用户的 QQ 号。必须是纯数字字符串。
             duration (int): 禁言时长（秒）。0 为解禁；60-600 为警告级；3600-86400 为惩罚级；最大为 2592000 (30天)。请根据违规严重程度灵活选择。
             user_name (str): 目标用户的昵称或称呼，用于回复确认。
+            group_id (str, optional): 目标 QQ 群号。在私聊使用时必填，在群聊使用时可选（默认当前群）。
         """
-        return await set_group_ban_logic(event, user_id, duration, user_name)
+        return await set_group_ban_logic(event, user_id, duration, user_name, group_id)
 
     # ==================== LLM 请求级别逻辑 ====================
     

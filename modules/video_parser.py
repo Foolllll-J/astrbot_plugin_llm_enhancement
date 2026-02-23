@@ -20,6 +20,7 @@ from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent
 from astrbot.api.provider import LLMResponse, ProviderRequest
 import astrbot.api.message_components as Comp
+from .provider_utils import find_provider
 
 # ==================== 媒体处理场景枚举 ====================
 
@@ -490,7 +491,8 @@ async def prepare_video_context(
         if duration is None or duration > safety_max_duration or duration <= 0:
             if is_temp_video and video_path in cleanup_paths:
                 try: os.remove(video_path)
-                except: pass
+                except Exception as e:
+                    logger.debug(f"video_parser: failed to remove temp video {video_path}: {e}")
                 cleanup_paths.remove(video_path)
             status = "too_long"
             continue
@@ -696,7 +698,8 @@ class VideoFrameProcessor:
                 media_path
             ) or 0
             return duration
-        except:  
+        except Exception as e:
+            logger.debug(f"[VideoFrameProcessor] 时长探测失败: path={media_path}, err={e}")
             return 0
     
 
@@ -752,8 +755,8 @@ class VideoFrameProcessor:
                 logger.warning("[VideoFrameProcessor] ASR: 无可用 STT Provider")
                 try:
                     os.remove(wav_path)
-                except:
-                    pass
+                except Exception as e:
+                    logger.debug(f"[VideoFrameProcessor] ASR wav 清理失败(无 STT): path={wav_path}, err={e}")
                 return None
             
             asr_text = None
@@ -779,8 +782,8 @@ class VideoFrameProcessor:
             finally:
                 try:
                     os.remove(wav_path)
-                except:
-                    pass
+                except Exception as e:
+                    logger.debug(f"[VideoFrameProcessor] ASR wav 清理失败: path={wav_path}, err={e}")
             
             return asr_text
         except Exception as e:  
@@ -901,34 +904,7 @@ class VideoFrameProcessor:
     
     def _find_provider(self, provider_id: str):
         """通用方法：从所有 Provider（包含 LLM 和 STT）中查找匹配的 ID/Name"""
-        if not provider_id: return None
-        
-        # 合并所有可能的 Provider 列表进行搜索
-        all_lists = []
-        try: all_lists.append(self.context.get_all_providers())
-        except: pass
-        try: all_lists.append(self.context.get_all_stt_providers())
-        except: pass
-        
-        for p_list in all_lists:
-            if not p_list: continue
-            for p in p_list:
-                # 收集所有可能的标识符
-                candidates = set()
-                for attr in ("id", "provider_id", "name"):
-                    val = getattr(p, attr, None)
-                    if val: candidates.add(str(val))
-                
-                # 检查配置中的标识符
-                pcfg = getattr(p, "provider_config", None)
-                if isinstance(pcfg, dict):
-                    for k in ("id", "provider_id", "name"):
-                        v = pcfg.get(k)
-                        if v: candidates.add(str(v))
-                
-                if provider_id in candidates:
-                    return p
-        return None
+        return find_provider(self.context, provider_id)
 
     def _get_vision_provider(self):
         """获取 Vision Provider"""
@@ -947,8 +923,8 @@ class VideoFrameProcessor:
             if default_p:
                 logger.debug(f"[VideoFrameProcessor] 使用当前会话 Provider 进行识图")
                 return default_p
-        except:
-            pass
+        except Exception as e:
+            logger.debug(f"[VideoFrameProcessor] 获取会话 Vision Provider 失败: err={e}")
             
         return None
 
@@ -966,8 +942,8 @@ class VideoFrameProcessor:
         try:
             stt_p = self.context.get_using_stt_provider(umo=self.event.unified_msg_origin)
             return stt_p
-        except:
-            pass
+        except Exception as e:
+            logger.debug(f"[VideoFrameProcessor] 获取会话 STT Provider 失败: err={e}")
         
         return None
     

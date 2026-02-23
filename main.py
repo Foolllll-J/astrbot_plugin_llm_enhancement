@@ -1,93 +1,43 @@
-import asyncio
+﻿import asyncio
 import json
 import time
 import random
-from typing import List, Dict, Any, Optional, Tuple 
+from typing import List, Any, Optional
 from astrbot.api.event import filter, AstrMessageEvent
-from astrbot.core.star.filter.platform_adapter_type import PlatformAdapterType
-from astrbot.api.star import Context, Star, register, StarTools
+from astrbot.api.star import Context, Star, register
 from astrbot.api import logger, AstrBotConfig 
 import astrbot.api.message_components as Comp 
 from astrbot.api.provider import LLMResponse, ProviderRequest 
 from astrbot.core.utils.session_waiter import session_waiter, SessionController
 from .modules.sentiment import Sentiment
 from .modules.similarity import Similarity
-from .modules.state_manager import StateManager, MemberState, GroupState
-from .modules.forward_parser import extract_forward_content
+from .modules.state_manager import StateManager, MemberState
+from .modules.forward_parser import process_reference_and_forward_content
+from .modules.media_content_processor import process_media_content
 from .modules.video_parser import (
-    extract_videos_from_chain, 
-    extract_forward_video_keyframes, 
-    probe_duration_sec,
     download_video_to_temp,
-    extract_audio_wav,
-    MediaScenario,
-    MediaContext,
-    VideoFrameProcessor,
-    is_gif_file
 )
 import os
 import shutil
-import aiosqlite
-from datetime import datetime
-from pathlib import Path
 from .modules.info_utils import process_group_members_info, set_group_ban_logic
+from .modules.provider_utils import find_provider
+from .modules.blacklist_bridge import is_user_blacklisted_via_blacklist_plugin
+from .modules.merge_flow import (
+    get_event_msg_id,
+    prune_member_msg_cache,
+    build_event_snapshot,
+    upsert_recent_wake_snapshot,
+    prepare_initial_merge_snapshots,
+    add_pending_msg_id,
+    remove_pending_msg_id,
+    clear_pending_msg_ids,
+    is_msg_still_available,
+)
 try:
     from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import AiocqhttpMessageEvent
     IS_AIOCQHTTP = True
 except ImportError:
     IS_AIOCQHTTP = False
-
-# ==================== 黑名单插件桥接 ====================
-
-def _get_blacklist_db_path() -> Optional[Path]:
-    """获取黑名单插件数据库路径"""
-    try:
-        target_data_dir = StarTools.get_data_dir("astrbot_plugin_blacklist_tools")
-        db_path = Path(target_data_dir) / "blacklist.db"
-        
-        if db_path.exists():
-            return db_path
-        else:
-            logger.debug(f"[LLMEnhancement] 未找到黑名单数据库。目标路径: {db_path}")
-    except Exception as e:
-        logger.error(f"[LLMEnhancement] 获取黑名单插件数据目录失败: {e}")
-    return None
-
-async def is_user_blacklisted_via_blacklist_plugin(user_id: str) -> bool:
-    """通过黑名单插件查询用户是否在黑名单中"""
-    db_path = _get_blacklist_db_path()
-    if db_path is None:
-        return False
-        
-    try:
-        async with aiosqlite.connect(str(db_path)) as db:
-            cursor = await db.execute(
-                "SELECT * FROM blacklist WHERE user_id = ?", 
-                (user_id,)
-            )
-            user = await cursor.fetchone()
-            if user:
-                # user[2] 是 expire_time
-                expire_time_str = user[2]
-                if expire_time_str:
-                    try:
-                        expire_datetime = datetime.fromisoformat(expire_time_str)
-                        if datetime.now() > expire_datetime:
-                            # 已过期，逻辑上不视为黑名单（由原插件负责删除）
-                            return False
-                        else:
-                            logger.info(f"[LLMEnhancement] 用户 {user_id} 在黑名单中 (到期时间: {expire_time_str})")
-                            return True
-                    except ValueError:
-                        return True
-                else:
-                    # expire_time 为空表示永久黑名单
-                    logger.info(f"[LLMEnhancement] 用户 {user_id} 在永久黑名单中")
-                    return True
-            return False
-    except Exception as e:
-        logger.error(f"[LLMEnhancement] 查询 blacklist 插件数据库失败: {e}")
-        return False
 
 # ==================== 常量定义 ====================
 
@@ -145,6 +95,11 @@ class LLMEnhancement(Star):
     async def on_group_msg(self, event: AstrMessageEvent):
         """处理消息的初步过滤、黑白名单检查及唤醒逻辑。支持群聊和私聊。"""
         self._refresh_config()
+        raw_message = event.message_obj.raw_message if (event.message_obj and hasattr(event.message_obj, "raw_message")) else {}
+        if not raw_message and hasattr(event, "event") and isinstance(event.event, dict):
+            raw_message = event.event
+        if isinstance(raw_message, dict) and raw_message.get("post_type") not in (None, "", "message"):
+            return
         bid: str = event.get_self_id()
         gid: str = event.get_group_id() # 私聊下为 None
         uid: str = event.get_sender_id()
@@ -153,7 +108,8 @@ class LLMEnhancement(Star):
         g = StateManager.get_group(gid or f"private_{uid}")
 
         # 1. 全局屏蔽检查
-        if uid == bid: return
+        if uid == bid:
+            return
         
         # 1.0 黑名单插件拦截
         if await is_user_blacklisted_via_blacklist_plugin(uid):
@@ -192,8 +148,8 @@ class LLMEnhancement(Star):
         wake = event.is_at_or_wake_command
         reason = "at_or_cmd"
 
-        # 特殊处理：空 @ 机器人消息
-        if wake and not msg:
+        # 特殊处理：空 @ Bot 消息（仅群聊）
+        if wake and not msg and gid:
             msg = f"{event.get_sender_name()}@了你"
             event.message_str = msg
             reason = "空@唤醒"
@@ -263,126 +219,62 @@ class LLMEnhancement(Star):
             event.is_at_or_wake_command = True
             log_prefix = f"群({gid})" if gid else "私聊"
             logger.info(f"{log_prefix}用户({uid}) {reason}: {msg[:50]}")
+            merge_delay = float(self._get_cfg("merge_delay", 10.0) or 10.0)
+            keep_sec = max(merge_delay * 6, 60.0)
+            async with member.lock:
+                prune_member_msg_cache(member, keep_sec=keep_sec)
+                snap = build_event_snapshot(event, gid, uid)
+                upsert_recent_wake_snapshot(member, snap)
 
-    @filter.platform_adapter_type(PlatformAdapterType.AIOCQHTTP)
-    @filter.event_message_type(filter.EventMessageType.ALL, priority=10)
-    async def on_notice(self, event: AstrMessageEvent):
-        """处理通知事件，如消息撤回。"""
-        raw_message = event.message_obj.raw_message if (event.message_obj and hasattr(event.message_obj, "raw_message")) else {}
-        if not raw_message and hasattr(event, "event") and isinstance(event.event, dict):
-            raw_message = event.event
-
-        if not raw_message:
-            return
-            
-        post_type = raw_message.get("post_type")
-        notice_type = raw_message.get("notice_type")
-        
-        if post_type == "notice" and notice_type in ["group_recall", "friend_recall"]:
-            gid = str(raw_message.get("group_id", ""))
-            user_id = str(raw_message.get("user_id", ""))
-            msg_id = str(raw_message.get("message_id", ""))
-            
-            # 如果没有群 ID，则认为是私聊撤回，使用 private_{user_id} 作为虚拟群组 ID
-            target_id = gid if gid else (f"private_{user_id}" if user_id else "")
-            
-            if target_id and msg_id:
-                g = StateManager.get_group(target_id)
-                # 遍历该群所有成员
-                found = False
-                for member in g.members.values():
-                    async with member.lock:
-                        # 增加调试日志
-                        if member.pending_msg_ids:
-                            logger.debug(f" [LLMEnhancement] 正在检查用户 {member.uid} 的待处理消息: {member.pending_msg_ids}")
-                        
-                        # 检查撤回的消息是否在待处理列表中
-                        if member.pending_msg_ids and msg_id in member.pending_msg_ids:
-                            in_merging = getattr(member, "in_merging", False)
-                            
-                            # 如果正在合并中，交由 collect_messages 处理（它会负责从 pending_msg_ids 移除）
-                            if in_merging:
-                                 logger.debug(f" [LLMEnhancement] 检测到消息撤回 (ID: {msg_id})，但当前处于合并期，交由合并器处理。")
-                                 continue
-                            
-                            # 如果不在合并期（即 LLM 处理期），则移除该 ID
-                            member.pending_msg_ids.remove(msg_id)
-                            logger.info(f" [LLMEnhancement] 检测到部分消息撤回 (ID: {msg_id})，已从用户 {member.uid} 的上下文中移除。剩余: {len(member.pending_msg_ids)}")
-                            
-                            # 如果所有消息都撤回了，则取消任务
-                            if not member.pending_msg_ids:
-                                member.cancel_merge = True
-                                found = True
-                                logger.info(f" [LLMEnhancement] 用户 {member.uid} 的所有请求消息均已被撤回，正在取消合并/请求流程。")
-                    
-                    # 如果是后续消息被撤回，on_notice 不做处理，交给 collect_messages 在合并窗口期处理
-                    # 如果已经过了合并窗口期（即在 LLM 生成中），后续消息撤回无法影响已发送的 prompt，故忽略
-                
-                if not found:
-                    logger.debug(f" [LLMEnhancement] 收到撤回事件 (ID: {msg_id})，但未匹配到任何正在进行的请求（或非触发消息）。")
-    
     # ==================== 消息合并处理 ====================
-    
+
     async def _handle_message_merge(self, event: AstrMessageEvent, req: ProviderRequest, gid: str, uid: str, member: MemberState) -> List[Any]:
         """执行消息合并逻辑，根据配置决定是否收集多用户消息并格式化。"""
+        group_state = StateManager.get_group(gid or f"private_{uid}")
+        merge_delay = float(self._get_cfg("merge_delay", 10.0) or 10.0)
+        allow_multi_user = self._get_cfg("merge_multi_user", False)
+        cache_keep_sec = max(merge_delay * 6, 60.0)
+        merged_skip_ttl = max(merge_delay * 2, 20.0)
+        merged_window_tolerance = 0.3
+
         async with member.lock:
             # 初始化状态
-            member.pending_msg_ids.clear()
+            prune_member_msg_cache(member, keep_sec=cache_keep_sec)
+            clear_pending_msg_ids(group_state, member)
             member.cancel_merge = False
             member.trigger_msg_id = None
-            member.in_merging = True  # 标记正在合并中，防止 on_notice 误判
-            
-            # 获取初始消息 ID
-            current_msg_id = None
-            if hasattr(event, "message_obj") and hasattr(event.message_obj, "message_id"):
-                current_msg_id = str(event.message_obj.message_id)
-                member.pending_msg_ids.add(current_msg_id)
-                member.trigger_msg_id = current_msg_id # 记录触发消息 ID
+            member.in_merging = True  # 标记正在合并中，避免并发请求重复进入
+            preselected_snapshots, member.trigger_msg_id = prepare_initial_merge_snapshots(
+                event=event,
+                gid=gid,
+                uid=uid,
+                member=member,
+                merge_delay=merge_delay,
+                merged_window_tolerance=merged_window_tolerance,
+                merged_skip_ttl=merged_skip_ttl,
+                add_pending_msg_id=lambda msg_id: add_pending_msg_id(group_state, member, msg_id),
+            )
 
         # buffer 结构: List[Tuple[msg_id, sender_name, message_str]]
-        # 注意：这里改为存储三元组，以便后续按 ID 删除
-        message_buffer = [(current_msg_id, event.get_sender_name(), event.message_str)]
-        additional_components = [seg for seg in event.message_obj.message if isinstance(seg, (Comp.Forward, Comp.Reply, Comp.Video, Comp.File))]
-        
-        merge_delay = self._get_cfg("merge_delay", 10.0)
-        allow_multi_user = self._get_cfg("merge_multi_user", False)
+        message_buffer = [
+            (
+                str(item.get("msg_id") or "") or None,
+                str(item.get("sender_name") or event.get_sender_name()),
+                str(item.get("text") or ""),
+            )
+            for item in preselected_snapshots
+        ]
+        additional_components: List[Any] = []
+        for item in preselected_snapshots:
+            for seg in item.get("components", []) or []:
+                if isinstance(seg, (Comp.Forward, Comp.Reply, Comp.Video, Comp.File)):
+                    additional_components.append(seg)
 
         @session_waiter(timeout=merge_delay, record_history_chains=False)
         async def collect_messages(controller: SessionController, ev: AstrMessageEvent):
             nonlocal message_buffer, additional_components
-            
-            # 识别撤回事件
-            raw = ev.message_obj.raw_message if (ev.message_obj and hasattr(ev.message_obj, "raw_message")) else {}
-            if not raw and hasattr(ev, "event") and isinstance(ev.event, dict): raw = ev.event
-            
-            # 处理撤回事件 (支持群聊和私聊)
-            is_recall = raw.get("post_type") == "notice" and raw.get("notice_type") in ["group_recall", "friend_recall"]
-            if is_recall:
-                recalled_msg_id = str(raw.get("message_id"))
-                
-                async with member.lock:
-                    # 无论撤回的是触发消息还是后续消息，都从 buffer 中查找并移除
-                    for i, (mid, name, content) in enumerate(message_buffer):
-                        if mid == recalled_msg_id:
-                            logger.info(f" [LLMEnhancement] 合并期间检测到消息撤回 (ID: {recalled_msg_id})，已从合并列表中移除。")
-                            message_buffer.pop(i)
-                            # 同时也从 pending_msg_ids 中移除
-                            if recalled_msg_id in member.pending_msg_ids:
-                                member.pending_msg_ids.remove(recalled_msg_id)
-                            break
-                    
-                    # 如果队列空了，立即终止会话
-                    if not message_buffer:
-                        logger.info(f" [LLMEnhancement] 合并队列已空，终止合并流程。")
-                        member.cancel_merge = True
-                        controller.stop()
-                        return
+            # 撤回事件实时监听已停用，统一在最终阶段做 get_msg 校验。
 
-                # 刷新等待时间，继续收集
-                controller.keep(timeout=merge_delay, reset_timeout=True)
-                return
-
-            # 检查是否已取消
             if member.cancel_merge:
                 controller.stop()
                 return
@@ -423,13 +315,13 @@ class LLMEnhancement(Star):
             # 记录消息 ID
             if new_msg_id:
                 async with member.lock:
-                    member.pending_msg_ids.add(new_msg_id)
+                    add_pending_msg_id(group_state, member, new_msg_id)
+                    member.merged_msg_ids[new_msg_id] = time.time() + merged_skip_ttl
 
             message_buffer.append((new_msg_id, ev.get_sender_name(), ev.message_str))
             for seg in ev.message_obj.message:
                 if isinstance(seg, (Comp.Forward, Comp.Reply, Comp.Video, Comp.File)):
                     additional_components.append(seg)
-
             controller.keep(timeout=merge_delay, reset_timeout=True)
         
         try:
@@ -446,15 +338,35 @@ class LLMEnhancement(Star):
             event.stop_event()
             return []
 
-        if len(message_buffer) > 0: # 改为 > 0，因为如果只有一条但没被撤回也需要处理；如果全被撤回了 len=0
-            # 检查是否涉及多个用户
+        # 合并结束后做一次协议端校验，兜底撤回事件延迟/丢失。
+        if message_buffer and IS_AIOCQHTTP and isinstance(event, AiocqhttpMessageEvent):
+            validation_before_count = len(message_buffer)
+            filtered_buffer = []
+            removed_msg_ids = []
+            for mid, name, content in message_buffer:
+                if mid and not await is_msg_still_available(event, mid):
+                    removed_msg_ids.append(mid)
+                    continue
+                filtered_buffer.append((mid, name, content))
+
+            if removed_msg_ids:
+                async with member.lock:
+                    for rid in removed_msg_ids:
+                        remove_pending_msg_id(group_state, member, rid)
+                removed_ids_text = ",".join(removed_msg_ids)
+                logger.info(
+                    f"[LLMEnhancement] 最终校验已从本次合并队列移除消息："
+                    f"before={validation_before_count}, removed={len(removed_msg_ids)}, "
+                    f"remaining={len(filtered_buffer)}, removed_ids={removed_ids_text}, "
+                    f"trigger_msg_id={member.trigger_msg_id or 'unknown'}"
+                )
+            message_buffer = filtered_buffer
+
+        if len(message_buffer) > 0:
             senders = set(name for _, name, _ in message_buffer)
-            
             if len(senders) > 1:
-                # 多人模式：[用户A]: 消息1 \n [用户B]: 消息2
                 merged_msg = "\n".join([f"[{name}]: {msg}" for _, name, msg in message_buffer])
             else:
-                # 单人模式：直接空格连接
                 merged_msg = " ".join([msg for _, _, msg in message_buffer])
 
             event.message_str = merged_msg
@@ -462,12 +374,14 @@ class LLMEnhancement(Star):
             log_prefix = f"群({gid})" if gid else "私聊"
             logger.info(f"{log_prefix}合并：用户({uid})触发，共合并了{len(message_buffer)}条消息 (涉及{len(senders)}人)")
         else:
-            # 如果所有消息都被撤回了
-            logger.info(f" [LLMEnhancement] 所有消息均已被撤回，取消请求。")
+            member.cancel_merge = True
+            logger.info(
+                f"[LLMEnhancement] 本次合并上下文消息均已被撤回或不可获取，取消本次请求。"
+                f"trigger_msg_id={member.trigger_msg_id or 'unknown'}"
+            )
             event.stop_event()
             return []
-        
-        # 注意：finally 块已移除，因为状态清理已移动到 on_llm_response
+
         return additional_components
 
     # ==================== LLM 工具注册 ====================
@@ -539,111 +453,6 @@ class LLMEnhancement(Star):
         return await set_group_ban_logic(event, user_id, duration, user_name, group_id)
 
     # ==================== LLM 请求级别逻辑 ====================
-    
-    async def _detect_media_scenario(self, req: ProviderRequest, video_sources: List[str] = None, reply_seg: Optional[Comp.Reply] = None) -> MediaContext:
-        """
-        【前置判断】检测当前是什么媒体处理场景
-        返回 MediaContext，包含场景标记和相关信息
-        """
-        ctx = MediaContext()
-        image_urls:  Any = getattr(req, "image_urls", None)
-        
-        # 优先判断是否有视频来源
-        if video_sources and len(video_sources) > 0:
-            ctx.media_path = video_sources[0]
-            # 后续会进行时长探测和进一步分类
-        elif image_urls and isinstance(image_urls, list) and len(image_urls) > 0:
-            ctx.media_path = image_urls[0]
-        else:
-            ctx.scenario = MediaScenario.NONE
-            return ctx
-            
-        first_path = ctx.media_path
-        if not first_path or not isinstance(first_path, str):
-            ctx.scenario = MediaScenario.NONE
-            logger.warning("[场景判断] → 无效媒体（非字符串）")
-            return ctx
-        
-        # 远程 URL → 尝试下载到本地
-        if first_path.startswith(("http://", "https://")):
-            logger.debug(f"[场景判断] 检测到远程 URL，尝试下载: {first_path}")
-            try:
-                max_size = self._get_cfg("video_max_size_mb", 50)
-                local_path = await download_video_to_temp(first_path, max_size)
-                if local_path: 
-                    ctx.media_path = local_path
-                    ctx.cleanup_paths.append(local_path)
-                    first_path = local_path
-                    logger.info(f"[场景判断] 下载成功: {local_path}")
-                else:
-                    ctx.scenario = MediaScenario.NONE
-                    # 具体原因由 download_video_to_temp 内部打印
-                    return ctx
-            except Exception as e:  
-                logger.warning(f"[场景判断] 下载过程抛出异常: {e}")
-                ctx.scenario = MediaScenario.NONE
-                return ctx
-        
-        ctx.media_path = first_path
-        
-        # ========== 场景分类 ==========
-        # 1. 首先通过 is_gif_file 判断是否为纯 GIF 流程
-        if is_gif_file(first_path):
-            ctx.duration = await self._probe_duration_helper(first_path)
-            if ctx.duration <= 0:
-                ctx.scenario = MediaScenario.NONE
-                logger.info(f"[场景判断] → GIF 探测时长为 0s，视为静态图片，跳过增强处理")
-                return ctx
-            ctx.scenario = MediaScenario.GIF_ANIMATED
-            logger.info(f"[场景判断] → GIF 动图 (时长: {ctx.duration:.2f}s)")
-            return ctx
-            
-        # 2. 判断是否为视频流程 (含 MP4 格式的动图)
-        is_from_video_source = video_sources and len(video_sources) > 0 and ctx.media_path == video_sources[0]
-        suffix = Path(first_path).suffix.lower()
-        
-        # 检查是否为视频后缀或魔数
-        is_video_format = suffix in [".mp4", ".mov", ".avi", ".wmv", ".flv", ".m4v"] or is_from_video_source
-        if not is_video_format:
-            try:
-                with open(first_path, "rb") as f:
-                    header = f.read(32)
-                    if b"ftyp" in header or b"matroska" in header or b"fLaC" in header:
-                        is_video_format = True
-            except: pass
-
-        if is_video_format:
-            ctx.duration = await self._probe_duration_helper(first_path)
-            
-            # 关键修复：只要时长探测为 0，就判定为普通图片，不论其来源
-            if ctx.duration <= 0:
-                ctx.scenario = MediaScenario.NONE
-                logger.info(f"[场景判断] → 探测时长为 0s，判定为普通图片，跳过增强处理")
-                return ctx
-                
-            ctx.scenario = MediaScenario.VIDEO
-            logger.info(f"[场景判断] → 视频 (统一抽帧流程, 时长: {ctx.duration:.2f}s)")
-        else:
-            # 3. 兜底进入 NONE 流程（静态图片不走增强解析）
-            ctx.scenario = MediaScenario.NONE
-            logger.info(f"[场景判断] → 静态图片或未知格式 (后缀: {suffix})，跳过增强处理")
-        
-        return ctx
-    
-    async def _probe_duration_helper(self, media_path: str) -> float:
-        """异步版本的时长探测"""
-        try: 
-            duration = await asyncio.to_thread(
-                probe_duration_sec,
-                self._get_cfg("ffmpeg_path", ""),
-                media_path
-            ) or 0
-            return duration
-        except Exception as e:  
-            logger.warning(f"[探测时长] 异常:  {e}")
-            return 0
-
-    # ==================== LLM 请求级别逻辑 ====================
 
     @filter.on_llm_request(priority=15)
     async def on_llm_request(self, event: AstrMessageEvent, req: ProviderRequest):
@@ -660,29 +469,28 @@ class LLMEnhancement(Star):
         member = g.members[uid]
         now = time.time()
         msg = event.message_str
+        current_msg_id = get_event_msg_id(event)
+        merge_delay = float(self._get_cfg("merge_delay", 10.0) or 10.0)
+        cache_keep_sec = max(merge_delay * 6, 60.0)
+        async with member.lock:
+            prune_member_msg_cache(member, keep_sec=cache_keep_sec)
+            if current_msg_id and current_msg_id in member.merged_msg_ids:
+                event.stop_event()
+                return
+
+        # 协议端偶发空事件（常见于 notice/回执）不应进入 LLM 请求流程
+        message_chain = []
+        if hasattr(event, "message_obj") and hasattr(event.message_obj, "message"):
+            message_chain = event.message_obj.message or []
+        if not msg and not message_chain:
+            logger.debug(f"[LLMEnhancement] 忽略空消息事件: gid={gid or 'private'}, uid={uid}")
+            event.stop_event()
+            return
         
         if member.in_merging:
+            logger.debug(f"[LLMEnhancement] 当前存在进行中的合并会话，跳过重复请求: gid={gid or 'private'}, uid={uid}")
+            event.stop_event()
             return
-
-        # ==================== 1. 防护机制 (仅群聊) ====================
-        if gid:
-            shutup_th_cfg = self._get_cfg("shutup")
-            if shutup_th_cfg:
-                shut_th = await self.sent.shut(msg)
-                if shut_th > shutup_th_cfg:
-                    silence_sec = shut_th * self._get_cfg("silence_multiple", 500)
-                    g.shutup_until = now + silence_sec
-                    logger.info(f"群({gid})触发闭嘴，沉默{silence_sec:.1f}秒")
-                    event.stop_event()
-                    return
-
-        insult_th_cfg = self._get_cfg("insult")
-        if insult_th_cfg:
-            insult_th = await self.sent.insult(msg)
-            if insult_th > insult_th_cfg:
-                silence_sec = insult_th * self._get_cfg("silence_multiple", 500)
-                member.silence_until = now + silence_sec
-                logger.info(f"用户({uid})触发辱骂沉默{silence_sec:.1f}秒(下次生效)")
 
         if gid and g.shutup_until > now:
             event.stop_event()
@@ -700,284 +508,64 @@ class LLMEnhancement(Star):
         member.last_request = now
         
         try:
-            # ==================== 2. 消息合并 ====================
+            # ==================== 1. 消息合并（前置，避免异步防护导致并发请求拆分） ====================
             all_components = await self._handle_message_merge(event, req, gid, uid, member)
             if member.cancel_merge:
                 event.stop_event()
                 return
 
+            # ==================== 2. 防护机制（使用合并后的文本） ====================
+            msg = event.message_str
+            now = time.time()
+
+            if gid:
+                shutup_th_cfg = self._get_cfg("shutup")
+                if shutup_th_cfg:
+                    shut_th = await self.sent.shut(msg)
+                    if shut_th > shutup_th_cfg:
+                        silence_sec = shut_th * self._get_cfg("silence_multiple", 500)
+                        g.shutup_until = now + silence_sec
+                        logger.info(f"群({gid})触发闭嘴，沉默{silence_sec:.1f}秒")
+                        event.stop_event()
+                        return
+
+            insult_th_cfg = self._get_cfg("insult")
+            if insult_th_cfg:
+                insult_th = await self.sent.insult(msg)
+                if insult_th > insult_th_cfg:
+                    silence_sec = insult_th * self._get_cfg("silence_multiple", 500)
+                    member.silence_until = now + silence_sec
+                    logger.info(f"用户({uid})触发辱骂沉默{silence_sec:.1f}秒(下次生效)")
+
             # 注册清理路径容器
             req._cleanup_paths = []
             
             # ==================== 3. 引用消息/转发消息内容提取 ====================
-            forward_id = None 
-            reply_seg = None 
-            json_extracted_texts = []
-
-            if IS_AIOCQHTTP and isinstance(event, AiocqhttpMessageEvent):
-                for seg in all_components:
-                    if isinstance(seg, Comp.Forward):
-                        forward_id = seg.id
-                        break
-                    elif isinstance(seg, Comp.Reply):
-                        reply_seg = seg
-        
-                if event.is_at_or_wake_command:  
-                    if not forward_id and reply_seg:
-                        try:
-                            client = event.bot
-                            original_msg = await client.api.call_action('get_msg', message_id=reply_seg.id)
-                            if original_msg and 'message' in original_msg:
-                                # 提取发送者信息
-                                sender_info = original_msg.get("sender", {})
-                                original_sender = str(sender_info.get("user_id", ""))
-                                original_sender_name = sender_info.get("nickname", "未知用户")
-                                self_id = str(event.get_self_id())
-                                block_prob = self._get_cfg("quote_self_media_block_prob", 0)
-                                
-                                if original_sender == self_id and block_prob > 0:
-                                    has_video = any(s.get("type") == "video" for s in original_msg['message'])
-                                    has_file = any(s.get("type") == "file" for s in original_msg['message'])
-                                    if has_video or has_file:
-                                        if random.random() < block_prob:
-                                            logger.info(f"[LLMEnhancement] 检测到引用了 Bot 自身发送的视频或文件，且命中屏蔽概率 ({block_prob})，已拦截请求。")
-                                            event.stop_event()
-                                            return
-
-                                # 记录引用消息的发送者，用于后续注入
-                                setattr(req, "_quoted_sender", original_sender_name)
-
-                                original_message_chain = original_msg['message']
-                                if isinstance(original_message_chain, list):
-                                    has_extracted_media = False
-                                    quoted_file_names = []
-                                    max_size = self._get_cfg("video_max_size_mb", 50)
-                                    for segment in original_message_chain:  
-                                        seg_type = segment.get("type")
-                                        if seg_type == "forward":
-                                            forward_id = segment.get("data", {}).get("id")
-                                            if forward_id:
-                                                break
-                                        elif seg_type == "image":
-                                            url = segment.get("data", {}).get("url")
-                                            if url:
-                                                has_extracted_media = True
-                                                if not hasattr(req, "image_urls") or req.image_urls is None:
-                                                    req.image_urls = []
-                                                
-                                                if url.startswith(("http://", "https://")):
-                                                    try:
-                                                        local_path = await download_video_to_temp(url, max_size)
-                                                        if local_path:  
-                                                            if local_path not in req.image_urls:
-                                                                req.image_urls.append(local_path)
-                                                                logger.debug(f"[LLMEnhancement] 从引用消息中提取并下载媒体: {url[:50]}... -> {local_path}")
-                                                                req._cleanup_paths.append(local_path)
-                                                            continue
-                                                    except Exception as e:
-                                                        logger.warning(f"下载引用消息图片失败: {e}")
-                                                
-                                                if url not in req.image_urls:
-                                                    req.image_urls.append(url)
-                                                    logger.debug(f"[LLMEnhancement] 从引用消息中提取到媒体 URL: {url}")
-                                        elif seg_type == "file":
-                                            file_name = segment.get("data", {}).get("file")
-                                            if file_name:
-                                                quoted_file_names.append(file_name)
-                                                logger.debug(f"[LLMEnhancement] 从引用消息中提取到文件名: {file_name}")
-                                        elif seg_type == "json":
-                                            try:  
-                                                inner_data_str = segment.get("data", {}).get("data")
-                                                if inner_data_str:
-                                                    inner_data_str = inner_data_str.replace("&#44;", ",")
-                                                    inner_json = json.loads(inner_data_str)
-                                                    if inner_json.get("app") == "com.tencent.multimsg" and inner_json.get("config", {}).get("forward") == 1:
-                                                        news_items = inner_json.get("meta", {}).get("detail", {}).get("news", [])
-                                                        for item in news_items:
-                                                            text_content = item.get("text")
-                                                            if text_content:
-                                                                clean_text = text_content.strip().replace("[图片]", "").strip()
-                                                                if clean_text:
-                                                                    json_extracted_texts.append(clean_text)
-                                                        if json_extracted_texts:
-                                                            break
-                                            except:  
-                                                continue
-                                    
-                                    if has_extracted_media or quoted_file_names:
-                                        quoted_sender = getattr(req, "_quoted_sender", "未知用户")
-                                        # 注入到 prompt 中，告知 LLM 这些内容是谁发的
-                                        context_parts = []
-                                        if has_extracted_media:
-                                            context_parts.append(f"以上图片提取自用户 {quoted_sender} 的引用消息")
-                                        if quoted_file_names:
-                                            file_list_str = "、".join(quoted_file_names)
-                                            context_parts.append(f"用户 {quoted_sender} 的引用消息中包含文件: {file_list_str}")
-                                        
-                                        context_desc = f"\n\n[补充信息] {'；'.join(context_parts)}，请在回复时参考该上下文。"
-                                        req.prompt += context_desc
-                                        logger.debug(f"[LLMEnhancement] 已为引用内容注入发送者/文件信息: {quoted_sender}")
-                                    
-                                    # 如果有视频
-                                    has_video_in_quote = any(s.get("type") == "video" for s in original_message_chain)
-                                    if has_video_in_quote:
-                                        quoted_sender = getattr(req, "_quoted_sender", "未知用户")
-                                        logger.debug(f"[LLMEnhancement] 检测到引用视频，已记录发送者信息: {quoted_sender}")
-                        except Exception as e:
-                            logger.warning(f"获取被回复消息详情失败: {e}")
-                    
-                    # 【转发消息处理】
-                    if forward_id or json_extracted_texts:
-                        image_urls = []
-                        forward_video_sources = []
-                        try:
-                            if forward_id:
-                                extracted_texts, image_urls, forward_video_sources = await extract_forward_content(event.bot, forward_id)
-                            else:
-                                extracted_texts = json_extracted_texts
-                            
-                            if extracted_texts or image_urls or forward_video_sources:
-                                # 处理转发消息中的视频关键帧
-                                if forward_video_sources and self._get_cfg("forward_video_keyframe_enable", True):
-                                    f_frames, f_cleanup, f_local_videos = await extract_forward_video_keyframes(
-                                        event,
-                                        forward_video_sources,
-                                        max_count=self._get_cfg("forward_video_max_count", 2),
-                                        ffmpeg_path=self._get_cfg("ffmpeg_path", ""),
-                                        max_mb=self._get_cfg("video_max_size_mb", 50),
-                                        max_duration=7200, # 硬编码安全限制 120 分钟
-                                        timeout_sec=10
-                                    )
-                                    if f_frames:
-                                        image_urls.extend(f_frames)
-                                        
-                                        # 处理转发视频的 ASR
-                                        if self._get_cfg("video_asr_enable", True) and f_local_videos:  
-                                            for idx, lv_path in enumerate(f_local_videos):
-                                                try:
-                                                    wav_path = await extract_audio_wav(self._get_cfg("ffmpeg_path", ""), lv_path)
-                                                    if wav_path and os.path.exists(wav_path):
-                                                        stt = self._get_stt_provider()
-                                                        
-                                                        if stt:  
-                                                            f_asr_text = None
-                                                            try:
-                                                                if hasattr(stt, "get_text"):
-                                                                    f_asr_text = await stt.get_text(wav_path)
-                                                                elif hasattr(stt, "speech_to_text"):
-                                                                    res = await stt.speech_to_text(wav_path)
-                                                                    f_asr_text = res.get("text", "") if isinstance(res, dict) else str(res)
-                                                                
-                                                                if f_asr_text:
-                                                                    extracted_texts.append(f" [视频语音转写 {idx+1}] {f_asr_text}")
-                                                                    logger.info(f"转发视频 {idx+1} ASR 成功")
-                                                            except:  
-                                                                pass
-                                                        
-                                                        try:
-                                                            os.remove(wav_path)
-                                                        except: 
-                                                            pass
-                                                except:  
-                                                    pass
-
-                                        if f_cleanup:
-                                            async def cleanup_f():
-                                                await asyncio.sleep(60)
-                                                for p in f_cleanup:
-                                                    try:
-                                                        if os.path.isdir(p):
-                                                            shutil.rmtree(p)
-                                                        elif os.path.isfile(p):
-                                                            os.remove(p)
-                                                    except:  
-                                                        pass
-                                            asyncio.create_task(cleanup_f())
-
-                                chat_records = "\n".join(extracted_texts)
-                                user_question = req.prompt.strip() or "请总结一下这个聊天记录"
-                                
-                                # 获取转发来源信息
-                                quoted_sender = getattr(req, "_quoted_sender", "未知用户")
-                                
-                                context_prompt = (
-                                    f"\n\n用户提供了由 {quoted_sender} 发送/转发的聊天记录，请根据这些记录内容来响应。聊天记录如下：\n"
-                                    f"--- 聊天记录开始 ---\n"
-                                    f"{chat_records}\n"
-                                    f"--- 聊天记录结束 ---"
-                                )
-                                req.prompt = user_question + context_prompt
-                                req.image_urls.extend(image_urls)
-                                logger.info(f"[转发消息] 成功注入转发内容 ({len(extracted_texts)} 条文本, {len(image_urls)} 张图片)")
-                                
-                                # ✅ 转发消息已处理完毕，跳过后续所有视频/GIF 处理
-                                await self._cleanup_paths(req._cleanup_paths)
-                                return
-                        except Exception as e:
-                            logger.warning(f"内容提取失败: {e}")
+            ref_result = await process_reference_and_forward_content(
+                event=event,
+                req=req,
+                all_components=all_components,
+                get_cfg=self._get_cfg,
+                get_stt_provider=lambda ev: self._get_stt_provider(event=ev),
+                cleanup_paths=self._cleanup_paths,
+                download_media=download_video_to_temp,
+            )
+            if ref_result.blocked:
+                event.stop_event()
+                return
+            reply_seg = ref_result.reply_seg
+            if ref_result.handled_forward:
+                return
             
-            # ==================== 4. 【分支】媒体场景检测与处理 ====================
-            if self._get_cfg("video_detect_enable", True):
-                # 尝试从当前消息或引用消息获取视频
-                video_sources = extract_videos_from_chain(all_components)
-                
-                if not video_sources and reply_seg:
-                    try:  
-                        client = event.bot
-                        original_msg = await client.api.call_action('get_msg', message_id=reply_seg.id)
-                        if original_msg and 'message' in original_msg:  
-                            video_sources = extract_videos_from_chain(original_msg['message'])
-                    except Exception as e:
-                        logger.warning(f"从引用消息提取视频失败: {e}")
-                
-                # 【关键】前置判断：当前是什么媒体场景
-                media_ctx = await self._detect_media_scenario(req, video_sources, reply_seg)
-                req._cleanup_paths.extend(media_ctx.cleanup_paths)
-                
-                logger.info(f"[LLMEnhancement] 媒体场景: {media_ctx.scenario.value}")
-                
-                # ========== 分支处理 ==========
-                processor = VideoFrameProcessor(
-                    self.context,
-                    event,
-                    self._get_cfg
-                )
-                
-                # 如果是视频/GIF 场景，为了避免 LLM 报错（1210 图片格式错误），先从 image_urls 中移除原始路径/URL
-                if media_ctx.scenario in [MediaScenario.VIDEO, MediaScenario.GIF_ANIMATED]:
-                    if media_ctx.media_path in req.image_urls:
-                        req.image_urls.remove(media_ctx.media_path)
-                    # 同时尝试移除可能存在的原始 URL
-                    if len(req.image_urls) > 0:
-                        req.image_urls = [url for url in req.image_urls if not any(url.lower().endswith(s) for s in [".mp4", ".mov", ".avi", ".wmv", ".flv", ".m4v"])]
-                
-                # 【场景 1】视频 → 统一抽帧流程
-                if media_ctx.scenario == MediaScenario.VIDEO:  
-                    logger.debug("[分支] 执行视频处理")
-                    quoted_sender = getattr(req, "_quoted_sender", None) if reply_seg else None
-                    # 获取引用消息的 ID 或当前消息 ID 作为缓存键
-                    msg_id = str(reply_seg.id) if reply_seg else str(event.message_obj.message_id)
-                    
-                    logger.debug(f"[LLMEnhancement] 视频处理最终 msg_id: {msg_id}")
-                    success = await processor.process_long_video(req, media_ctx.media_path, media_ctx.duration, sender_name=quoted_sender, msg_id=msg_id)
-                    if not success:  
-                        logger.warning("[分支] 视频处理失败")
-                
-                # 【场景 2】GIF 动图 → 固定参数
-                elif media_ctx.scenario == MediaScenario.GIF_ANIMATED:
-                    logger.debug("[分支] 执行 GIF 处理")
-                    quoted_sender = getattr(req, "_quoted_sender", None) if reply_seg else None
-                    # 获取引用消息的 ID 或当前消息 ID 作为缓存键
-                    msg_id = str(reply_seg.id) if reply_seg else str(event.message_obj.message_id)
-                        
-                    logger.debug(f"[LLMEnhancement] GIF 处理最终 msg_id: {msg_id}")
-                    success = await processor.process_gif(req, media_ctx.media_path, sender_name=quoted_sender, msg_id=msg_id)
-                    if not success: 
-                        logger.warning("[分支] GIF 处理失败")
-                
-                # 【场景 3】无媒体或无效场景 → 无处理
-                elif media_ctx.scenario == MediaScenario.NONE:
-                    logger.debug("[分支] 无媒体内容")
+            # ==================== 4. 媒体场景检测与处理 ====================
+            await process_media_content(
+                context=self.context,
+                event=event,
+                req=req,
+                all_components=all_components,
+                reply_seg=reply_seg,
+                get_cfg=self._get_cfg,
+            )
         
         finally:
             # 5. 统一清理文件
@@ -988,64 +576,47 @@ class LLMEnhancement(Star):
         """延迟清理临时文件"""
         if not cleanup_paths:
             return
-        
-        async def final_cleanup():
+
+        snapshot_paths = [p for p in dict.fromkeys(cleanup_paths) if p]
+        if not snapshot_paths:
+            return
+
+        async def final_cleanup(paths: List[str]):
             await asyncio.sleep(120)
-            for p in cleanup_paths: 
+            for p in paths:
                 try:
                     if os.path.isfile(p):
                         os.remove(p)
                     elif os.path.isdir(p):
                         shutil.rmtree(p)
-                except: 
-                    pass
-        
-        asyncio.create_task(final_cleanup())
+                except Exception as e:
+                    logger.debug(f"[LLMEnhancement] cleanup path 失败: {p}, err={e}")
+
+        asyncio.create_task(final_cleanup(snapshot_paths))
 
     def _find_provider(self, provider_id: str):
         """通用方法：从所有 Provider（包含 LLM 和 STT）中查找匹配的 ID/Name"""
-        if not provider_id: return None
-        
-        all_lists = []
-        try: all_lists.append(self.context.get_all_providers())
-        except: pass
-        try: all_lists.append(self.context.get_all_stt_providers())
-        except: pass
-        
-        for p_list in all_lists:
-            if not p_list: continue
-            for p in p_list:
-                candidates = set()
-                for attr in ("id", "provider_id", "name"):
-                    val = getattr(p, attr, None)
-                    if val: candidates.add(str(val))
-                
-                pcfg = getattr(p, "provider_config", None)
-                if isinstance(pcfg, dict):
-                    for k in ("id", "provider_id", "name"):
-                        v = pcfg.get(k)
-                        if v: candidates.add(str(v))
-                
-                if provider_id in candidates:
-                    return p
-        return None
+        return find_provider(self.context, provider_id)
 
-    def _get_stt_provider(self):
+    def _get_stt_provider(self, event: Optional[AstrMessageEvent] = None, umo: Optional[str] = None):
         """获取 STT Provider"""
         asr_pid = self._get_cfg("asr_provider_id")
         p = self._find_provider(asr_pid)
         if p:
-            logger.info(f"[LLMEnhancement] 成功匹配到指定的 STT Provider: {asr_pid}")
+            logger.debug(f"[LLMEnhancement] 成功匹配到指定 STT Provider: {asr_pid}")
             return p
-            
+
         if asr_pid:
-            logger.warning(f"[LLMEnhancement] 未找到指定的 STT Provider: {asr_pid}")
-        
+            logger.warning(f"[LLMEnhancement] 未找到指定 STT Provider: {asr_pid}")
+
         try:
-            return self.context.get_using_stt_provider(umo=self.event.unified_msg_origin)
-        except:
+            using_umo = umo or (getattr(event, "unified_msg_origin", None) if event is not None else None)
+            if using_umo:
+                return self.context.get_using_stt_provider(umo=using_umo)
+            return self.context.get_using_stt_provider()
+        except Exception:
             pass
-        
+
         return None
 
     @filter.on_llm_response(priority=20)
@@ -1053,10 +624,11 @@ class LLMEnhancement(Star):
         """在 LLM 返回结果后执行，用于更新会话状态并处理撤回拦截。"""
         gid: str = event.get_group_id()
         uid: str = event.get_sender_id()
-        if not gid or not uid:
+        if not uid:
             return
             
-        g = StateManager.get_group(gid)
+        target_id = gid or f"private_{uid}"
+        g = StateManager.get_group(target_id)
         member = g.members.get(uid)
         
         if member:
@@ -1064,13 +636,13 @@ class LLMEnhancement(Star):
             if member.cancel_merge:
                 logger.info(f" [LLMEnhancement] LLM 响应生成完成，但检测到消息已撤回，拦截回复 (用户: {uid})。")
                 member.cancel_merge = False
-                member.pending_msg_ids.clear()
+                clear_pending_msg_ids(g, member)
                 event.stop_event() # 拦截响应
                 return
 
             member.last_response = time.time()
             # 清理待处理消息 ID
-            member.pending_msg_ids.clear()
+            clear_pending_msg_ids(g, member)
             member.cancel_merge = False
 
     async def _get_history_msg(self, event: AstrMessageEvent, role: str = "assistant", count: int | None = 0) -> List[str]:

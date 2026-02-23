@@ -22,6 +22,7 @@ import shutil
 from .modules.info_utils import process_group_members_info, set_group_ban_logic
 from .modules.provider_utils import find_provider
 from .modules.blacklist_bridge import is_user_blacklisted_via_blacklist_plugin
+from .modules.wake_extend import evaluate_wake_extend
 from .modules.merge_flow import (
     get_event_msg_id,
     prune_member_msg_cache,
@@ -50,9 +51,6 @@ BUILT_CMDS = [
     "key", "websearch", "help",
 ]
 
-MAX_MERGE_MESSAGES = 15 # 最大合并消息数
-
-
 @register("llm_enhancement", "Foolllll", "增强LLM的综合表现", "1.0.0") 
 class LLMEnhancement(Star): 
     def __init__(self, context: Context, config: AstrBotConfig): 
@@ -66,21 +64,23 @@ class LLMEnhancement(Star):
 
     def _refresh_config(self):
         """将 object 格式的配置平铺到 self.cfg 中"""
+        self.cfg = {}
         # 1. 获取顶级配置项
         for k in ["group_whitelist", "group_blacklist", "user_blacklist"]:
             self.cfg[k] = self.config.get(k)
         
-        # 2. 处理智能唤醒
-        wake_cfg = self.config.get("intelligent_wake", {})
-        if isinstance(wake_cfg, dict):
-            for k, v in wake_cfg.items():
-                self.cfg[k] = v
-        
-        # 3. 处理视频解析
-        video_cfg = self.config.get("video_injection", {})
-        if isinstance(video_cfg, dict):
-            for k, v in video_cfg.items():
-                self.cfg[k] = v
+        # 2. 平铺对象配置
+        for section in [
+            "intelligent_wake",
+            "parse_switches",
+            "video_injection",
+            "forward_parsing",
+            "file_parsing",
+        ]:
+            section_cfg = self.config.get(section, {})
+            if isinstance(section_cfg, dict):
+                for k, v in section_cfg.items():
+                    self.cfg[k] = v
                 
 
     def _get_cfg(self, key: str, default: Any = None) -> Any:
@@ -171,15 +171,21 @@ class LLMEnhancement(Star):
 
         # 唤醒延长 (仅群聊)
         if gid and not wake:
-            wake_extend = self._get_cfg("wake_extend")
-            if (wake_extend and (now - member.last_response) <= int(wake_extend or 0)):
-                if bmsgs := await self._get_history_msg(event, count=3):
-                    simi = await self.similarity.similarity(gid, msg, bmsgs)
-                    threshold = self._get_cfg("wake_extend_similarity", 0.1)
-                    logger.debug(f" [LLMEnhancement] 唤醒延长检查: 相关系数={simi:.4f}, 阈值={threshold:.4f}, 历史参考={len(bmsgs)}条")
-                    if simi >= threshold:
-                        wake = True
-                        reason = f"唤醒延长(相关性{simi:.2f})"
+            wake, wake_reason = await evaluate_wake_extend(
+                event=event,
+                msg=msg,
+                gid=gid,
+                uid=uid,
+                now=now,
+                group_state=g,
+                member=member,
+                get_cfg=self._get_cfg,
+                get_history_msg=lambda ev, count: self._get_history_msg(ev, count=count),
+                similarity_fn=self.similarity.similarity,
+                find_provider=self._find_provider,
+            )
+            if wake and wake_reason:
+                reason = wake_reason
 
         # 话题相关性唤醒 (仅群聊)
         if gid and not wake:
@@ -233,6 +239,10 @@ class LLMEnhancement(Star):
         group_state = StateManager.get_group(gid or f"private_{uid}")
         merge_delay = float(self._get_cfg("merge_delay", 10.0) or 10.0)
         allow_multi_user = self._get_cfg("merge_multi_user", False)
+        try:
+            merge_max_count = max(1, int(self._get_cfg("merge_max_count", 5) or 5))
+        except (TypeError, ValueError):
+            merge_max_count = 5
         cache_keep_sec = max(merge_delay * 6, 60.0)
         merged_skip_ttl = max(merge_delay * 2, 20.0)
         merged_window_tolerance = 0.3
@@ -308,7 +318,7 @@ class LLMEnhancement(Star):
             
             ev.stop_event()
 
-            if len(message_buffer) >= MAX_MERGE_MESSAGES:
+            if len(message_buffer) >= merge_max_count:
                 controller.stop()
                 return
             
@@ -640,7 +650,10 @@ class LLMEnhancement(Star):
                 event.stop_event() # 拦截响应
                 return
 
-            member.last_response = time.time()
+            resp_ts = time.time()
+            member.last_response = resp_ts
+            g.last_response_uid = uid
+            g.last_response_ts = resp_ts
             # 清理待处理消息 ID
             clear_pending_msg_ids(g, member)
             member.cancel_merge = False

@@ -307,18 +307,24 @@ async def extract_forward_video_keyframes(
     event: AstrMessageEvent,
     video_sources: List[str],
     max_count: int,
+    max_frame_count: int,
+    frame_interval_sec: int,
     ffmpeg_path: str,
     max_mb: int,
     max_duration: int,
     timeout_sec: int,
 ) -> Tuple[List[str], List[str], List[str]]:
     """
-    将合并转发中的视频源转换为少量关键帧图片（每个视频 1 张）。
+    将聊天记录中的视频源转换为关键帧图片。
+    抽帧策略：优先按 frame_interval_sec 估算抽帧数，再受 max_frame_count 上限约束。
     返回: (帧路径列表, 待清理路径列表, 本地视频路径列表)
     """
     frames = []
     cleanup_paths = []
     local_video_paths = []
+
+    if max_count <= 0 or max_frame_count <= 0:
+        return [], [], []
     
     for src in video_sources[:max_count]:
         video_path = src
@@ -367,11 +373,24 @@ async def extract_forward_video_keyframes(
                 cleanup_paths.remove(video_path)
             continue
             
-        # 4. 抽 1 帧
-        sampled = await sample_frames_equidistant(ffmpeg_path, video_path, duration, 1)
+        # 4. 抽帧数计算：优先按抽帧间隔估算，再受上限约束
+        interval_sec = int(frame_interval_sec or 0)
+        if interval_sec > 0:
+            ideal_count = math.ceil(duration / interval_sec)
+            sample_count = max(1, min(ideal_count, max_frame_count))
+            if ideal_count > max_frame_count:
+                actual_interval = duration / sample_count
+                logger.info(
+                    f"[聊天记录解析] 视频时长 {duration:.1f}s 超过间隔覆盖范围，调整抽帧间隔: "
+                    f"{interval_sec}s -> {actual_interval:.1f}s (上限 {max_frame_count} 帧)"
+                )
+        else:
+            sample_count = max(1, max_frame_count)
+
+        sampled = await sample_frames_equidistant(ffmpeg_path, video_path, duration, sample_count)
         if sampled:
-            frames.append(sampled[0])
-            cleanup_paths.append(sampled[0])
+            frames.extend(sampled)
+            cleanup_paths.extend(sampled)
             local_video_paths.append(video_path)
                 
     return frames, cleanup_paths, local_video_paths
@@ -653,6 +672,14 @@ class VideoFrameProcessor:
             
             frames = [str(p) for p in frame_paths]
             frame_count = len(frames)
+
+            if frame_count == 1:
+                logger.info("[VideoFrameProcessor] GIF仅抽取到1帧，跳过汇总流程")
+                req.image_urls = [frames[0]]
+                for frame in frames:
+                    req._cleanup_paths = req._cleanup_paths or []
+                    req._cleanup_paths.append(frame)
+                return True
             
             # GIF 帧聚合
             summary = await self._aggregate_frames_helper(

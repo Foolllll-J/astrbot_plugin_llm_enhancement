@@ -120,7 +120,7 @@ async def process_media_content(
     get_cfg: Callable[[str, Any], Any],
 ) -> None:
     """处理视频/GIF/文件相关媒体分支。"""
-    if not get_cfg("video_detect_enable", True):
+    if not get_cfg("video_parse_enable", True):
         return
 
     video_sources = extract_videos_from_chain(all_components)

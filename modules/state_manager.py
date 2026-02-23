@@ -26,6 +26,8 @@ class GroupState(BaseModel):
     members: dict[str, MemberState] = Field(default_factory=dict)   # 成员状态字典
     shutup_until: float = 0.0                              # 群组闭嘴截止时间（时间戳）
     pending_msg_index: dict[str, str] = Field(default_factory=dict) # 撤回快速索引：message_id -> uid
+    last_response_uid: Optional[str] = None                # 最近一次触发响应的用户
+    last_response_ts: float = 0.0                          # 最近一次响应时间（时间戳）
 
 
 class StateManager:

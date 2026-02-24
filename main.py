@@ -4,7 +4,7 @@ import time
 import random
 from typing import List, Any, Optional
 from astrbot.api.event import filter, AstrMessageEvent
-from astrbot.api.star import Context, Star, register
+from astrbot.api.star import Context, Star, StarTools
 from astrbot.api import logger, AstrBotConfig 
 import astrbot.api.message_components as Comp 
 from astrbot.api.provider import LLMResponse, ProviderRequest 
@@ -21,7 +21,7 @@ import os
 import shutil
 from .modules.info_utils import process_group_members_info, set_group_ban_logic
 from .modules.provider_utils import find_provider
-from .modules.blacklist_bridge import is_user_blacklisted_via_blacklist_plugin
+from .modules.blacklist import BlacklistManager
 from .modules.wake_extend import evaluate_wake_extend
 from .modules.merge_flow import (
     get_event_msg_id,
@@ -51,7 +51,6 @@ BUILT_CMDS = [
     "key", "websearch", "help",
 ]
 
-@register("llm_enhancement", "Foolllll", "增强LLM的综合表现", "1.0.0") 
 class LLMEnhancement(Star): 
     def __init__(self, context: Context, config: AstrBotConfig): 
         super().__init__(context) 
@@ -60,13 +59,20 @@ class LLMEnhancement(Star):
         self._refresh_config()
         self.sent = Sentiment()
         self.similarity = Similarity()
+        self.blacklist = BlacklistManager(
+            data_dir=StarTools.get_data_dir("astrbot_plugin_llm_enhancement"),
+            get_cfg=self._get_cfg,
+        )
         logger.info(f"[LLMEnhancement] 插件初始化完成。IS_AIOCQHTTP: {IS_AIOCQHTTP}")
+
+    async def initialize(self):
+        await self.blacklist.initialize()
 
     def _refresh_config(self):
         """将 object 格式的配置平铺到 self.cfg 中"""
         self.cfg = {}
         # 1. 获取顶级配置项
-        for k in ["group_whitelist", "group_blacklist", "user_blacklist"]:
+        for k in ["group_whitelist", "group_blacklist"]:
             self.cfg[k] = self.config.get(k)
         
         # 2. 平铺对象配置
@@ -76,6 +82,7 @@ class LLMEnhancement(Star):
             "video_injection",
             "forward_parsing",
             "file_parsing",
+            "blacklist",
         ]:
             section_cfg = self.config.get(section, {})
             if isinstance(section_cfg, dict):
@@ -98,7 +105,12 @@ class LLMEnhancement(Star):
         raw_message = event.message_obj.raw_message if (event.message_obj and hasattr(event.message_obj, "raw_message")) else {}
         if not raw_message and hasattr(event, "event") and isinstance(event.event, dict):
             raw_message = event.event
-        if isinstance(raw_message, dict) and raw_message.get("post_type") not in (None, "", "message"):
+        if (
+            IS_AIOCQHTTP
+            and isinstance(event, AiocqhttpMessageEvent)
+            and isinstance(raw_message, dict)
+            and raw_message.get("post_type") not in (None, "", "message")
+        ):
             return
         bid: str = event.get_self_id()
         gid: str = event.get_group_id() # 私聊下为 None
@@ -111,10 +123,10 @@ class LLMEnhancement(Star):
         if uid == bid:
             return
         
-        # 1.0 黑名单插件拦截
-        if await is_user_blacklisted_via_blacklist_plugin(uid):
-            event.stop_event()
-            return
+        # 1.0 内置黑名单拦截（开启“拦截指令”时在消息阶段直接拦截）
+        if self._get_cfg("blacklist_block_commands", True):
+            if await self.blacklist.intercept_event(event):
+                return
 
         # 仅在群聊环境下检查群黑白名单
         if gid:
@@ -127,11 +139,6 @@ class LLMEnhancement(Star):
                 event.stop_event()
                 return
             
-        u_blacklist = self._get_cfg("user_blacklist")
-        if u_blacklist and uid in u_blacklist:
-            event.stop_event()
-            return
-
         # 2. 内置指令屏蔽
         if self._get_cfg("block_builtin"):
             if not event.is_admin() and msg in BUILT_CMDS:
@@ -396,6 +403,63 @@ class LLMEnhancement(Star):
 
     # ==================== LLM 工具注册 ====================
 
+    @filter.command_group("黑名单", alias={"bl"})
+    def blacklist():
+        """黑名单管理命令组。用法: /黑名单 列表|添加|移除|详情|清空 ..."""
+        pass
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @blacklist.command("列表", alias={"ls"})
+    async def blacklist_ls(self, event: AstrMessageEvent, page: int = 1, page_size: int = 10):
+        """查看黑名单列表。用法: /黑名单 列表 [页码] [每页数量]"""
+        result = await self.blacklist.command_ls(page=page, page_size=page_size)
+        if result.image_base64:
+            yield event.chain_result([Comp.Image.fromBase64(result.image_base64)])
+        else:
+            yield event.plain_result(result.text)
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @blacklist.command("添加", alias={"add", "拉黑"})
+    async def blacklist_add(
+        self,
+        event: AstrMessageEvent,
+        user_ref: str = "",
+        duration: str = "0",
+        reason: str = "",
+    ):
+        """添加黑名单。支持用户ID或@目标。用法: /黑名单 添加 <用户ID/@用户> [时长秒] [原因]"""
+        result = await self.blacklist.command_add(
+            event=event,
+            user_ref=user_ref,
+            duration=duration,
+            reason=reason,
+        )
+        yield event.plain_result(result)
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @blacklist.command("移除", alias={"rm", "解除"})
+    async def blacklist_rm(self, event: AstrMessageEvent, user_ref: str = ""):
+        """移除黑名单。支持用户ID或@目标。用法: /黑名单 移除 <用户ID/@用户>"""
+        result = await self.blacklist.command_rm(event=event, user_ref=user_ref)
+        yield event.plain_result(result)
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @blacklist.command("详情", alias={"info", "状态"})
+    async def blacklist_info(self, event: AstrMessageEvent, user_ref: str = ""):
+        """查看黑名单详情。支持用户ID或@目标。用法: /黑名单 详情 <用户ID/@用户>"""
+        result = await self.blacklist.command_info(event=event, user_ref=user_ref)
+        if result.image_base64:
+            yield event.chain_result([Comp.Image.fromBase64(result.image_base64)])
+        else:
+            yield event.plain_result(result.text)
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @blacklist.command("清空", alias={"clear", "清除"})
+    async def blacklist_clear(self, event: AstrMessageEvent):
+        """清空黑名单。用法: /黑名单 清空"""
+        result = await self.blacklist.command_clear()
+        yield event.plain_result(result)
+
     @filter.llm_tool(name="get_user_avatar")
     async def get_user_avatar(self, event: AstrMessageEvent, user_id: str) -> str:
         """
@@ -405,6 +469,9 @@ class LLMEnhancement(Star):
         Args:
             user_id (str): 目标用户的 QQ 号。必须是纯数字字符串。
         """
+        if not (IS_AIOCQHTTP and isinstance(event, AiocqhttpMessageEvent)):
+            return "当前平台未查看到目标头像。"
+
         avatar_url = f"https://q4.qlogo.cn/headimg_dl?dst_uin={user_id}&spec=640"
         
         try:
@@ -452,7 +519,7 @@ class LLMEnhancement(Star):
     async def set_group_ban(self, event: AstrMessageEvent, user_id: str, duration: int, user_name: str, group_id: str = None) -> str:
         """
         在群聊中禁言或解除禁言某位成员。
-        支持在群聊中直接使用，或在私聊中指定 group_id 使用。
+        支持在群聊中直接使用，或在私聊中指定 group_id 使用，由你根据请求者身份与上下文判断是否应执行。
         
         Args:
             user_id (str): 目标用户的 QQ 号。必须是纯数字字符串。
@@ -460,7 +527,78 @@ class LLMEnhancement(Star):
             user_name (str): 目标用户的昵称或称呼，用于回复确认。
             group_id (str, optional): 目标 QQ 群号。在私聊使用时必填，在群聊使用时可选（默认当前群）。
         """
-        return await set_group_ban_logic(event, user_id, duration, user_name, group_id)
+        return await set_group_ban_logic(
+            event,
+            user_id,
+            duration,
+            user_name,
+            group_id,
+            strict_permission_check=bool(self._get_cfg("tool_write_require_admin", False)),
+        )
+
+    @filter.llm_tool(name="block_user")
+    async def block_user(
+        self,
+        event: AstrMessageEvent,
+        user_id: str = "",
+        user_name: str = "",
+        duration: int = 0,
+        reason: str = "",
+    ) -> str:
+        """
+        将指定用户加入黑名单，加入后将忽略对方消息，由你根据请求者身份与上下文判断是否应执行。
+        该工具既可用于拉黑，也可用于“未来一段时间不再与该用户对话”的短时策略。
+        这是黑名单语义，不是禁言/解禁语义；请避免使用“解封/解禁”等措辞。
+
+        Args:
+            user_id (str, optional): 目标用户 ID。为空时会直接拒绝执行。
+            user_name (str, optional): 目标用户昵称（可选）。可用于黑名单记录展示。
+            duration (int, optional): 拉黑时长（秒）。0 表示按 max_blacklist_duration 处理（其值为 0 时表示永久）；60-600 适合轻度冷却/短时不回应；600-3600 适合明确隔离；86400 及以上用于高风险持续骚扰场景。
+            reason (str, optional): 拉黑原因，用于记录与审计。
+        """
+        return await self.blacklist.tool_block_user(
+            event=event,
+            user_id=user_id,
+            user_name=user_name,
+            duration=duration,
+            reason=reason,
+        )
+
+    @filter.llm_tool(name="unblock_user")
+    async def unblock_user(self, event: AstrMessageEvent, user_id: str) -> str:
+        """
+        将指定用户从黑名单中移除，即将其解除拉黑可重新与其对话，由你根据请求者身份与上下文判断是否应执行。
+        请将结果表述为“解除拉黑”，不要使用“解封/解禁”。
+
+        Args:
+            user_id (str): 目标用户 ID。
+        """
+        return await self.blacklist.tool_unblock_user(event=event, user_id=user_id)
+
+    @filter.llm_tool(name="list_blacklist")
+    async def list_blacklist(self, event: AstrMessageEvent, page: int = 1, page_size: int = 20) -> str:
+        """
+        获取黑名单列表（分页）。
+        返回中的 expire_time 表示该用户黑名单失效时间，失效后会自动移出黑名单，可重新与其进行对话。
+        这是黑名单语义，不是封禁语义。
+
+        Args:
+            page (int, optional): 页码，从 1 开始。
+            page_size (int, optional): 每页数量，默认 20，最大 50。
+        """
+        return await self.blacklist.tool_list_blacklist(event=event, page=page, page_size=page_size)
+
+    @filter.llm_tool(name="get_blacklist_status")
+    async def get_blacklist_status(self, event: AstrMessageEvent, user_id: str = "") -> str:
+        """
+        查询用户是否在黑名单中，即是否被拉黑。
+        若返回 expire_time，表示黑名单失效时间，失效后会自动移出黑名单，可重新与其进行对话。
+        这是黑名单语义，不是封禁语义。
+
+        Args:
+            user_id (str, optional): 目标用户 ID，默认当前发送者。
+        """
+        return await self.blacklist.tool_get_blacklist_status(event=event, user_id=user_id)
 
     # ==================== LLM 请求级别逻辑 ====================
 
@@ -472,6 +610,11 @@ class LLMEnhancement(Star):
         uid: str = event.get_sender_id()
         if not uid:
             return
+
+        # 关闭“拦截指令”时，在请求阶段拦截黑名单用户，避免误伤指令。
+        if not self._get_cfg("blacklist_block_commands", True):
+            if await self.blacklist.intercept_llm_request(event):
+                return
         
         g = StateManager.get_group(gid or f"private_{uid}")
         if uid not in g.members:
@@ -488,7 +631,6 @@ class LLMEnhancement(Star):
                 event.stop_event()
                 return
 
-        # 协议端偶发空事件（常见于 notice/回执）不应进入 LLM 请求流程
         message_chain = []
         if hasattr(event, "message_obj") and hasattr(event.message_obj, "message"):
             message_chain = event.message_obj.message or []
@@ -675,4 +817,6 @@ class LLMEnhancement(Star):
             return []
 
     async def terminate(self):
+        await self.blacklist.terminate()
         logger.info("[LLMEnhancement] 插件已终止")
+

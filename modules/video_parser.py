@@ -22,6 +22,12 @@ from astrbot.api.provider import LLMResponse, ProviderRequest
 import astrbot.api.message_components as Comp
 from .provider_utils import find_provider
 
+try:
+    from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import AiocqhttpMessageEvent
+    IS_AIOCQHTTP = True
+except ImportError:
+    IS_AIOCQHTTP = False
+
 # ==================== 媒体处理场景枚举 ====================
 
 class MediaScenario(Enum):
@@ -168,6 +174,8 @@ def extract_videos_from_chain(chain: List[object]) -> List[str]:
 async def napcat_resolve_file_url(event: AstrMessageEvent, file_id: str) -> Optional[str]:
     """使用 Napcat 接口将文件/视频的 file_id 解析为可下载 URL 或本地路径。"""
     if not (isinstance(file_id, str) and file_id):
+        return None
+    if not (IS_AIOCQHTTP and isinstance(event, AiocqhttpMessageEvent)):
         return None
     if not (hasattr(event, "bot") and hasattr(event.bot, "api") and hasattr(event.bot.api, "call_action")):
         return None

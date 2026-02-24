@@ -12,7 +12,7 @@
 
 ## 📖 简介
 
-一款为 [AstrBot](https://astrbot.app) 设计的 LLM 增强插件。通过集成智能唤醒、消息合并以及多媒体解析，显著提升 Bot 在群聊中的参与感、逻辑连贯性和多模态理解能力，让你的 Bot 不再只是被动响应，而是能够“听懂”话题、“看懂”视频、“感知”群成员。
+一款为 [AstrBot](https://astrbot.app) 设计的 LLM 增强插件。通过集成智能唤醒、消息合并、多媒体解析与黑名单管理，并提供可配置的工具权限校验，提升 Bot 在群聊与私聊中的参与感、逻辑连贯性与安全性，让你的 Bot 不再只是被动响应，而是能够“听懂”话题、“看懂”视频、“感知”群成员。
 
 ---
 
@@ -21,10 +21,10 @@
 本插件通过以下核心模块，将您的 Bot 升级为具备“直觉”与“多维感知”的智能实体：
 
 * **🧠 智能唤醒系统**：支持相关性、活跃期、特定提及、专业答疑等多种触发模式，内置沉默与冷却机制。
-* **📦 消息合并增强**：智能聚合短时间内多条消息，支持跨用户上下文合并与合并数量上限控制。
+* **📦 消息合并增强**：智能聚合短时间内多条消息，支持跨用户上下文合并、撤回消息兜底处理与合并数量上限控制。
 * **🎬 媒体文件感知**：支持视频抽帧/ASR、文件引用感知及合并转发内容解析。支持聊天记录视频抽帧上限控制与占位符回退。内置视频总结缓存机制，避免重复解析。
 * **🛠️ 增强管理工具**：集成群成员感知、禁言管理、高清头像获取等 LLM 函数工具。
-* **🛡️ 多维黑名单桥接**：提供群组、用户级屏蔽，支持与外部黑名单插件联动。
+* **🛡️ 黑名单管理器**：支持拉黑/解除拉黑、分页查询与状态查询；可配置是否拦截指令（关闭后仅拦截 LLM 请求）。
 
 ---
 
@@ -32,7 +32,7 @@
 
 1. **环境准备**：
    * 系统需安装 FFmpeg 并将其加入环境变量（用于视频/GIF 解析）。
-   * 推荐安装 [`astrbot_plugin_blacklist_tools`](https://github.com/Foolllll-J/astrbot_plugin_blacklist_tools) 插件以启用黑名单桥接（注意：**必须使用该链接指向的分支仓库**以确保兼容性）。
+   * 在插件目录执行 `pip install -r requirements.txt` 安装依赖。
 2. **插件部署**：
    * 将 `astrbot_plugin_llm_enhancement` 文件夹放入 AstrBot 的 `plugins` 目录。
 3. **重启 AstrBot**。
@@ -93,16 +93,19 @@ Bot 可根据语境自主调用以下工具函数，无需人工干预：
 
 * **`get_group_members_info`**：获取当前群聊的成员名单（包含昵称与 ID）。
 * **`get_user_avatar`**：获取指定用户的 640px 高清头像。
-* **`set_group_ban`**：执行禁言操作。
+* **`set_group_ban`**：执行禁言或解禁操作，且支持跨会话禁言。
+* **`block_user` / `unblock_user`**：拉黑或解除拉黑指定用户。
+* **`list_blacklist` / `get_blacklist_status`**：分页查询黑名单与单用户状态。
 
 ---
 
 ## 🙏 致谢
 
-本插件的开发参考或直接移植了以下优秀项目的核心逻辑，特此鸣谢：
+本插件的开发参考或直接移植了以下优秀项目的部分逻辑，特此鸣谢：
 
 * [astrbot_plugin_wakepro](https://github.com/Zhalslar/astrbot_plugin_wakepro)：提供了智能唤醒参考。
 * [astrbot_zssm_explain](https://github.com/xiaoxi68/astrbot_zssm_explain)：提供了视频注入的实现思路。
+* [astrbot_plugin_blacklist_tools](https://github.com/ctrlkk/astrbot_plugin_blacklist_tools)：提供了黑名单模块实现参考。
 
 ---
 

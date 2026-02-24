@@ -17,6 +17,12 @@ from .video_parser import (
     is_gif_file,
 )
 
+try:
+    from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import AiocqhttpMessageEvent
+    IS_AIOCQHTTP = True
+except ImportError:
+    IS_AIOCQHTTP = False
+
 
 async def _probe_duration_helper(get_cfg: Callable[[str, Any], Any], media_path: str) -> float:
     try:
@@ -125,7 +131,7 @@ async def process_media_content(
 
     video_sources = extract_videos_from_chain(all_components)
 
-    if not video_sources and reply_seg:
+    if not video_sources and reply_seg and IS_AIOCQHTTP and isinstance(event, AiocqhttpMessageEvent):
         try:
             client = event.bot
             original_msg = await client.api.call_action("get_msg", message_id=reply_seg.id)

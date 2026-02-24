@@ -11,12 +11,6 @@
         "type": "list",
         "default": []
     },
-    "user_blacklist": {
-        "description": "用户黑名单",
-        "hint": "屏蔽黑名单里的用户，使其全局无法唤醒bot。",
-        "type": "list",
-        "default": []
-    },
     "intelligent_wake": {
         "type": "object",
         "description": "智能唤醒",
@@ -291,6 +285,32 @@
                     "step": 0.01
                 },
                 "default": 0
+            }
+        }
+    },
+    "blacklist": {
+        "type": "object",
+        "description": "黑名单",
+        "hint": "黑名单管理配置，用于命令与 LLM 工具拉黑。",
+        "items": {
+            "max_blacklist_duration": {
+                "type": "int",
+                "default": 86400,
+                "minimum": 0,
+                "description": "黑名单最长时长（秒）",
+                "hint": "仅对 LLM 工具生效。设置为 0 表示允许永久拉黑。"
+            },
+            "blacklist_block_commands": {
+                "type": "bool",
+                "default": true,
+                "description": "黑名单是否拦截指令",
+                "hint": "开启时在消息阶段拦截黑名单用户（包括指令）；关闭时放行指令处理，仅在 LLM 请求阶段拦截。"
+            },
+            "tool_write_require_admin": {
+                "type": "bool",
+                "default": false,
+                "description": "写工具运行前权限校验",
+                "hint": "默认关闭，交给 LLM 自行判断。开启后：禁言/拉黑仅允许管理员或目标为调用者本人；解除拉黑仅允许管理员。"
             }
         }
     }

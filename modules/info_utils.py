@@ -1,6 +1,6 @@
 import json
 import time
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Literal
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent
 
@@ -10,6 +10,36 @@ try:
     IS_AIOCQHTTP = True 
 except ImportError: 
     IS_AIOCQHTTP = False 
+
+PermissionPolicy = Literal["admin_only", "admin_or_self"]
+
+
+def validate_write_permission(
+    event: AstrMessageEvent,
+    *,
+    target_user_id: str,
+    strict: bool,
+    policy: PermissionPolicy,
+    action: str,
+) -> Optional[str]:
+    if not strict:
+        return None
+
+    sender_id = str(event.get_sender_id() or "")
+    is_admin = bool(event.is_admin())
+    is_self_action = bool(target_user_id) and target_user_id == sender_id
+
+    if policy == "admin_only":
+        if not is_admin:
+            return f"权限不足。只有管理员可以{action}。"
+        return None
+
+    if policy == "admin_or_self":
+        if not is_admin and not is_self_action:
+            return f"权限不足。您({sender_id})没有权限{action}其他用户({target_user_id})。"
+        return None
+
+    return f"权限策略错误: {policy}"
 
 async def get_group_members_internal(event: AstrMessageEvent, group_id: Optional[str] = None) -> Optional[List[Dict[str, Any]]]: 
     """ 调用API获取群成员列表 """ 
@@ -75,7 +105,14 @@ async def process_group_members_info(event: AstrMessageEvent, group_id: Optional
         logger.info(f"获取群成员信息时发生错误: {e}，耗时 {elapsed_time:.2f}s") 
         return json.dumps({"error": f"获取群成员信息时发生内部错误: {str(e)}"})
 
-async def set_group_ban_logic(event: AstrMessageEvent, user_id: str, duration: int, user_name: str, group_id: str = None) -> str:
+async def set_group_ban_logic(
+    event: AstrMessageEvent,
+    user_id: str,
+    duration: int,
+    user_name: str,
+    group_id: str = None,
+    strict_permission_check: bool = False,
+) -> str:
     """
     在群聊中禁言某用户的逻辑。
     """
@@ -94,40 +131,47 @@ async def set_group_ban_logic(event: AstrMessageEvent, user_id: str, duration: i
                 "message": "未识别到群聊环境，请提供目标群号(group_id)。"
             }, ensure_ascii=False)
 
-        # 2. 权限检查
+        target_user_id = str(user_id or "").strip()
+        if not target_user_id:
+            return json.dumps(
+                {"success": False, "message": "请提供要禁言/解除禁言的目标用户 ID。"},
+                ensure_ascii=False,
+            )
+
         sender_id = str(event.get_sender_id())
-        self_id = str(event.get_self_id())
-        is_admin = event.is_admin()
-        
-        # 1. 如果是管理员在操作，允许
-        # 2. 如果是 Bot 自身发起的决策（针对当前对话者），允许（即 target_id == sender_id，即“自卫”逻辑）
-        # 3. 如果是 Bot 自身 ID 发起的调用，允许
-        is_self_defense = (str(user_id) == sender_id)
-        
-        if not is_admin and not is_self_defense and sender_id != self_id:
-            logger.warning(f"用户 {sender_id} 尝试禁言 {user_id}，权限不足。")
-            return json.dumps({
-                "success": False,
-                "message": f"权限不足。只有管理员可以执行对他人的禁言操作。您的 ID: {sender_id}"
-            }, ensure_ascii=False)
+        permission_error = validate_write_permission(
+            event,
+            target_user_id=target_user_id,
+            strict=strict_permission_check,
+            policy="admin_or_self",
+            action="禁言",
+        )
+        if permission_error:
+            logger.warning(f"用户 {sender_id} 尝试禁言 {target_user_id}，权限不足（严格校验开启）。")
+            return json.dumps(
+                {
+                    "success": False,
+                    "message": permission_error,
+                },
+                ensure_ascii=False,
+            )
 
         # 3. 执行禁言
         client = event.bot
         params = {
             "group_id": int(target_group_id),
-            "user_id": int(user_id),
+            "user_id": int(target_user_id),
             "duration": duration
         }
         
         await client.api.call_action('set_group_ban', **params)
         
-        operator_title = "管理员" if is_admin else "你"
-        logger.info(f"{operator_title} {sender_id} 通过工具禁言了用户 {user_id} ({user_name})，时长 {duration} 秒。")
+        logger.info(f"调用方 {sender_id} 通过工具禁言了用户 {target_user_id} ({user_name})，时长 {duration} 秒。")
         
         return json.dumps({
             "success": True,
-            "message": f"用户 {user_name} ({user_id}) 已被禁言 {duration} 秒。",
-            "user_id": user_id,
+            "message": f"用户 {user_name} ({target_user_id}) 已被禁言 {duration} 秒。",
+            "user_id": target_user_id,
             "user_name": user_name,
             "duration": duration,
             "timestamp": int(time.time())

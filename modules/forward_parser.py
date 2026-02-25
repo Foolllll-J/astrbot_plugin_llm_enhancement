@@ -250,7 +250,7 @@ async def extract_content_recursively(
                     elif seg_type == "forward":
                         nested_content = seg_data.get("content")
                         if isinstance(nested_content, list):
-                            logger.info(f"forward_parser: 发现嵌套转发内容 (深度: {depth + 1}, 节点数: {len(nested_content)})")
+                            logger.debug(f"forward_parser: 发现嵌套转发内容 (深度: {depth + 1}, 节点数: {len(nested_content)})")
                             await extract_content_recursively(
                                 nested_content,
                                 extracted_texts,
@@ -403,7 +403,7 @@ async def process_reference_and_forward_content(
 
                                         if asr_text:
                                             extracted_texts.append(f" [视频语音转写 {idx + 1}] {asr_text}")
-                                            logger.info(f"转发视频 {idx + 1} ASR 成功")
+                                            logger.debug(f"转发视频 {idx + 1} ASR 成功")
                                     except Exception as e:
                                         logger.debug(f"[LLMEnhancement] 转发视频 ASR 失败: idx={idx + 1}, err={e}")
 

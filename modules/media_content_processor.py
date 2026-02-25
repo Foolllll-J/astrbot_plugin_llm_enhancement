@@ -69,7 +69,7 @@ async def detect_media_scenario(
                 ctx.media_path = local_path
                 ctx.cleanup_paths.append(local_path)
                 first_path = local_path
-                logger.info(f"[场景判断] 下载成功: {local_path}")
+                logger.debug(f"[场景判断] 下载成功: {local_path}")
             else:
                 ctx.scenario = MediaScenario.NONE
                 return ctx
@@ -84,10 +84,10 @@ async def detect_media_scenario(
         ctx.duration = await _probe_duration_helper(get_cfg, first_path)
         if ctx.duration <= 0:
             ctx.scenario = MediaScenario.NONE
-            logger.info("[场景判断] → GIF 探测时长为 0s，视为静态图片，跳过增强处理")
+            logger.debug("[场景判断] → GIF 探测时长为 0s，视为静态图片，跳过增强处理")
             return ctx
         ctx.scenario = MediaScenario.GIF_ANIMATED
-        logger.info(f"[场景判断] → GIF 动图 (时长: {ctx.duration:.2f}s)")
+        logger.debug(f"[场景判断] → GIF 动图 (时长: {ctx.duration:.2f}s)")
         return ctx
 
     suffix = Path(first_path).suffix.lower()
@@ -106,14 +106,14 @@ async def detect_media_scenario(
         ctx.duration = await _probe_duration_helper(get_cfg, first_path)
         if ctx.duration <= 0:
             ctx.scenario = MediaScenario.NONE
-            logger.info("[场景判断] → 探测时长为 0s，判定为普通图片，跳过增强处理")
+            logger.debug("[场景判断] → 探测时长为 0s，判定为普通图片，跳过增强处理")
             return ctx
         ctx.scenario = MediaScenario.VIDEO
-        logger.info(f"[场景判断] → 视频 (统一抽帧流程, 时长: {ctx.duration:.2f}s)")
+        logger.debug(f"[场景判断] → 视频 (统一抽帧流程, 时长: {ctx.duration:.2f}s)")
         return ctx
 
     ctx.scenario = MediaScenario.NONE
-    logger.info(f"[场景判断] → 静态图片或未知格式 (后缀: {suffix})，跳过增强处理")
+    logger.debug(f"[场景判断] → 静态图片或未知格式 (后缀: {suffix})，跳过增强处理")
     return ctx
 
 
@@ -143,7 +143,7 @@ async def process_media_content(
     media_ctx = await detect_media_scenario(req, get_cfg, video_sources)
     req._cleanup_paths.extend(media_ctx.cleanup_paths)
 
-    logger.info(f"[LLMEnhancement] 媒体场景: {media_ctx.scenario.value}")
+    logger.debug(f"[LLMEnhancement] 媒体场景: {media_ctx.scenario.value}")
 
     processor = VideoFrameProcessor(context, event, get_cfg)
 

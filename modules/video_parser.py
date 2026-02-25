@@ -340,10 +340,10 @@ async def extract_forward_video_keyframes(
         
         # 1. 解析 Napcat file_id
         if not os.path.exists(src) and not src.startswith(("http://", "https://")):
-            logger.info(f"video_parser: 尝试解析本地/NapCat文件 ID: {src}")
+            logger.debug(f"video_parser: 尝试解析本地/NapCat文件 ID: {src}")
             resolved = await napcat_resolve_file_url(event, src)
             if resolved:
-                logger.info(f"video_parser: 文件 ID 解析成功 -> {resolved}")
+                logger.debug(f"video_parser: 文件 ID 解析成功 -> {resolved}")
                 video_path = resolved
             else:
                 logger.warning(f"video_parser: 文件 ID 解析失败: {src}")
@@ -351,7 +351,7 @@ async def extract_forward_video_keyframes(
             
         # 2. 下载远程视频
         if video_path.startswith(("http://", "https://")):
-            logger.info(f"video_parser: 正在下载并解析合并转发中的视频: {video_path}")
+            logger.debug(f"video_parser: 正在下载并解析合并转发中的视频: {video_path}")
             try:
                 downloaded = await asyncio.wait_for(
                     download_video_to_temp(video_path, max_mb),
@@ -388,7 +388,7 @@ async def extract_forward_video_keyframes(
             sample_count = max(1, min(ideal_count, max_frame_count))
             if ideal_count > max_frame_count:
                 actual_interval = duration / sample_count
-                logger.info(
+                logger.debug(
                     f"[聊天记录解析] 视频时长 {duration:.1f}s 超过间隔覆盖范围，调整抽帧间隔: "
                     f"{interval_sec}s -> {actual_interval:.1f}s (上限 {max_frame_count} 帧)"
                 )
@@ -653,7 +653,7 @@ class VideoFrameProcessor:
                     self._inject_summary(req, cached_summary, "内容摘要(缓存复用)", sender_name=sender_name)
                     return True
 
-            logger.info(f"[VideoFrameProcessor] GIF 处理: {gif_path}")
+            logger.debug(f"[VideoFrameProcessor] GIF 处理: {gif_path}")
             
             ffmpeg_path = self._get_cfg("ffmpeg_path")
             duration = await self._probe_duration(gif_path)
@@ -665,7 +665,7 @@ class VideoFrameProcessor:
             # GIF 固定参数：1秒/帧，最多 10 帧。使用 math.ceil 确保 1.1s -> 2 帧
             sample_count = max(1, min(math.ceil(duration), 10))
             
-            logger.info(f"[VideoFrameProcessor] GIF 抽帧: 时长 {duration:.2f}s, 抽帧数 {sample_count}")
+            logger.debug(f"[VideoFrameProcessor] GIF 抽帧: 时长 {duration:.2f}s, 抽帧数 {sample_count}")
             
             frame_paths = await sample_frames_equidistant(
                 ffmpeg_path,
@@ -682,7 +682,7 @@ class VideoFrameProcessor:
             frame_count = len(frames)
 
             if frame_count == 1:
-                logger.info("[VideoFrameProcessor] GIF仅抽取到1帧，跳过汇总流程")
+                logger.debug("[VideoFrameProcessor] GIF仅抽取到1帧，跳过汇总流程")
                 req.image_urls = [frames[0]]
                 for frame in frames:
                     req._cleanup_paths = req._cleanup_paths or []
@@ -752,11 +752,11 @@ class VideoFrameProcessor:
             # 如果实际抽帧数因为达到上限而被压缩，日志记录一下
             if ideal_count > max_frame_count:
                 actual_interval = duration / sample_count
-                logger.info(f"[VideoFrameProcessor] 视频时长 {duration:.1f}s 超过间隔覆盖范围，调整抽帧间隔: {interval}s -> {actual_interval:.1f}s (上限 {max_frame_count} 帧)")
+                logger.debug(f"[VideoFrameProcessor] 视频时长 {duration:.1f}s 超过间隔覆盖范围，调整抽帧间隔: {interval}s -> {actual_interval:.1f}s (上限 {max_frame_count} 帧)")
         else:
             sample_count = self._get_cfg("video_sample_count", 3)
         
-        logger.info(f"[VideoFrameProcessor] 视频多帧抽取: {sample_count} 帧")
+        logger.debug(f"[VideoFrameProcessor] 视频多帧抽取: {sample_count} 帧")
         
         try:
             frames, cleanup_paths, local_video_path, status = await prepare_video_context(
@@ -809,9 +809,9 @@ class VideoFrameProcessor:
                         asr_text = str(res)
                 
                 if asr_text:
-                    logger.info(f"[VideoFrameProcessor] ASR 成功: {asr_text[:100]}...")
+                    logger.debug(f"[VideoFrameProcessor] ASR 成功: {asr_text[:100]}...")
                 else:
-                    logger.info(f"[VideoFrameProcessor] ASR 成功，但未识别到文字内容")
+                    logger.debug(f"[VideoFrameProcessor] ASR 成功，但未识别到文字内容")
             except Exception as e:
                 logger.warning(f"[VideoFrameProcessor] ASR 调用失败: {e}")
             finally:
@@ -833,7 +833,7 @@ class VideoFrameProcessor:
         # 强制字数限制
         max_summary_length = max_summary_length or 100
         
-        logger.info(f"[帧聚合汇总] 开始处理 {len(frames)} 帧图片...")
+        logger.debug(f"[帧聚合汇总] 开始处理 {len(frames)} 帧图片...")
         
         # 步骤 1：逐帧识图
         frame_descriptions = []
@@ -848,7 +848,7 @@ class VideoFrameProcessor:
                 start_t = time.time()
                 # 获取 provider 名称用于日志
                 p_name = getattr(provider, "name", "unknown") or getattr(provider, "id", "unknown")
-                logger.info(f"[帧聚合汇总] 正在请求第 {idx}/{frame_count} 帧 ...")
+                logger.debug(f"[帧聚合汇总] 正在请求第 {idx}/{frame_count} 帧 ...")
                 
                 response = await provider.text_chat(
                     prompt=f"简要描述这一帧（第 {idx}/{frame_count} 帧）的内容，重点关注动作、表情和关键物体。",
@@ -861,7 +861,7 @@ class VideoFrameProcessor:
                 cost = time.time() - start_t
                 if desc:  
                     frame_descriptions.append(f"[第 {idx} 帧] {desc}")
-                    logger.info(f"[帧聚合汇总] 第 {idx}/{len(frames)} 帧解析成功 (耗时: {cost:.2f}s). 响应: {desc}")
+                    logger.debug(f"[帧聚合汇总] 第 {idx}/{len(frames)} 帧解析成功 (耗时: {cost:.2f}s). 响应: {desc}")
                 else:
                     logger.warning(f"[帧聚合汇总] 第 {idx}/{len(frames)} 帧解析响应为空")
             except Exception as e:
@@ -876,7 +876,7 @@ class VideoFrameProcessor:
         
         if asr_text:
             comprehensive_context += f"\n\n[视频语音转写]\n{asr_text}"
-            logger.info("[帧聚合汇总] 已融合 ASR 内容")
+            logger.debug("[帧聚合汇总] 已融合 ASR 内容")
         
         # 步骤 3：LLM 汇总
         try:
@@ -886,7 +886,7 @@ class VideoFrameProcessor:
                 return None
             
             llm_name = getattr(llm_provider, "name", "unknown") or getattr(llm_provider, "id", "unknown")
-            logger.info(f"[帧聚合汇总] 正在请求汇总摘要...")
+            logger.debug(f"[帧聚合汇总] 正在请求汇总摘要...")
             
             summary_prompt = (
                 f"你是一个媒体分析助手。请根据以下提供的逐帧视觉描述和语音转写（如有），"
@@ -912,10 +912,10 @@ class VideoFrameProcessor:
             if summary:
                 # 步骤 4：长度控制
                 if len(summary) > max_summary_length:
-                    logger.info(f"[帧聚合汇总] 摘要长度 {len(summary)} 超过限制 {max_summary_length}，截断处理")
+                    logger.debug(f"[帧聚合汇总] 摘要长度 {len(summary)} 超过限制 {max_summary_length}，截断处理")
                     summary = summary[:max_summary_length].rsplit('。', 1)[0] + "。"
                 
-                logger.info(f"[帧聚合汇总] 汇总成功 (耗时: {time.time() - start_t:.2f}s, 字数: {len(summary)}): {summary}")
+                logger.debug(f"[帧聚合汇总] 汇总成功 (耗时: {time.time() - start_t:.2f}s, 字数: {len(summary)}): {summary}")
                 return summary
             else:
                 logger.warning(f"[帧聚合汇总] 汇总摘要响应为空")

@@ -50,12 +50,28 @@ BUILT_CMDS = [
     "del", "reset", "history", "persona", "tool ls",
     "key", "websearch", "help",
 ]
+RECENT_RECALL_TTL_SEC = 120.0
+
+
+def _raw_get(raw: Any, key: str, default: Any = None) -> Any:
+    """兼容 dict / aiocqhttp Event 的字段读取。"""
+    if raw is None:
+        return default
+    try:
+        if isinstance(raw, dict):
+            return raw.get(key, default)
+        if hasattr(raw, "get"):
+            return raw.get(key, default)
+        return getattr(raw, key, default)
+    except Exception:
+        return default
 
 class LLMEnhancement(Star): 
     def __init__(self, context: Context, config: AstrBotConfig): 
         super().__init__(context) 
         self.config = config
         self.cfg = {}
+        self._recent_recalled_msg: dict[str, float] = {}
         self._refresh_config()
         self.sent = Sentiment()
         self.similarity = Similarity()
@@ -96,6 +112,33 @@ class LLMEnhancement(Star):
             return self.cfg[key]
         return self.config.get(key, default)
 
+    def _build_recall_key(self, umo: str, msg_id: str) -> str:
+        return f"{umo}::{msg_id}"
+
+    def _mark_recent_recall(self, umo: str, msg_id: str, ttl_sec: float = RECENT_RECALL_TTL_SEC) -> None:
+        sid = str(msg_id or "").strip()
+        if not sid:
+            return
+        now_ts = time.time()
+        self._recent_recalled_msg[self._build_recall_key(umo, sid)] = now_ts + max(10.0, float(ttl_sec))
+        expired = [k for k, exp in self._recent_recalled_msg.items() if exp <= now_ts]
+        for k in expired:
+            self._recent_recalled_msg.pop(k, None)
+
+    def _consume_recent_recall(self, umo: str, msg_id: str) -> bool:
+        sid = str(msg_id or "").strip()
+        if not sid:
+            return False
+        now_ts = time.time()
+        key = self._build_recall_key(umo, sid)
+        exp = self._recent_recalled_msg.get(key, 0.0)
+        if exp <= now_ts:
+            if key in self._recent_recalled_msg:
+                self._recent_recalled_msg.pop(key, None)
+            return False
+        self._recent_recalled_msg.pop(key, None)
+        return True
+
     # ==================== 唤醒消息级别 ====================
     
     @filter.event_message_type(filter.EventMessageType.ALL, priority=1)
@@ -103,14 +146,30 @@ class LLMEnhancement(Star):
         """处理消息的初步过滤、黑白名单检查及唤醒逻辑。支持群聊和私聊。"""
         self._refresh_config()
         raw_message = event.message_obj.raw_message if (event.message_obj and hasattr(event.message_obj, "raw_message")) else {}
-        if not raw_message and hasattr(event, "event") and isinstance(event.event, dict):
+        if not raw_message and hasattr(event, "event"):
             raw_message = event.event
         if (
             IS_AIOCQHTTP
-            and isinstance(event, AiocqhttpMessageEvent)
-            and isinstance(raw_message, dict)
-            and raw_message.get("post_type") not in (None, "", "message")
+            and _raw_get(raw_message, "post_type") not in (None, "", "message")
         ):
+            raw_post_type = _raw_get(raw_message, "post_type")
+            raw_notice_type = _raw_get(raw_message, "notice_type")
+            recalled_msg_id = str(_raw_get(raw_message, "message_id") or "").strip()
+            if raw_post_type == "notice" and raw_notice_type in {"group_recall", "friend_recall"} and recalled_msg_id:
+                self._mark_recent_recall(event.unified_msg_origin, recalled_msg_id)
+                logger.debug(
+                    "[LLMEnhancement] on_group_msg 记录撤回消息："
+                    f"umo={event.unified_msg_origin}, recalled_msg_id={recalled_msg_id}, "
+                    f"notice_type={raw_notice_type}"
+                )
+            logger.debug(
+                "[LLMEnhancement] on_group_msg 忽略非消息事件："
+                f"post_type={raw_post_type}, "
+                f"notice_type={raw_notice_type}, "
+                f"request_type={_raw_get(raw_message, 'request_type')}, "
+                f"sender={event.get_sender_id()}, group={event.get_group_id()}, "
+                f"umo={event.unified_msg_origin}"
+            )
             return
         bid: str = event.get_self_id()
         gid: str = event.get_group_id() # 私聊下为 None
@@ -290,11 +349,76 @@ class LLMEnhancement(Star):
         @session_waiter(timeout=merge_delay, record_history_chains=False)
         async def collect_messages(controller: SessionController, ev: AstrMessageEvent):
             nonlocal message_buffer, additional_components
-            # 撤回事件实时监听已停用，统一在最终阶段做 get_msg 校验。
-
             if member.cancel_merge:
                 controller.stop()
                 return
+
+            # 单通道实时撤回监控：撤回事件由 session_controller 转发到此处处理。
+            raw = (
+                ev.message_obj.raw_message
+                if (hasattr(ev, "message_obj") and hasattr(ev.message_obj, "raw_message"))
+                else {}
+            )
+            if not raw and hasattr(ev, "event"):
+                raw = ev.event
+            raw_post_type = _raw_get(raw, "post_type")
+            raw_notice_type = _raw_get(raw, "notice_type")
+            if (
+                IS_AIOCQHTTP
+                and raw_post_type == "notice"
+                and raw_notice_type in {"group_recall", "friend_recall"}
+            ):
+                recalled_msg_id = str(_raw_get(raw, "message_id") or "").strip()
+                if not recalled_msg_id:
+                    logger.debug(
+                        "[LLMEnhancement] 实时撤回监控：message_id 为空。"
+                        f"uid={uid}, notice_type={raw_notice_type}"
+                    )
+                    return
+
+                async with member.lock:
+                    in_pending = recalled_msg_id in member.pending_msg_ids
+                    in_buffer = any(str(mid or "") == recalled_msg_id for mid, _n, _c in message_buffer)
+                    if not (in_pending or in_buffer):
+                        return
+
+                    before_count = len(message_buffer)
+                    message_buffer = [
+                        (mid, name, content)
+                        for mid, name, content in message_buffer
+                        if str(mid or "") != recalled_msg_id
+                    ]
+                    remove_pending_msg_id(group_state, member, recalled_msg_id)
+                    member.merged_msg_ids.pop(recalled_msg_id, None)
+                    after_count = len(message_buffer)
+                    is_trigger_recalled = str(member.trigger_msg_id or "") == recalled_msg_id
+                    if is_trigger_recalled and after_count > 0:
+                        member.trigger_msg_id = str(message_buffer[0][0] or "")
+                    should_stop = after_count <= 0
+                    if should_stop:
+                        member.cancel_merge = True
+                        clear_pending_msg_ids(group_state, member)
+
+                    logger.debug(
+                        "[LLMEnhancement] 实时撤回监控命中："
+                        f"uid={uid}, recalled_msg_id={recalled_msg_id}, trigger_msg_id={member.trigger_msg_id or 'unknown'}, "
+                        f"in_pending={in_pending}, in_buffer={in_buffer}, "
+                        f"is_trigger_recalled={is_trigger_recalled}, "
+                        f"before={before_count}, after={after_count}, "
+                        f"should_stop={should_stop}, new_trigger_msg_id={member.trigger_msg_id or 'unknown'}"
+                    )
+
+                    if should_stop:
+                        logger.info(
+                            "[LLMEnhancement] 实时撤回触发终止，已立即取消本次合并会话。"
+                            f"uid={uid}, recalled_msg_id={recalled_msg_id}, after={after_count}"
+                        )
+                        controller.stop()
+                    else:
+                        controller.keep(timeout=merge_delay, reset_timeout=True)
+                return
+            elif IS_AIOCQHTTP and raw_post_type == "notice":
+                pass
 
             # 环境检查
             if gid:
@@ -344,6 +468,11 @@ class LLMEnhancement(Star):
         try:
             await collect_messages(event)
         except TimeoutError:
+            logger.debug(
+                "[LLMEnhancement] collect_messages 等待超时："
+                f"uid={uid}, group={gid or 'private'}, trigger_msg_id={member.trigger_msg_id or 'unknown'}, "
+                f"buffer_count={len(message_buffer)}"
+            )
             pass # 继续后续处理
         finally:
             async with member.lock:
@@ -375,6 +504,12 @@ class LLMEnhancement(Star):
                     f"[LLMEnhancement] 最终校验已从本次合并队列移除消息："
                     f"before={validation_before_count}, removed={len(removed_msg_ids)}, "
                     f"remaining={len(filtered_buffer)}, removed_ids={removed_ids_text}, "
+                    f"trigger_msg_id={member.trigger_msg_id or 'unknown'}"
+                )
+            else:
+                logger.debug(
+                    f"[LLMEnhancement] 最终校验完成（未移除消息）："
+                    f"before={validation_before_count}, removed=0, remaining={len(filtered_buffer)}, "
                     f"trigger_msg_id={member.trigger_msg_id or 'unknown'}"
                 )
             message_buffer = filtered_buffer
@@ -623,6 +758,13 @@ class LLMEnhancement(Star):
         now = time.time()
         msg = event.message_str
         current_msg_id = get_event_msg_id(event)
+        if current_msg_id and self._consume_recent_recall(event.unified_msg_origin, current_msg_id):
+            logger.info(
+                "[LLMEnhancement] on_llm_request 拦截：触发消息已在本次请求前撤回。"
+                f"umo={event.unified_msg_origin}, msg_id={current_msg_id}, uid={uid}"
+            )
+            event.stop_event()
+            return
         merge_delay = float(self._get_cfg("merge_delay", 10.0) or 10.0)
         cache_keep_sec = max(merge_delay * 6, 60.0)
         async with member.lock:

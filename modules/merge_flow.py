@@ -203,7 +203,7 @@ async def is_msg_still_available(event: AstrMessageEvent, msg_id: str) -> bool:
         logger.info(f"[LLMEnhancement] get_msg 未返回 message 字段，判定不可用: msg_id={msg_id}")
         return False
     if isinstance(msg_content, (list, str)) and len(msg_content) == 0:
-        logger.info(f"[LLMEnhancement] get_msg 返回空内容，判定不可用: msg_id={msg_id}")
+        logger.debug(f"[LLMEnhancement] get_msg 返回空内容，判定不可用: msg_id={msg_id}")
         return False
 
     return True

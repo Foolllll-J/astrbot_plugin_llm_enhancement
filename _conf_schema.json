@@ -147,6 +147,12 @@
                 "type": "bool",
                 "default": true,
                 "hint": "关闭后，不再提取或注入引用消息中的文件信息。"
+            },
+            "json_parse_enable": {
+                "description": "启用 JSON 卡片解析",
+                "type": "bool",
+                "default": true,
+                "hint": "关闭后，不再提取引用消息中的 JSON 卡片关键信息（如分享卡片标题、摘要、链接）。"
             }
         }
     },
@@ -274,6 +280,13 @@
                 "type": "bool",
                 "default": true,
                 "hint": "开启后，引用消息中的文件名会注入到上下文。"
+            },
+            "inject_file_text_length": {
+                "description": "注入文件文本长度",
+                "type": "int",
+                "default": 0,
+                "minimum": 0,
+                "hint": "大于 0 时会读取可直接解析的文本文件并注入前 N 个字符；设为 0 表示关闭。"
             },
             "quote_self_file_block_prob": {
                 "description": "引用 Bot 自身文件的请求屏蔽概率",

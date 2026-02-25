@@ -38,7 +38,15 @@ def build_event_snapshot(event: AstrMessageEvent, gid: str, uid: str) -> Dict[st
     chain = []
     if hasattr(event, "message_obj") and hasattr(event.message_obj, "message") and event.message_obj.message:
         chain = event.message_obj.message
-    components = [seg for seg in chain if isinstance(seg, (Comp.Forward, Comp.Reply, Comp.Video, Comp.File))]
+    def _is_merge_component(seg: Any) -> bool:
+        if isinstance(seg, (Comp.Forward, Comp.Reply, Comp.Video, Comp.File, Comp.Json)):
+            return True
+        if isinstance(seg, dict):
+            seg_type = str(seg.get("type") or "").lower()
+            return seg_type in {"forward", "reply", "video", "file", "json"}
+        return False
+
+    components = [seg for seg in chain if _is_merge_component(seg)]
     return {
         "msg_id": get_event_msg_id(event),
         "ts": time.time(),

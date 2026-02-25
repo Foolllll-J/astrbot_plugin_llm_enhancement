@@ -12,10 +12,11 @@ from astrbot.core.utils.session_waiter import session_waiter, SessionController
 from .modules.sentiment import Sentiment
 from .modules.similarity import Similarity
 from .modules.state_manager import StateManager, MemberState
-from .modules.forward_parser import process_reference_and_forward_content
-from .modules.media_content_processor import process_media_content
+from .modules.forward_parser import process_forward_record_content
+from .modules.reference_parser import process_reference_context
 from .modules.video_parser import (
     download_video_to_temp,
+    process_media_content,
 )
 import os
 import shutil
@@ -142,7 +143,7 @@ class LLMEnhancement(Star):
     # ==================== 唤醒消息级别 ====================
     
     @filter.event_message_type(filter.EventMessageType.ALL, priority=1)
-    async def on_group_msg(self, event: AstrMessageEvent):
+    async def on_message_event(self, event: AstrMessageEvent):
         """处理消息的初步过滤、黑白名单检查及唤醒逻辑。支持群聊和私聊。"""
         self._refresh_config()
         raw_message = event.message_obj.raw_message if (event.message_obj and hasattr(event.message_obj, "raw_message")) else {}
@@ -158,12 +159,12 @@ class LLMEnhancement(Star):
             if raw_post_type == "notice" and raw_notice_type in {"group_recall", "friend_recall"} and recalled_msg_id:
                 self._mark_recent_recall(event.unified_msg_origin, recalled_msg_id)
                 logger.debug(
-                    "[LLMEnhancement] on_group_msg 记录撤回消息："
+                    "[LLMEnhancement] 记录撤回消息："
                     f"umo={event.unified_msg_origin}, recalled_msg_id={recalled_msg_id}, "
                     f"notice_type={raw_notice_type}"
                 )
             logger.debug(
-                "[LLMEnhancement] on_group_msg 忽略非消息事件："
+                "[LLMEnhancement] 忽略非消息事件："
                 f"post_type={raw_post_type}, "
                 f"notice_type={raw_notice_type}, "
                 f"request_type={_raw_get(raw_message, 'request_type')}, "
@@ -214,11 +215,66 @@ class LLMEnhancement(Star):
         wake = event.is_at_or_wake_command
         reason = "at_or_cmd"
 
+        # 兼容“纯视频/纯文件/纯转发/纯JSON卡片无文本”场景：避免空文本被下游跳过。
+        has_video_component = False
+        has_file_component = False
+        has_forward_component = False
+        has_json_component = False
+        file_name = ""
+        try:
+            if hasattr(event, "message_obj") and hasattr(event.message_obj, "message"):
+                for seg in (event.message_obj.message or []):
+                    if isinstance(seg, Comp.Video):
+                        has_video_component = True
+                    elif isinstance(seg, Comp.File):
+                        has_file_component = True
+                        file_name = str(getattr(seg, "name", "") or getattr(seg, "file", "") or "").strip()
+                    elif isinstance(seg, Comp.Forward):
+                        has_forward_component = True
+                    elif isinstance(seg, Comp.Json):
+                        has_json_component = True
+                    elif isinstance(seg, dict):
+                        seg_type = seg.get("type")
+                        data = seg.get("data") or {}
+                        if seg_type == "video":
+                            has_video_component = True
+                        elif seg_type == "file":
+                            has_file_component = True
+                            if not file_name:
+                                file_name = str(data.get("name") or data.get("file") or "").strip()
+                        elif seg_type == "forward":
+                            has_forward_component = True
+                        elif seg_type == "json":
+                            has_json_component = True
+        except Exception:
+            has_video_component = False
+            has_file_component = False
+            has_forward_component = False
+            has_json_component = False
+            file_name = ""
+
         # 特殊处理：空 @ Bot 消息（仅群聊）
         if wake and not msg and gid:
             msg = f"{event.get_sender_name()}@了你"
             event.message_str = msg
             reason = "空@唤醒"
+        elif wake and not msg and has_video_component:
+            msg = f"{event.get_sender_name()}发送了一个视频"
+            event.message_str = msg
+            reason = "视频消息唤醒"
+        elif wake and not msg and has_file_component:
+            suffix = f"：{file_name}" if file_name else ""
+            msg = f"{event.get_sender_name()}发送了一个文件{suffix}"
+            event.message_str = msg
+            reason = "文件消息唤醒"
+        elif wake and not msg and has_forward_component:
+            msg = f"{event.get_sender_name()}发送了一条转发消息"
+            event.message_str = msg
+            reason = "转发消息唤醒"
+        elif wake and not msg and has_json_component:
+            msg = f"{event.get_sender_name()}发送了一条分享卡片"
+            event.message_str = msg
+            reason = "JSON卡片唤醒"
 
         if not msg:
             if not wake:
@@ -340,10 +396,26 @@ class LLMEnhancement(Star):
             )
             for item in preselected_snapshots
         ]
+        def _is_merge_component(seg: Any) -> bool:
+            if isinstance(seg, (Comp.Forward, Comp.Reply, Comp.Video, Comp.File, Comp.Json)):
+                return True
+            if isinstance(seg, dict):
+                seg_type = str(seg.get("type") or "").lower()
+                return seg_type in {"forward", "reply", "video", "file", "json"}
+            return False
+
+        def _is_message_component(seg: Any) -> bool:
+            if isinstance(seg, (Comp.Image, Comp.Video, Comp.File, Comp.Forward, Comp.Json)):
+                return True
+            if isinstance(seg, dict):
+                seg_type = str(seg.get("type") or "").lower()
+                return seg_type in {"image", "video", "file", "forward", "json"}
+            return False
+
         additional_components: List[Any] = []
         for item in preselected_snapshots:
             for seg in item.get("components", []) or []:
-                if isinstance(seg, (Comp.Forward, Comp.Reply, Comp.Video, Comp.File)):
+                if _is_merge_component(seg):
                     additional_components.append(seg)
 
         @session_waiter(timeout=merge_delay, record_history_chains=False)
@@ -434,7 +506,7 @@ class LLMEnhancement(Star):
                     return
             
             # 检查是否是消息（排除 notice 等）
-            if not ev.message_str and not any(isinstance(seg, (Comp.Image, Comp.Video, Comp.File, Comp.Forward)) for seg in ev.message_obj.message):
+            if not ev.message_str and not any(_is_message_component(seg) for seg in ev.message_obj.message):
                 return
             
             # 获取新消息 ID
@@ -461,7 +533,7 @@ class LLMEnhancement(Star):
 
             message_buffer.append((new_msg_id, ev.get_sender_name(), ev.message_str))
             for seg in ev.message_obj.message:
-                if isinstance(seg, (Comp.Forward, Comp.Reply, Comp.Video, Comp.File)):
+                if _is_merge_component(seg):
                     additional_components.append(seg)
             controller.keep(timeout=merge_delay, reset_timeout=True)
         
@@ -834,35 +906,72 @@ class LLMEnhancement(Star):
             # 注册清理路径容器
             req._cleanup_paths = []
             
-            # ==================== 3. 引用消息/转发消息内容提取 ====================
-            ref_result = await process_reference_and_forward_content(
+            # ==================== 3. 引用/JSON/文件上下文注入（不含转发聊天记录解析） ====================
+            ref_result = await process_reference_context(
                 event=event,
                 req=req,
                 all_components=all_components,
                 get_cfg=self._get_cfg,
-                get_stt_provider=lambda ev: self._get_stt_provider(event=ev),
-                cleanup_paths=self._cleanup_paths,
                 download_media=download_video_to_temp,
             )
+            injection_summary = {
+                "json": bool(getattr(ref_result, "injected_json", False)),
+                "file": bool(getattr(ref_result, "injected_file", False)),
+                "forward": False,
+                "video": False,
+            }
             if ref_result.blocked:
+                logger.debug(
+                    "[LLMEnhancement] 注入摘要: "
+                    f"uid={uid}, group={gid or 'private'}, "
+                    f"json={injection_summary['json']}, file={injection_summary['file']}, "
+                    f"forward={injection_summary['forward']}, video={injection_summary['video']}, "
+                    "blocked_by_reference=true"
+                )
                 event.stop_event()
                 return
             reply_seg = ref_result.reply_seg
-            if ref_result.handled_forward:
-                return
-            
-            # ==================== 4. 媒体场景检测与处理 ====================
-            await process_media_content(
-                context=self.context,
+
+            # ==================== 4. 转发聊天记录解析 ====================
+            handled_forward = await process_forward_record_content(
                 event=event,
                 req=req,
-                all_components=all_components,
-                reply_seg=reply_seg,
+                forward_id=ref_result.forward_id,
                 get_cfg=self._get_cfg,
+                get_stt_provider=lambda ev: self._get_stt_provider(event=ev),
+                get_vision_provider=lambda ev: self._get_vision_provider(event=ev),
+                cleanup_paths=self._cleanup_paths,
+            )
+            injection_summary["forward"] = bool(handled_forward)
+            if handled_forward:
+                logger.debug(
+                    "[LLMEnhancement] 注入摘要: "
+                    f"uid={uid}, group={gid or 'private'}, "
+                    f"json={injection_summary['json']}, file={injection_summary['file']}, "
+                    f"forward={injection_summary['forward']}, video={injection_summary['video']}"
+                )
+                return
+             
+            # ==================== 5. 媒体场景检测与处理 ====================
+            injection_summary["video"] = bool(
+                await process_media_content(
+                    context=self.context,
+                    event=event,
+                    req=req,
+                    all_components=all_components,
+                    reply_seg=reply_seg,
+                    get_cfg=self._get_cfg,
+                )
+            )
+            logger.debug(
+                "[LLMEnhancement] 注入摘要: "
+                f"uid={uid}, group={gid or 'private'}, "
+                f"json={injection_summary['json']}, file={injection_summary['file']}, "
+                f"forward={injection_summary['forward']}, video={injection_summary['video']}"
             )
         
         finally:
-            # 5. 统一清理文件
+            # 6. 统一清理文件
             if hasattr(req, "_cleanup_paths"):
                 await self._cleanup_paths(req._cleanup_paths)
 
@@ -912,6 +1021,29 @@ class LLMEnhancement(Star):
             pass
 
         return None
+
+    def _get_llm_provider(self, event: Optional[AstrMessageEvent] = None, umo: Optional[str] = None):
+        """获取当前会话 LLM Provider。"""
+        try:
+            using_umo = umo or (getattr(event, "unified_msg_origin", None) if event is not None else None)
+            if using_umo:
+                return self.context.get_using_provider(umo=using_umo)
+            return self.context.get_using_provider()
+        except Exception:
+            return None
+
+    def _get_vision_provider(self, event: Optional[AstrMessageEvent] = None, umo: Optional[str] = None):
+        """获取视觉解析 Provider；未指定时回退到当前会话 LLM Provider。"""
+        image_pid = self._get_cfg("image_provider_id")
+        p = self._find_provider(image_pid)
+        if p:
+            logger.debug(f"[LLMEnhancement] 成功匹配到指定 Vision Provider: {image_pid}")
+            return p
+
+        if image_pid:
+            logger.warning(f"[LLMEnhancement] 未找到指定 Vision Provider: {image_pid}，回退到会话 Provider")
+
+        return self._get_llm_provider(event=event, umo=umo)
 
     @filter.on_llm_response(priority=20)
     async def on_llm_response(self, event: AstrMessageEvent, resp: LLMResponse):

@@ -28,6 +28,10 @@ try:
 except ImportError:
     IS_AIOCQHTTP = False
 
+# 统一缓存策略：与 forward_parser 中的转发缓存保持一致
+VIDEO_SUMMARY_CACHE_TTL_SEC = 3600
+VIDEO_SUMMARY_CACHE_MAX_SIZE = 100
+
 # ==================== 媒体处理场景枚举 ====================
 
 class MediaScenario(Enum):
@@ -185,12 +189,32 @@ async def napcat_resolve_file_url(event: AstrMessageEvent, file_id: str) -> Opti
     except Exception:
         gid = None
 
-    actions = [
-        {"action": "get_file", "params": {"file_id": file_id}},
-        {"action": "get_file", "params": {"file": file_id}},
-    ]
-    if gid:
-        actions.append({"action": "get_group_file_url", "params": {"group_id": gid, "file_id": file_id}})
+    def _build_candidates(raw_id: str) -> list[str]:
+        rid = str(raw_id or "").strip()
+        if not rid:
+            return []
+        cands = [rid]
+        base = os.path.basename(rid)
+        if base and base not in cands:
+            cands.append(base)
+        stem, ext = os.path.splitext(base)
+        if stem and ext and stem not in cands:
+            cands.append(stem)
+        return cands
+
+    actions = []
+    for cand in _build_candidates(file_id):
+        actions.extend(
+            [
+                {"action": "get_file", "params": {"file_id": cand}},
+                {"action": "get_file", "params": {"file": cand}},
+                {"action": "get_image", "params": {"file": cand}},
+                {"action": "get_image", "params": {"file_id": cand}},
+                {"action": "get_private_file_url", "params": {"file_id": cand}},
+            ]
+        )
+        if gid:
+            actions.append({"action": "get_group_file_url", "params": {"group_id": gid, "file_id": cand}})
 
     for item in actions:
         try:
@@ -335,20 +359,45 @@ async def extract_forward_video_keyframes(
         return [], [], []
     
     for src in video_sources[:max_count]:
-        video_path = src
+        src_str = str(src or "").strip()
+        if not src_str:
+            continue
+        video_path = src_str
         is_temp_video = False
-        
-        # 1. 解析 Napcat file_id
-        if not os.path.exists(src) and not src.startswith(("http://", "https://")):
-            logger.debug(f"video_parser: 尝试解析本地/NapCat文件 ID: {src}")
-            resolved = await napcat_resolve_file_url(event, src)
-            if resolved:
-                logger.debug(f"video_parser: 文件 ID 解析成功 -> {resolved}")
-                video_path = resolved
+
+        # 兼容 file:// 本地路径
+        if video_path.startswith("file://"):
+            fp = video_path[7:]
+            if fp.startswith("/") and len(fp) > 3 and fp[2] == ":":
+                fp = fp[1:]
+            video_path = fp
+
+        # 1. 解析 NapCat file_id（仅对非 URL 且非绝对路径值尝试）
+        if not os.path.exists(video_path) and not video_path.startswith(("http://", "https://")):
+            if os.path.isabs(video_path):
+                # 一些平台会回传不可访问的容器内绝对路径，尝试用文件名回退解析
+                fallback_id = os.path.basename(video_path)
+                if not fallback_id:
+                    logger.debug(f"video_parser: 本地绝对路径不可访问，跳过该视频: {video_path}")
+                    continue
+                logger.debug(f"video_parser: 绝对路径不可访问，尝试按文件名回退解析: {fallback_id}")
+                resolved = await napcat_resolve_file_url(event, fallback_id)
+                if resolved:
+                    logger.debug(f"video_parser: 回退解析成功 -> {resolved}")
+                    video_path = resolved
+                else:
+                    logger.debug(f"video_parser: 回退解析失败，跳过该视频: {video_path}")
+                    continue
             else:
-                logger.warning(f"video_parser: 文件 ID 解析失败: {src}")
-                continue
-            
+                logger.debug(f"video_parser: 尝试解析 NapCat 文件 ID: {video_path}")
+                resolved = await napcat_resolve_file_url(event, video_path)
+                if resolved:
+                    logger.debug(f"video_parser: 文件 ID 解析成功 -> {resolved}")
+                    video_path = resolved
+                else:
+                    logger.debug(f"video_parser: 文件 ID 解析失败，跳过该视频: {video_path}")
+                    continue
+
         # 2. 下载远程视频
         if video_path.startswith(("http://", "https://")):
             logger.debug(f"video_parser: 正在下载并解析合并转发中的视频: {video_path}")
@@ -563,11 +612,11 @@ class VideoFrameProcessor:
         return None
 
     @classmethod
-    async def set_cached_summary(cls, video_key: str, summary: str, ttl: int = 3600):
+    async def set_cached_summary(cls, video_key: str, summary: str, ttl: int = VIDEO_SUMMARY_CACHE_TTL_SEC):
         """设置视频总结缓存，默认有效期 1 小时"""
         async with cls._cache_lock:
-            # 简单的容量清理：如果缓存超过 100 条，清空全部
-            if len(cls._summary_cache) > 100:
+            # 简单的容量清理：如果缓存超过上限，清空全部
+            if len(cls._summary_cache) >= VIDEO_SUMMARY_CACHE_MAX_SIZE:
                 cls._summary_cache.clear()
             
             cls._summary_cache[video_key] = {
@@ -989,3 +1038,167 @@ class VideoFrameProcessor:
         elif isinstance(response, dict):
             return response.get("completion_text", "").strip()
         return ""
+
+
+def _extract_videos_from_raw_event(event: AstrMessageEvent) -> List[str]:
+    """从 raw_message 结构兜底提取视频源。"""
+    try:
+        raw = getattr(getattr(event, "message_obj", None), "raw_message", None)
+        if not raw and hasattr(event, "event"):
+            raw = event.event
+        if not isinstance(raw, dict):
+            return []
+        chain = raw.get("message")
+        if not isinstance(chain, list) or not chain:
+            return []
+        return extract_videos_from_chain(chain)
+    except Exception:
+        return []
+
+
+async def _probe_duration_helper(get_cfg, media_path: str) -> float:
+    try:
+        duration = await asyncio.to_thread(
+            probe_duration_sec,
+            get_cfg("ffmpeg_path", ""),
+            media_path,
+        ) or 0
+        return duration
+    except Exception as e:
+        logger.warning(f"[探测时长] 异常: {e}")
+        return 0
+
+
+async def detect_media_scenario(
+    req: ProviderRequest,
+    get_cfg,
+    video_sources: Optional[List[str]] = None,
+) -> MediaContext:
+    """检测当前媒体场景并返回上下文。"""
+    ctx = MediaContext()
+    image_urls: Any = getattr(req, "image_urls", None)
+
+    if video_sources and len(video_sources) > 0:
+        ctx.media_path = video_sources[0]
+    elif image_urls and isinstance(image_urls, list) and len(image_urls) > 0:
+        ctx.media_path = image_urls[0]
+    else:
+        ctx.scenario = MediaScenario.NONE
+        return ctx
+
+    first_path = ctx.media_path
+    if not first_path or not isinstance(first_path, str):
+        ctx.scenario = MediaScenario.NONE
+        return ctx
+
+    if first_path.startswith(("http://", "https://")):
+        try:
+            max_size = get_cfg("video_max_size_mb", 50)
+            local_path = await download_video_to_temp(first_path, max_size)
+            if local_path:
+                ctx.media_path = local_path
+                ctx.cleanup_paths.append(local_path)
+                first_path = local_path
+            else:
+                ctx.scenario = MediaScenario.NONE
+                return ctx
+        except Exception:
+            ctx.scenario = MediaScenario.NONE
+            return ctx
+
+    ctx.media_path = first_path
+    if is_gif_file(first_path):
+        ctx.duration = await _probe_duration_helper(get_cfg, first_path)
+        if ctx.duration <= 0:
+            ctx.scenario = MediaScenario.NONE
+            return ctx
+        ctx.scenario = MediaScenario.GIF_ANIMATED
+        return ctx
+
+    suffix = Path(first_path).suffix.lower()
+    is_from_video_source = bool(video_sources and len(video_sources) > 0 and ctx.media_path == video_sources[0])
+    is_video_format = suffix in [".mp4", ".mov", ".avi", ".mkv", ".webm", ".flv", ".wmv", ".m4v"] or is_from_video_source
+    if not is_video_format:
+        try:
+            with open(first_path, "rb") as f:
+                header = f.read(32)
+                if b"ftyp" in header or b"matroska" in header or b"fLaC" in header:
+                    is_video_format = True
+        except Exception:
+            pass
+
+    if is_video_format:
+        ctx.duration = await _probe_duration_helper(get_cfg, first_path)
+        if ctx.duration <= 0:
+            ctx.scenario = MediaScenario.NONE
+            return ctx
+        ctx.scenario = MediaScenario.VIDEO
+        return ctx
+
+    ctx.scenario = MediaScenario.NONE
+    return ctx
+
+
+async def process_media_content(
+    context: Any,
+    event: AstrMessageEvent,
+    req: ProviderRequest,
+    all_components: List[Any],
+    reply_seg: Optional[Comp.Reply],
+    get_cfg,
+) -> bool:
+    """处理视频/GIF 媒体注入。"""
+    if not get_cfg("video_parse_enable", True):
+        return False
+
+    video_sources = extract_videos_from_chain(all_components)
+    raw_video_sources = _extract_videos_from_raw_event(event)
+    if raw_video_sources:
+        video_sources = raw_video_sources + [src for src in video_sources if src not in raw_video_sources]
+
+    if not video_sources and reply_seg and IS_AIOCQHTTP and isinstance(event, AiocqhttpMessageEvent):
+        try:
+            client = event.bot
+            original_msg = await client.api.call_action("get_msg", message_id=reply_seg.id)
+            if original_msg and "message" in original_msg:
+                video_sources = extract_videos_from_chain(original_msg["message"])
+        except Exception:
+            pass
+
+    media_ctx = await detect_media_scenario(req, get_cfg, video_sources)
+    req._cleanup_paths.extend(media_ctx.cleanup_paths)
+    processor = VideoFrameProcessor(context, event, get_cfg)
+
+    if media_ctx.scenario in [MediaScenario.VIDEO, MediaScenario.GIF_ANIMATED]:
+        if media_ctx.media_path in req.image_urls:
+            req.image_urls.remove(media_ctx.media_path)
+        if len(req.image_urls) > 0:
+            req.image_urls = [
+                url for url in req.image_urls
+                if not any(url.lower().endswith(s) for s in [".mp4", ".mov", ".avi", ".wmv", ".flv", ".m4v"])
+            ]
+
+    if media_ctx.scenario == MediaScenario.VIDEO:
+        quoted_sender = getattr(req, "_quoted_sender", None) if reply_seg else None
+        current_msg_id = getattr(getattr(event, "message_obj", None), "message_id", None)
+        msg_id = str(reply_seg.id) if reply_seg else str(current_msg_id)
+        return await processor.process_long_video(
+            req,
+            media_ctx.media_path,
+            media_ctx.duration,
+            sender_name=quoted_sender,
+            msg_id=msg_id,
+        )
+    elif media_ctx.scenario == MediaScenario.GIF_ANIMATED:
+        quoted_sender = getattr(req, "_quoted_sender", None) if reply_seg else None
+        current_msg_id = getattr(getattr(event, "message_obj", None), "message_id", None)
+        msg_id = str(reply_seg.id) if reply_seg else str(current_msg_id)
+        return await processor.process_gif(
+            req,
+            media_ctx.media_path,
+            sender_name=quoted_sender,
+            msg_id=msg_id,
+        )
+
+    return False
+

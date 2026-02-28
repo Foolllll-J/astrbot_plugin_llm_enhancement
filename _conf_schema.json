@@ -66,8 +66,8 @@
                 "hint": "留空时不启用模型判定。配置后会让该模型仅输出 T/F，用于判断是否继续响应。"
             },
             "mention_wake": {
-                "description": "提及唤醒的昵称",
-                "hint": "提及到bot的昵称时，唤醒bot。不填时关闭提及检测。",
+                "description": "提及唤醒规则",
+                "hint": "支持普通文本包含、re:pattern 与 /pattern/flags（flags: i,m,s,x,a,u,L）。不填时关闭提及检测。",
                 "type": "list",
                 "default": []
             },
@@ -108,8 +108,8 @@
                 "default": 0.0005
             },
             "wake_forbidden_words": {
-                "description": "唤醒词屏蔽词",
-                "hint": "唤醒词屏蔽词，如果用户输入的唤醒词包含这些词，则不会唤醒bot(bot管理员不受影响)。",
+                "description": "屏蔽唤醒规则",
+                "hint": "支持普通文本包含、re:pattern 与 /pattern/flags（flags: i,m,s,x,a,u,L）。命中规则时不会唤醒bot（bot管理员不受影响）。",
                 "type": "list",
                 "default": [
                     "政治",

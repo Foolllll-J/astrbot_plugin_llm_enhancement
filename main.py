@@ -23,7 +23,13 @@ import shutil
 from .modules.info_utils import process_group_members_info, set_group_ban_logic
 from .modules.provider_utils import find_provider
 from .modules.blacklist import BlacklistManager
-from .modules.wake_extend import evaluate_wake_extend
+from .modules.wake_logic import (
+    evaluate_wake_extend,
+    detect_wake_media_components,
+    normalize_wake_trigger_message,
+    evaluate_mention_wake,
+    contains_forbidden_wake_word,
+)
 from .modules.merge_flow import (
     get_event_msg_id,
     prune_member_msg_cache,
@@ -112,6 +118,7 @@ class LLMEnhancement(Star):
         if key in self.cfg:
             return self.cfg[key]
         return self.config.get(key, default)
+
 
     def _build_recall_key(self, umo: str, msg_id: str) -> str:
         return f"{umo}::{msg_id}"
@@ -215,66 +222,32 @@ class LLMEnhancement(Star):
         wake = event.is_at_or_wake_command
         reason = "at_or_cmd"
 
-        # 兼容“纯视频/纯文件/纯转发/纯JSON卡片无文本”场景：避免空文本被下游跳过。
-        has_video_component = False
-        has_file_component = False
-        has_forward_component = False
-        has_json_component = False
-        file_name = ""
-        try:
-            if hasattr(event, "message_obj") and hasattr(event.message_obj, "message"):
-                for seg in (event.message_obj.message or []):
-                    if isinstance(seg, Comp.Video):
-                        has_video_component = True
-                    elif isinstance(seg, Comp.File):
-                        has_file_component = True
-                        file_name = str(getattr(seg, "name", "") or getattr(seg, "file", "") or "").strip()
-                    elif isinstance(seg, Comp.Forward):
-                        has_forward_component = True
-                    elif isinstance(seg, Comp.Json):
-                        has_json_component = True
-                    elif isinstance(seg, dict):
-                        seg_type = seg.get("type")
-                        data = seg.get("data") or {}
-                        if seg_type == "video":
-                            has_video_component = True
-                        elif seg_type == "file":
-                            has_file_component = True
-                            if not file_name:
-                                file_name = str(data.get("name") or data.get("file") or "").strip()
-                        elif seg_type == "forward":
-                            has_forward_component = True
-                        elif seg_type == "json":
-                            has_json_component = True
-        except Exception:
-            has_video_component = False
-            has_file_component = False
-            has_forward_component = False
-            has_json_component = False
-            file_name = ""
+        message_chain = []
+        if hasattr(event, "message_obj") and hasattr(event.message_obj, "message"):
+            message_chain = event.message_obj.message or []
+        (
+            has_video_component,
+            has_file_component,
+            has_forward_component,
+            has_json_component,
+            file_name,
+        ) = detect_wake_media_components(message_chain)
 
-        # 特殊处理：空 @ Bot 消息（仅群聊）
-        if wake and not msg and gid:
-            msg = f"{event.get_sender_name()}@了你"
+        normalized_msg, normalized_reason = normalize_wake_trigger_message(
+            wake=wake,
+            msg=msg,
+            gid=gid,
+            sender_name=event.get_sender_name(),
+            has_video_component=has_video_component,
+            has_file_component=has_file_component,
+            has_forward_component=has_forward_component,
+            has_json_component=has_json_component,
+            file_name=file_name,
+        )
+        if normalized_reason:
+            msg = normalized_msg
             event.message_str = msg
-            reason = "空@唤醒"
-        elif wake and not msg and has_video_component:
-            msg = f"{event.get_sender_name()}发送了一个视频"
-            event.message_str = msg
-            reason = "视频消息唤醒"
-        elif wake and not msg and has_file_component:
-            suffix = f"：{file_name}" if file_name else ""
-            msg = f"{event.get_sender_name()}发送了一个文件{suffix}"
-            event.message_str = msg
-            reason = "文件消息唤醒"
-        elif wake and not msg and has_forward_component:
-            msg = f"{event.get_sender_name()}发送了一条转发消息"
-            event.message_str = msg
-            reason = "转发消息唤醒"
-        elif wake and not msg and has_json_component:
-            msg = f"{event.get_sender_name()}发送了一条分享卡片"
-            event.message_str = msg
-            reason = "JSON卡片唤醒"
+            reason = normalized_reason
 
         if not msg:
             if not wake:
@@ -282,14 +255,10 @@ class LLMEnhancement(Star):
 
         # 提及唤醒 (仅群聊)
         if gid and not wake:
-            mention_wake = self._get_cfg("mention_wake")
-            if mention_wake:
-                names = [n for n in mention_wake if n]
-                for n in names:
-                    if n and n in msg:
-                        wake = True
-                        reason = f"提及唤醒({n})"
-                        break
+            matched_mention = evaluate_mention_wake(msg, self._get_cfg("mention_wake"))
+            if matched_mention:
+                wake = True
+                reason = f"提及唤醒({matched_mention})"
 
         # 唤醒延长 (仅群聊)
         if gid and not wake:
@@ -336,12 +305,14 @@ class LLMEnhancement(Star):
                     reason = "概率唤醒"
 
         # 违禁词检查
-        forbidden_words = self._get_cfg("wake_forbidden_words")
-        if forbidden_words:  
-            for word in forbidden_words:
-                if not event.is_admin() and word in event.message_str:
-                    event.stop_event()
-                    return
+        if not event.is_admin():
+            forbidden_word = contains_forbidden_wake_word(
+                event.message_str or "",
+                self._get_cfg("wake_forbidden_words"),
+            )
+            if forbidden_word:
+                event.stop_event()
+                return
 
         if wake:
             event.is_at_or_wake_command = True
@@ -1093,4 +1064,3 @@ class LLMEnhancement(Star):
     async def terminate(self):
         await self.blacklist.terminate()
         logger.info("[LLMEnhancement] 插件已终止")
-

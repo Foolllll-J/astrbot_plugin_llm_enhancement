@@ -14,7 +14,7 @@ import aiosqlite
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent
 import astrbot.api.message_components as Comp
-from .info_utils import validate_write_permission
+from .info_utils import validate_write_permission, is_tool_admin_required
 
 try:
     from PIL import Image, ImageDraw, ImageFont
@@ -321,8 +321,9 @@ class BlacklistManager:
     def blacklist_block_commands(self) -> bool:
         return self._cfg_bool("blacklist_block_commands", True)
 
-    def tool_write_require_admin(self) -> bool:
-        return self._cfg_bool("tool_write_require_admin", False)
+    def tool_write_require_admin(self, tool_id: str) -> bool:
+        selected = self._get_cfg("tool_admin_required_tools", [])
+        return is_tool_admin_required(tool_id, selected)
 
     async def initialize(self) -> None:
         self._data_dir.mkdir(parents=True, exist_ok=True)
@@ -728,7 +729,7 @@ class BlacklistManager:
         permission_error = validate_write_permission(
             event,
             target_user_id=target_user_id,
-            strict=self.tool_write_require_admin(),
+            strict=self.tool_write_require_admin("block_user"),
             policy="admin_or_self",
             action="拉黑",
         )
@@ -821,7 +822,7 @@ class BlacklistManager:
         permission_error = validate_write_permission(
             event,
             target_user_id=target_user_id,
-            strict=self.tool_write_require_admin(),
+            strict=self.tool_write_require_admin("unblock_user"),
             policy="admin_only",
             action="解除拉黑",
         )

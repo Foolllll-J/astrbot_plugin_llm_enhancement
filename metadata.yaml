@@ -1,6 +1,6 @@
 name: astrbot_plugin_llm_enhancement
 display_name: LLM 综合增强
-desc: 增强 LLM 聊天表现，集成智能唤醒、消息合并、撤回检测、多媒体解析、黑名单管理与群管工具能力。
+desc: 增强 LLM 群聊表现，集成智能唤醒、消息合并、多媒体解析、QQ信息注入、黑名单管理与受控群管工具能力。
 version: v1.0.0
 author: Foolllll
 repo: https://github.com/Foolllll-J/astrbot_plugin_llm_enhancement

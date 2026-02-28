@@ -301,6 +301,113 @@
             }
         }
     },
+    "qq_platform": {
+        "type": "object",
+        "description": "QQ平台配置",
+        "hint": "集中配置 QQ 群聊场景的上下文注入与工具权限控制。",
+        "items": {
+            "extra_info_injection_fields": {
+                "type": "list",
+                "default": [
+                    "昵称",
+                    "群名片",
+                    "群身份",
+                    "群头衔"
+                ],
+                "options": [
+                    "用户ID",
+                    "昵称",
+                    "群名片",
+                    "性别",
+                    "年龄",
+                    "入群时间",
+                    "最后发言时间",
+                    "群等级",
+                    "QQ等级",
+                    "群身份",
+                    "群头衔",
+                    "地区",
+                    "禁言时间戳",
+                    "Q龄"
+                ],
+                "description": "发送者信息注入字段",
+                "hint": "按需勾选要注入给 LLM 的字段。留空表示关闭该注入。仅群聊(aiocqhttp)生效。"
+            },
+            "extra_info_injection_include_bot_self": {
+                "type": "bool",
+                "default": false,
+                "description": "注入 Bot 自身信息",
+                "hint": "开启后，将按相同配置注入 Bot 在当前群中的成员信息。"
+            },
+            "extra_info_injection_no_cache": {
+                "type": "bool",
+                "default": false,
+                "description": "注入查询忽略缓存",
+                "hint": "开启后，每次注入将忽略缓存直接查询最新成员信息。"
+            },
+            "tool_admin_required_tools": {
+                "type": "list",
+                "default": [],
+                "options": [
+                    "禁言成员",
+                    "群组踢人",
+                    "全员禁言",
+                    "设置群管理员",
+                    "设置群名片",
+                    "设置群头衔",
+                    "设置精华消息",
+                    "移出精华消息",
+                    "设置群名称",
+                    "发送群公告",
+                    "删除群公告",
+                    "批量踢出群成员",
+                    "解散群",
+                    "拉黑用户",
+                    "解除拉黑"
+                ],
+                "description": "启用管理员校验的工具",
+                "hint": "勾选后，对应工具调用时将强制要求管理员权限。未勾选则交给 LLM 自行判断。"
+            },
+            "enabled_dangerous_tools": {
+                "type": "list",
+                "default": [],
+                "options": [
+                    "禁言成员",
+                    "群组踢人",
+                    "全员禁言",
+                    "删除群公告",
+                    "设置群管理员",
+                    "移出精华消息",
+                    "批量踢出群成员",
+                    "解散群"
+                ],
+                "description": "允许启用的危险工具",
+                "hint": "默认不勾选表示危险工具全部禁用。建议将不启用的函数工具关闭。"
+            },
+            "confirm_required_tools": {
+                "type": "list",
+                "default": [],
+                "options": [
+                    "群组踢人",
+                    "全员禁言",
+                    "删除群公告",
+                    "设置群管理员",
+                    "移出精华消息",
+                    "批量踢出群成员",
+                    "解散群"
+                ],
+                "description": "启用二次确认的工具",
+                "hint": "勾选后，工具首次调用只会返回确认请求；需要二次确认后再次调用才会真正执行。"
+            },
+            "confirm_timeout_sec": {
+                "type": "int",
+                "default": 90,
+                "minimum": 10,
+                "description": "二次确认有效期（秒）",
+                "hint": "超过有效期后 confirm_token 失效，需要重新发起操作。"
+            }
+        }
+    },
     "blacklist": {
         "type": "object",
         "description": "黑名单",
@@ -317,13 +424,7 @@
                 "type": "bool",
                 "default": true,
                 "description": "黑名单是否拦截指令",
-                "hint": "开启时在消息阶段拦截黑名单用户（包括指令）；关闭时放行指令处理，仅在 LLM 请求阶段拦截。"
-            },
-            "tool_write_require_admin": {
-                "type": "bool",
-                "default": false,
-                "description": "写工具运行前权限校验",
-                "hint": "默认关闭，交给 LLM 自行判断。开启后：禁言/拉黑仅允许管理员或目标为调用者本人；解除拉黑仅允许管理员。"
+                "hint": "开启时在消息阶段拦截黑名单用户（包括指令）；关闭时放行指令处理，仅拦截 LLM 请求。"
             }
         }
     }

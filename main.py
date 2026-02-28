@@ -20,7 +20,28 @@ from .modules.video_parser import (
 )
 import os
 import shutil
-from .modules.info_utils import process_group_members_info, set_group_ban_logic
+from .modules.info_utils import (
+    process_group_info,
+    process_group_notices,
+    process_group_essence,
+    process_group_members_info,
+    process_group_member_info,
+    inject_sender_group_member_info,
+    inject_bot_group_member_info,
+    kick_group_member_logic,
+    set_group_whole_ban_logic,
+    set_group_admin_logic,
+    set_group_card_logic,
+    set_group_special_title_logic,
+    set_essence_msg_logic,
+    delete_essence_msg_logic,
+    set_group_name_logic,
+    send_group_notice_logic,
+    delete_group_notice_logic,
+    dismiss_group_logic,
+    set_group_kick_members_logic,
+    set_group_ban_logic,
+)
 from .modules.provider_utils import find_provider
 from .modules.blacklist import BlacklistManager
 from .modules.wake_logic import (
@@ -105,6 +126,7 @@ class LLMEnhancement(Star):
             "video_injection",
             "forward_parsing",
             "file_parsing",
+            "qq_platform",
             "blacklist",
         ]:
             section_cfg = self.config.get(section, {})
@@ -118,6 +140,23 @@ class LLMEnhancement(Star):
         if key in self.cfg:
             return self.cfg[key]
         return self.config.get(key, default)
+
+    def _tool_admin_required_tools(self) -> Any:
+        return self._get_cfg("tool_admin_required_tools", [])
+
+    def _enabled_dangerous_tools(self) -> Any:
+        return self._get_cfg("enabled_dangerous_tools", [])
+
+    def _confirm_required_tools(self) -> Any:
+        return self._get_cfg("confirm_required_tools", [])
+
+    def _confirm_timeout_sec(self) -> int:
+        raw = self._get_cfg("confirm_timeout_sec", 90)
+        try:
+            value = int(raw)
+        except Exception:
+            value = 90
+        return max(10, min(600, value))
 
 
     def _build_recall_key(self, umo: str, msg_id: str) -> str:
@@ -689,12 +728,76 @@ class LLMEnhancement(Star):
         - role: 权限角色 (owner/admin/member)
 
         Args:
-            group_id (str, optional): 目标 QQ 群号。如果未提供，将默认获取当前所在群聊的成员。
+            group_id (str, optional): 目标 QQ 群号。在私聊使用时必填，在群聊使用时可选（默认当前群）。
         """
         return await process_group_members_info(event, group_id)
 
+    @filter.llm_tool(name="get_group_member_info")
+    async def get_group_member_info(
+        self,
+        event: AstrMessageEvent,
+        user_id: str,
+        group_id: str = None,
+        no_cache: bool = False,
+    ) -> str:
+        """
+        获取指定 QQ 群成员详情。
+        适合用于确认某个成员的身份信息、群身份、群头衔、群名片等。
+
+        Args:
+            group_id (str, optional): 目标群号。在私聊使用时必填，在群聊使用时可选（默认当前群）。
+            user_id (str): 目标用户 QQ 号（必填）。
+            no_cache (bool, optional): 是否跳过缓存直接查询 OneBot。
+        """
+        return await process_group_member_info(
+            event=event,
+            user_id=user_id,
+            group_id=group_id,
+            no_cache=no_cache,
+        )
+
+    @filter.llm_tool(name="get_group_info")
+    async def get_group_info(self, event: AstrMessageEvent, group_id: str = None, no_cache: bool = False) -> str:
+        """
+        获取指定 QQ 群的群信息（群名、人数等）。
+
+        Args:
+            group_id (str, optional): 目标群号。在私聊使用时必填，在群聊使用时可选（默认当前群）。
+            no_cache (bool, optional): 是否跳过缓存直接查询 OneBot。
+        """
+        return await process_group_info(event=event, group_id=group_id, no_cache=no_cache)
+
+    @filter.llm_tool(name="get_group_notices")
+    async def get_group_notices(self, event: AstrMessageEvent, group_id: str = None, limit: int = 10) -> str:
+        """
+        获取指定 QQ 群的群公告列表。
+
+        Args:
+            group_id (str, optional): 目标群号。在私聊使用时必填，在群聊使用时可选（默认当前群）。
+            limit (int, optional): 返回条数上限，默认 10，最大 50。
+        """
+        return await process_group_notices(event=event, group_id=group_id, limit=limit)
+
+    @filter.llm_tool(name="get_group_essence")
+    async def get_group_essence(self, event: AstrMessageEvent, group_id: str = None, limit: int = 10) -> str:
+        """
+        获取指定 QQ 群的精华消息列表。
+
+        Args:
+            group_id (str, optional): 目标群号。在私聊使用时必填，在群聊使用时可选（默认当前群）。
+            limit (int, optional): 返回条数上限，默认 10，最大 50。
+        """
+        return await process_group_essence(event=event, group_id=group_id, limit=limit)
+
     @filter.llm_tool(name="set_group_ban")
-    async def set_group_ban(self, event: AstrMessageEvent, user_id: str, duration: int, user_name: str, group_id: str = None) -> str:
+    async def set_group_ban(
+        self,
+        event: AstrMessageEvent,
+        user_id: str,
+        duration: int,
+        user_name: str,
+        group_id: str = None,
+    ) -> str:
         """
         在群聊中禁言或解除禁言某位成员。
         支持在群聊中直接使用，或在私聊中指定 group_id 使用，由你根据请求者身份与上下文判断是否应执行。
@@ -711,7 +814,293 @@ class LLMEnhancement(Star):
             duration,
             user_name,
             group_id,
-            strict_permission_check=bool(self._get_cfg("tool_write_require_admin", False)),
+            admin_required_tools=self._tool_admin_required_tools(),
+            enabled_dangerous_tools=self._enabled_dangerous_tools(),
+        )
+
+    @filter.llm_tool(name="kick_group_member")
+    async def kick_group_member(
+        self,
+        event: AstrMessageEvent,
+        user_id: str,
+        group_id: str = None,
+        reject_add_request: bool = False,
+        confirm_token: str = "",
+    ) -> str:
+        """
+        将指定成员踢出群聊。
+
+        Args:
+            user_id (str): 目标用户 ID。
+            group_id (str, optional): 目标群号。在私聊使用时必填，在群聊使用时可选（默认当前群）。
+            reject_add_request (bool, optional): 是否拒绝该用户再次加群请求。
+            confirm_token (str, optional): 二次确认令牌。首次调用可能返回 token，第二次原参数不变并携带 token 才执行。
+        """
+        return await kick_group_member_logic(
+            event=event,
+            user_id=user_id,
+            group_id=group_id,
+            reject_add_request=reject_add_request,
+            admin_required_tools=self._tool_admin_required_tools(),
+            enabled_dangerous_tools=self._enabled_dangerous_tools(),
+            confirm_required_tools=self._confirm_required_tools(),
+            confirm_timeout_sec=self._confirm_timeout_sec(),
+            confirm_token=confirm_token,
+        )
+
+    @filter.llm_tool(name="set_group_whole_ban")
+    async def set_group_whole_ban(
+        self,
+        event: AstrMessageEvent,
+        enable: bool,
+        group_id: str = None,
+        confirm_token: str = "",
+    ) -> str:
+        """
+        开启或关闭群全员禁言。
+
+        Args:
+            enable (bool): True 表示开启，False 表示关闭。
+            group_id (str, optional): 目标群号。在私聊使用时必填，在群聊使用时可选（默认当前群）。
+            confirm_token (str, optional): 二次确认令牌。首次调用可能返回 token，第二次原参数不变并携带 token 才执行。
+        """
+        return await set_group_whole_ban_logic(
+            event=event,
+            enable=enable,
+            group_id=group_id,
+            admin_required_tools=self._tool_admin_required_tools(),
+            enabled_dangerous_tools=self._enabled_dangerous_tools(),
+            confirm_required_tools=self._confirm_required_tools(),
+            confirm_timeout_sec=self._confirm_timeout_sec(),
+            confirm_token=confirm_token,
+        )
+
+    @filter.llm_tool(name="set_group_admin")
+    async def set_group_admin(
+        self,
+        event: AstrMessageEvent,
+        user_id: str,
+        enable: bool,
+        group_id: str = None,
+        confirm_token: str = "",
+    ) -> str:
+        """
+        设置或取消群管理员。
+
+        Args:
+            user_id (str): 目标用户 ID。
+            group_id (str, optional): 目标群号。在私聊使用时必填，在群聊使用时可选（默认当前群）。
+            enable (bool): True 设为管理员，False 取消管理员。
+            confirm_token (str, optional): 二次确认令牌。首次调用可能返回 token，第二次原参数不变并携带 token 才执行。
+        """
+        return await set_group_admin_logic(
+            event=event,
+            user_id=user_id,
+            enable=enable,
+            group_id=group_id,
+            admin_required_tools=self._tool_admin_required_tools(),
+            enabled_dangerous_tools=self._enabled_dangerous_tools(),
+            confirm_required_tools=self._confirm_required_tools(),
+            confirm_timeout_sec=self._confirm_timeout_sec(),
+            confirm_token=confirm_token,
+        )
+
+    @filter.llm_tool(name="set_group_card")
+    async def set_group_card(self, event: AstrMessageEvent, user_id: str, card: str, group_id: str = None) -> str:
+        """
+        设置群成员名片即群昵称。
+
+        Args:
+            user_id (str): 目标用户 ID。
+            card (str): 新的群名片文本。
+            group_id (str, optional): 目标群号。在私聊使用时必填，在群聊使用时可选（默认当前群）。
+        """
+        return await set_group_card_logic(
+            event=event,
+            user_id=user_id,
+            card=card,
+            group_id=group_id,
+            admin_required_tools=self._tool_admin_required_tools(),
+            enabled_dangerous_tools=self._enabled_dangerous_tools(),
+        )
+
+    @filter.llm_tool(name="set_group_special_title")
+    async def set_group_special_title(
+        self,
+        event: AstrMessageEvent,
+        user_id: str,
+        special_title: str,
+        group_id: str = None,
+    ) -> str:
+        """
+        设置群成员专属头衔。
+
+        Args:
+            user_id (str): 目标用户 ID。
+            special_title (str): 头衔内容。
+            group_id (str, optional): 目标群号。在私聊使用时必填，在群聊使用时可选（默认当前群）。
+        """
+        return await set_group_special_title_logic(
+            event=event,
+            user_id=user_id,
+            special_title=special_title,
+            group_id=group_id,
+            admin_required_tools=self._tool_admin_required_tools(),
+            enabled_dangerous_tools=self._enabled_dangerous_tools(),
+        )
+
+    @filter.llm_tool(name="set_essence_msg")
+    async def set_essence_msg(self, event: AstrMessageEvent) -> str:
+        """
+        将指定消息设置为群精华消息。
+        仅通过当前消息的引用(reply)自动提取目标消息 ID。仅支持群聊中使用。
+        """
+        return await set_essence_msg_logic(
+            event=event,
+            admin_required_tools=self._tool_admin_required_tools(),
+            enabled_dangerous_tools=self._enabled_dangerous_tools(),
+        )
+
+    @filter.llm_tool(name="delete_essence_msg")
+    async def delete_essence_msg(
+        self,
+        event: AstrMessageEvent,
+        message_id: str = "",
+        confirm_token: str = "",
+    ) -> str:
+        """
+        将指定消息移出群精华列表。
+
+        Args:
+            message_id (str, optional): 目标消息 ID。可先调用 get_group_essence 获取后再传入。
+            confirm_token (str, optional): 二次确认令牌。首次调用可能返回 token，第二次原参数不变并携带 token 才执行。
+        """
+        return await delete_essence_msg_logic(
+            event=event,
+            message_id=message_id,
+            admin_required_tools=self._tool_admin_required_tools(),
+            enabled_dangerous_tools=self._enabled_dangerous_tools(),
+            confirm_required_tools=self._confirm_required_tools(),
+            confirm_timeout_sec=self._confirm_timeout_sec(),
+            confirm_token=confirm_token,
+        )
+
+    @filter.llm_tool(name="set_group_name")
+    async def set_group_name(self, event: AstrMessageEvent, group_name: str, group_id: str = None) -> str:
+        """
+        修改群名称。
+
+        Args:
+            group_name (str): 新群名称。
+            group_id (str, optional): 目标群号。在私聊使用时必填，在群聊使用时可选（默认当前群）。
+        """
+        return await set_group_name_logic(
+            event=event,
+            group_name=group_name,
+            group_id=group_id,
+            admin_required_tools=self._tool_admin_required_tools(),
+            enabled_dangerous_tools=self._enabled_dangerous_tools(),
+        )
+
+    @filter.llm_tool(name="send_group_notice")
+    async def send_group_notice(
+        self,
+        event: AstrMessageEvent,
+        content: str,
+        group_id: str = None,
+        pinned: bool = False,
+    ) -> str:
+        """
+        发送群公告。
+
+        Args:
+            content (str): 公告正文内容。
+            group_id (str, optional): 目标群号。在私聊使用时必填，在群聊使用时可选（默认当前群）。
+            pinned (bool, optional): 是否置顶公告。
+        """
+        return await send_group_notice_logic(
+            event=event,
+            content=content,
+            group_id=group_id,
+            pinned=pinned,
+            admin_required_tools=self._tool_admin_required_tools(),
+            enabled_dangerous_tools=self._enabled_dangerous_tools(),
+        )
+
+    @filter.llm_tool(name="delete_group_notice")
+    async def delete_group_notice(
+        self,
+        event: AstrMessageEvent,
+        notice_id: str,
+        group_id: str = None,
+        confirm_token: str = "",
+    ) -> str:
+        """
+        删除指定群公告。
+
+        Args:
+            notice_id (str): 公告 ID。可先调用 get_group_notices 获取公告列表并从中选择目标 notice_id。
+            group_id (str, optional): 目标群号。在私聊使用时必填，在群聊使用时可选（默认当前群）。
+            confirm_token (str, optional): 二次确认令牌。首次调用可能返回 token，第二次原参数不变并携带 token 才执行。
+        """
+        return await delete_group_notice_logic(
+            event=event,
+            notice_id=notice_id,
+            group_id=group_id,
+            admin_required_tools=self._tool_admin_required_tools(),
+            enabled_dangerous_tools=self._enabled_dangerous_tools(),
+            confirm_required_tools=self._confirm_required_tools(),
+            confirm_timeout_sec=self._confirm_timeout_sec(),
+            confirm_token=confirm_token,
+        )
+
+    @filter.llm_tool(name="dismiss_group")
+    async def dismiss_group(self, event: AstrMessageEvent, group_id: str = None, confirm_token: str = "") -> str:
+        """
+        解散群聊（高风险操作）。
+
+        Args:
+            group_id (str, optional): 目标群号。在私聊使用时必填，在群聊使用时可选（默认当前群）。
+            confirm_token (str, optional): 二次确认令牌。首次调用可能返回 token，第二次原参数不变并携带 token 才执行。
+        """
+        return await dismiss_group_logic(
+            event=event,
+            group_id=group_id,
+            admin_required_tools=self._tool_admin_required_tools(),
+            enabled_dangerous_tools=self._enabled_dangerous_tools(),
+            confirm_required_tools=self._confirm_required_tools(),
+            confirm_timeout_sec=self._confirm_timeout_sec(),
+            confirm_token=confirm_token,
+        )
+
+    @filter.llm_tool(name="set_group_kick_members")
+    async def set_group_kick_members(
+        self,
+        event: AstrMessageEvent,
+        user_ids: str,
+        group_id: str = None,
+        reject_add_request: bool = False,
+        confirm_token: str = "",
+    ) -> str:
+        """
+        批量踢出群成员。
+
+        Args:
+            user_ids (str): 用户 ID 列表，支持逗号分隔字符串。
+            group_id (str, optional): 目标群号。在私聊使用时必填，在群聊使用时可选（默认当前群）。
+            reject_add_request (bool, optional): 是否拒绝这些用户再次加群请求。
+            confirm_token (str, optional): 二次确认令牌。首次调用可能返回 token，第二次原参数不变并携带 token 才执行。
+        """
+        return await set_group_kick_members_logic(
+            event=event,
+            user_ids=user_ids,
+            group_id=group_id,
+            reject_add_request=reject_add_request,
+            admin_required_tools=self._tool_admin_required_tools(),
+            enabled_dangerous_tools=self._enabled_dangerous_tools(),
+            confirm_required_tools=self._confirm_required_tools(),
+            confirm_timeout_sec=self._confirm_timeout_sec(),
+            confirm_token=confirm_token,
         )
 
     @filter.llm_tool(name="block_user")
@@ -874,6 +1263,36 @@ class LLMEnhancement(Star):
                     member.silence_until = now + silence_sec
                     logger.info(f"用户({uid})触发辱骂沉默{silence_sec:.1f}秒(下次生效)")
 
+            selected_fields = self._get_cfg("extra_info_injection_fields", [])
+            inject_no_cache = bool(self._get_cfg("extra_info_injection_no_cache", False))
+            sender_member_injected = bool(
+                await inject_sender_group_member_info(
+                    event,
+                    req,
+                    raw_fields=selected_fields,
+                    no_cache=inject_no_cache,
+                )
+            )
+            bot_member_injected = False
+            if bool(self._get_cfg("extra_info_injection_include_bot_self", False)):
+                bot_member_injected = bool(
+                    await inject_bot_group_member_info(
+                        event,
+                        req,
+                        raw_fields=selected_fields,
+                        no_cache=inject_no_cache,
+                    )
+                )
+
+            injection_summary = {
+                "member_info": sender_member_injected,
+                "bot_member_info": bot_member_injected,
+                "json": False,
+                "file": False,
+                "forward": False,
+                "video": False,
+            }
+
             # 注册清理路径容器
             req._cleanup_paths = []
             
@@ -885,16 +1304,14 @@ class LLMEnhancement(Star):
                 get_cfg=self._get_cfg,
                 download_media=download_video_to_temp,
             )
-            injection_summary = {
-                "json": bool(getattr(ref_result, "injected_json", False)),
-                "file": bool(getattr(ref_result, "injected_file", False)),
-                "forward": False,
-                "video": False,
-            }
+            injection_summary["json"] = bool(getattr(ref_result, "injected_json", False))
+            injection_summary["file"] = bool(getattr(ref_result, "injected_file", False))
             if ref_result.blocked:
                 logger.debug(
                     "[LLMEnhancement] 注入摘要: "
                     f"uid={uid}, group={gid or 'private'}, "
+                    f"member_info={injection_summary['member_info']}, "
+                    f"bot_member_info={injection_summary['bot_member_info']}, "
                     f"json={injection_summary['json']}, file={injection_summary['file']}, "
                     f"forward={injection_summary['forward']}, video={injection_summary['video']}, "
                     "blocked_by_reference=true"
@@ -918,6 +1335,8 @@ class LLMEnhancement(Star):
                 logger.debug(
                     "[LLMEnhancement] 注入摘要: "
                     f"uid={uid}, group={gid or 'private'}, "
+                    f"member_info={injection_summary['member_info']}, "
+                    f"bot_member_info={injection_summary['bot_member_info']}, "
                     f"json={injection_summary['json']}, file={injection_summary['file']}, "
                     f"forward={injection_summary['forward']}, video={injection_summary['video']}"
                 )
@@ -937,6 +1356,8 @@ class LLMEnhancement(Star):
             logger.debug(
                 "[LLMEnhancement] 注入摘要: "
                 f"uid={uid}, group={gid or 'private'}, "
+                f"member_info={injection_summary['member_info']}, "
+                f"bot_member_info={injection_summary['bot_member_info']}, "
                 f"json={injection_summary['json']}, file={injection_summary['file']}, "
                 f"forward={injection_summary['forward']}, video={injection_summary['video']}"
             )

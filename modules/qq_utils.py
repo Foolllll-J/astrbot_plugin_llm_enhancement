@@ -1,8 +1,9 @@
-import json
+﻿import json
 import hashlib
 import secrets
 import time
 import re
+from datetime import datetime, timedelta
 from typing import List, Dict, Any, Optional, Literal
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent
@@ -46,6 +47,7 @@ TOOL_OPTION_LABEL_TO_ID: Dict[str, str] = {
     "删除群公告": "delete_group_notice",
     "解散群": "dismiss_group",
     "批量踢出群成员": "set_group_kick_members",
+    "撤回消息": "delete_msg",
     "拉黑用户": "block_user",
     "解除拉黑": "unblock_user",
 }
@@ -54,6 +56,7 @@ DANGEROUS_TOOL_IDS = {
     "kick_group_member",
     "set_group_whole_ban",
     "set_group_admin",
+    "delete_msg",
     "delete_essence_msg",
     "delete_group_notice",
     "dismiss_group",
@@ -63,6 +66,7 @@ CONFIRMATION_REQUIRED_TOOL_IDS = {
     "kick_group_member",
     "set_group_whole_ban",
     "set_group_admin",
+    "delete_msg",
     "delete_essence_msg",
     "delete_group_notice",
     "dismiss_group",
@@ -768,6 +772,168 @@ def _to_bool(value: Any, default: bool = False) -> bool:
     return default
 
 
+def _parse_search_keywords(raw_keywords: str) -> List[str]:
+    """将逗号/竖线/换行分隔的关键词文本解析为关键词列表。"""
+    if not raw_keywords:
+        return []
+    parts = re.split(r"[,，|\n\r]+", str(raw_keywords))
+    return [p.strip() for p in parts if p and p.strip()]
+
+
+def _parse_time_range_to_ts(raw_time_range: str) -> tuple[Optional[int], Optional[int], Optional[str]]:
+    """
+    将 time_range 解析为 (start_ts, end_ts, error)。
+    支持:
+    - 今天
+    - 昨天 / 昨日
+    - 最近N小时
+    - YYYY-MM-DD HH:MM 到 YYYY-MM-DD HH:MM
+    - 10位时间戳范围: start,end
+    """
+    text = str(raw_time_range or "").strip()
+    if not text:
+        return None, None, None
+
+    now_dt = datetime.now()
+    today_start = datetime(now_dt.year, now_dt.month, now_dt.day, 0, 0, 0)
+
+    if text in {"今天"}:
+        return int(today_start.timestamp()), int(now_dt.timestamp()), None
+    if text in {"昨天", "昨日"}:
+        start_dt = today_start - timedelta(days=1)
+        end_dt = today_start - timedelta(seconds=1)
+        return int(start_dt.timestamp()), int(end_dt.timestamp()), None
+
+    recent_match = re.fullmatch(r"最近\s*(\d{1,3})\s*小时", text)
+    if recent_match:
+        hours = int(recent_match.group(1))
+        if hours <= 0:
+            return None, None, "time_range 格式错误：最近N小时中的 N 必须大于 0。"
+        end_dt = now_dt
+        start_dt = now_dt - timedelta(hours=hours)
+        return int(start_dt.timestamp()), int(end_dt.timestamp()), None
+
+    fixed_match = re.fullmatch(
+        r"(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2})\s*(?:到|至|~|～)\s*(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2})",
+        text,
+    )
+    if fixed_match:
+        try:
+            start_dt = datetime.strptime(fixed_match.group(1), "%Y-%m-%d %H:%M")
+            end_dt = datetime.strptime(fixed_match.group(2), "%Y-%m-%d %H:%M")
+            if start_dt > end_dt:
+                start_dt, end_dt = end_dt, start_dt
+            return int(start_dt.timestamp()), int(end_dt.timestamp()), None
+        except Exception:
+            return None, None, "time_range 时间解析失败，请使用 YYYY-MM-DD HH:MM 到 YYYY-MM-DD HH:MM。"
+
+    ts_match = re.fullmatch(r"(\d{10})\s*(?:,|，|到|至|~|～)\s*(\d{10})", text)
+    if ts_match:
+        start_ts = int(ts_match.group(1))
+        end_ts = int(ts_match.group(2))
+        if start_ts > end_ts:
+            start_ts, end_ts = end_ts, start_ts
+        return start_ts, end_ts, None
+
+    return None, None, (
+        "time_range 格式不支持。请使用：今天 / 昨天 / 最近N小时 / "
+        "YYYY-MM-DD HH:MM 到 YYYY-MM-DD HH:MM"
+    )
+
+
+def _extract_msg_time(msg: Dict[str, Any]) -> Optional[int]:
+    for key in ("time", "message_time", "timestamp", "send_time"):
+        val = msg.get(key)
+        try:
+            if val is not None and str(val).strip() != "":
+                return int(float(val))
+        except Exception:
+            continue
+    return None
+
+
+def _extract_msg_seq(msg: Dict[str, Any]) -> str:
+    for key in ("message_seq", "seq", "real_seq"):
+        val = msg.get(key)
+        if val is not None and str(val).strip():
+            return str(val).strip()
+    return ""
+
+
+def _extract_msg_id(msg: Dict[str, Any]) -> str:
+    for key in ("message_id", "msg_id", "id", "real_id"):
+        val = msg.get(key)
+        if val is not None and str(val).strip():
+            return str(val).strip()
+    return ""
+
+
+def _segment_to_text(seg: Any) -> str:
+    if isinstance(seg, str):
+        return seg
+    if not isinstance(seg, dict):
+        return ""
+    seg_type = str(seg.get("type") or "").strip().lower()
+    data = seg.get("data") or {}
+    if not isinstance(data, dict):
+        data = {}
+    if seg_type == "text":
+        return str(data.get("text") or "")
+    if seg_type == "at":
+        qq = str(data.get("qq") or "").strip()
+        if qq.lower() == "all":
+            return "@全体成员"
+        return f"@{qq}" if qq else "@"
+    if seg_type == "reply":
+        rid = str(data.get("id") or "").strip()
+        return f"[回复:{rid}]" if rid else "[回复]"
+    if seg_type == "image":
+        return "[图片]"
+    if seg_type == "video":
+        return "[视频]"
+    if seg_type == "record":
+        return "[语音]"
+    if seg_type == "file":
+        name = str(data.get("name") or "").strip()
+        return f"[文件:{name}]" if name else "[文件]"
+    if seg_type == "face":
+        return "[表情]"
+    if seg_type == "json":
+        return "[JSON]"
+    if seg_type == "xml":
+        return "[XML]"
+    if seg_type == "forward":
+        return "[合并转发]"
+    return ""
+
+
+def _message_to_text(message: Any, raw_message: str = "") -> str:
+    if isinstance(message, str):
+        text = message.strip()
+        if text:
+            return text
+    if isinstance(message, list):
+        content = "".join(_segment_to_text(seg) for seg in message).strip()
+        if content:
+            return content
+    if isinstance(raw_message, str):
+        return raw_message.strip()
+    return ""
+
+
+def _sender_to_name(sender: Any) -> str:
+    if not isinstance(sender, dict):
+        return ""
+    card = str(sender.get("card") or "").strip()
+    nickname = str(sender.get("nickname") or "").strip()
+    if card:
+        return card
+    if nickname:
+        return nickname
+    uid = str(sender.get("user_id") or "").strip()
+    return uid
+
+
 async def get_group_info_internal(
     event: AstrMessageEvent,
     group_id: Optional[str] = None,
@@ -1018,6 +1184,198 @@ async def process_group_essence(
         elapsed_time = time.time() - start_time
         logger.info(f"获取群精华时发生错误: {e}，耗时 {elapsed_time:.2f}s")
         return json.dumps({"error": f"获取群精华时发生内部错误: {str(e)}"}, ensure_ascii=False)
+
+
+async def get_group_msg_history_internal(
+    event: AstrMessageEvent,
+    group_id: Optional[str] = None,
+    count: int = 50,
+    message_seq: str = "",
+) -> Optional[List[Dict[str, Any]]]:
+    """调用 API 获取一页群历史消息。"""
+    try:
+        target_group_id = group_id or event.get_group_id()
+        if not target_group_id:
+            return None
+        if not IS_AIOCQHTTP or not isinstance(event, AiocqhttpMessageEvent):
+            return None
+
+        page_size = max(1, min(int(count or 50), 50))
+        params: Dict[str, Any] = {
+            "group_id": str(target_group_id),
+            "count": page_size,
+        }
+        seq_text = str(message_seq or "").strip()
+        if seq_text:
+            params["message_seq"] = seq_text
+
+        raw_result = await _call_action(event, "get_group_msg_history", **params)
+        data = _unwrap_action_data(raw_result)
+
+        # 常见结构: data={"messages":[...]} 或 data=[...]
+        if isinstance(data, dict):
+            for key in ("messages", "message", "list", "records"):
+                messages = data.get(key)
+                if isinstance(messages, list):
+                    return messages
+            return None
+        if isinstance(data, list):
+            return data
+
+        if isinstance(raw_result, dict):
+            for key in ("messages", "message", "list", "records"):
+                messages = raw_result.get(key)
+                if isinstance(messages, list):
+                    return messages
+            inner_data = raw_result.get("data")
+            if isinstance(inner_data, dict):
+                for key in ("messages", "message", "list", "records"):
+                    messages = inner_data.get(key)
+                    if isinstance(messages, list):
+                        return messages
+
+        return None
+    except Exception as e:
+        logger.info(f"获取群历史消息 API 调用失败: {e}")
+        return None
+
+
+async def process_group_msg_history(
+    event: AstrMessageEvent,
+    group_id: Optional[str] = None,
+    count: int = 50,
+    search_keywords: str = "",
+    time_range: str = "",
+) -> str:
+    """
+    获取并处理群历史消息，支持:
+    - 关键词包含匹配(多个关键词)
+    - 时间范围过滤
+    """
+    start_time = time.time()
+    try:
+        target_group_id = group_id or event.get_group_id()
+        if not target_group_id:
+            return _json_error("未识别到群聊环境，请提供目标群号。")
+        if not IS_AIOCQHTTP or not isinstance(event, AiocqhttpMessageEvent):
+            return _json_error(
+                f"此功能仅支持QQ群聊(aiocqhttp平台)，当前平台为 {event.get_platform_name()}"
+            )
+
+        safe_count = max(1, min(int(count or 50), 300))
+        keywords = _parse_search_keywords(search_keywords)
+        start_ts, end_ts, range_err = _parse_time_range_to_ts(time_range)
+        if range_err:
+            return _json_error(range_err)
+
+        # 50 为接口单页上限，按页向前翻，直到满足返回条件或达到扫描上限。
+        page_size = 50
+        scan_limit = max(200, min(5000, safe_count * 20))
+        cursor_seq = ""
+        scanned = 0
+        matched: List[Dict[str, Any]] = []
+        seen_msg_keys: set[str] = set()
+        seen_seq: set[str] = set()
+
+        while scanned < scan_limit and len(matched) < safe_count:
+            page = await get_group_msg_history_internal(
+                event=event,
+                group_id=str(target_group_id),
+                count=page_size,
+                message_seq=cursor_seq,
+            )
+            if not page:
+                break
+
+            oldest_ts_in_page: Optional[int] = None
+            stop_by_time_window = False
+            for item in page:
+                if not isinstance(item, dict):
+                    continue
+                scanned += 1
+
+                msg_id = _extract_msg_id(item)
+                msg_seq = _extract_msg_seq(item)
+                uniq_key = msg_id or f"seq:{msg_seq}" or f"scan:{scanned}"
+                if uniq_key in seen_msg_keys:
+                    continue
+                seen_msg_keys.add(uniq_key)
+
+                msg_ts = _extract_msg_time(item)
+                if msg_ts is not None:
+                    if oldest_ts_in_page is None or msg_ts < oldest_ts_in_page:
+                        oldest_ts_in_page = msg_ts
+                    if end_ts is not None and msg_ts > end_ts:
+                        continue
+                    if start_ts is not None and msg_ts < start_ts:
+                        # 通常消息按时间倒序分页，命中后可提前结束当前页后续扫描。
+                        stop_by_time_window = True
+                        continue
+
+                sender = item.get("sender")
+                text = _message_to_text(item.get("message"), str(item.get("raw_message") or ""))
+                if not text:
+                    text = "[空消息]"
+
+                if keywords and not any(k in text for k in keywords):
+                    continue
+
+                matched.append(
+                    {
+                        "message_id": msg_id,
+                        "message_seq": msg_seq,
+                        "time": msg_ts,
+                        "time_text": (
+                            datetime.fromtimestamp(msg_ts).strftime("%Y-%m-%d %H:%M:%S")
+                            if isinstance(msg_ts, int) and msg_ts > 0
+                            else ""
+                        ),
+                        "user_id": str((sender or {}).get("user_id") or item.get("user_id") or ""),
+                        "sender_name": _sender_to_name(sender),
+                        "content": text,
+                    }
+                )
+                if len(matched) >= safe_count:
+                    break
+
+            if len(matched) >= safe_count:
+                break
+            if stop_by_time_window and start_ts is not None:
+                break
+
+            last_item = page[-1] if page else {}
+            next_seq = _extract_msg_seq(last_item) or _extract_msg_id(last_item)
+            next_seq = str(next_seq or "").strip()
+            if not next_seq:
+                break
+            if next_seq == cursor_seq or next_seq in seen_seq:
+                break
+            seen_seq.add(next_seq)
+            cursor_seq = next_seq
+
+            if oldest_ts_in_page is not None and start_ts is not None and oldest_ts_in_page < start_ts:
+                break
+
+        result = {
+            "group_id": str(target_group_id),
+            "requested_count": safe_count,
+            "returned_count": len(matched),
+            "scanned_count": scanned,
+            "scan_limit": scan_limit,
+            "search_keywords": keywords,
+            "time_range": str(time_range or "").strip(),
+            "start_ts": start_ts,
+            "end_ts": end_ts,
+            "messages": matched,
+        }
+        elapsed_time = time.time() - start_time
+        logger.info(f"成功获取群 {target_group_id} 历史消息，返回 {len(matched)} 条，耗时 {elapsed_time:.2f}s")
+        return json.dumps(result, ensure_ascii=False, indent=2)
+    except Exception as e:
+        elapsed_time = time.time() - start_time
+        logger.info(f"获取群历史消息时发生错误: {e}，耗时 {elapsed_time:.2f}s")
+        return _json_error("获取群历史消息时发生内部错误。", error=str(e))
+
 
 async def set_group_ban_logic(
     event: AstrMessageEvent,
@@ -1367,6 +1725,7 @@ async def set_group_special_title_logic(
 
 async def set_essence_msg_logic(
     event: AstrMessageEvent,
+    message_id: str = "",
     admin_required_tools: Any = None,
     enabled_dangerous_tools: Any = None,
 ) -> str:
@@ -1376,9 +1735,11 @@ async def set_essence_msg_logic(
         target_group_id = str(event.get_group_id() or "").strip()
         if not target_group_id:
             return _json_error("此工具仅支持在群聊中使用。")
-        target_message_id = str(_extract_reply_message_id(event) or "").strip()
+        target_message_id = str(message_id or "").strip()
         if not target_message_id:
-            return _json_error("无法确定目标消息，请先引用一条消息再调用本工具。")
+            target_message_id = str(_extract_reply_message_id(event) or "").strip()
+        if not target_message_id:
+            return _json_error("无法确定目标消息，请传入 message_id 或先引用一条消息再调用本工具。")
 
         disabled_resp = _check_write_tool_access(
             event,
@@ -1452,6 +1813,60 @@ async def delete_essence_msg_logic(
         return _json_success("已移出群精华消息。", message_id=target_message_id, group_id=target_group_id)
     except Exception as e:
         return _json_error("移出精华消息失败。", error=str(e))
+
+
+async def delete_msg_logic(
+    event: AstrMessageEvent,
+    message_id: str = "",
+    admin_required_tools: Any = None,
+    enabled_dangerous_tools: Any = None,
+    confirm_required_tools: Any = None,
+    confirm_timeout_sec: int = CONFIRM_TIMEOUT_DEFAULT_SEC,
+    confirm_token: str = "",
+) -> str:
+    """撤回指定消息，默认优先使用传入 message_id，缺省时尝试从引用(reply)解析。"""
+    try:
+        if not IS_AIOCQHTTP or not isinstance(event, AiocqhttpMessageEvent):
+            return _json_error(f"此功能仅支持 QQ 平台 (aiocqhttp)，当前平台为 {event.get_platform_name()}")
+
+        target_message_id = str(message_id or "").strip()
+        if not target_message_id:
+            target_message_id = str(_extract_reply_message_id(event) or "").strip()
+        if not target_message_id:
+            return _json_error("无法确定目标消息，请传入 message_id 或先引用一条消息再调用本工具。")
+
+        disabled_resp = _check_write_tool_access(
+            event,
+            tool_id="delete_msg",
+            action="撤回消息",
+            admin_required_tools=admin_required_tools,
+            enabled_dangerous_tools=enabled_dangerous_tools,
+        )
+        if disabled_resp:
+            return disabled_resp
+
+        group_scope = str(event.get_group_id() or f"private_{event.get_sender_id() or 'unknown'}")
+        confirm_resp = _check_write_tool_confirmation(
+            event,
+            tool_id="delete_msg",
+            action="撤回消息",
+            group_scope=group_scope,
+            fingerprint_payload={
+                "group_scope": group_scope,
+                "message_id": target_message_id,
+            },
+            confirm_required_tools=confirm_required_tools,
+            confirm_timeout_sec=confirm_timeout_sec,
+            confirm_token=confirm_token,
+        )
+        if confirm_resp:
+            return confirm_resp
+
+        msg_param: Any = int(target_message_id) if target_message_id.isdigit() else target_message_id
+        await _call_action(event, "delete_msg", message_id=msg_param)
+        return _json_success("已撤回目标消息。", message_id=target_message_id, group_scope=group_scope)
+    except Exception as e:
+        return _json_error("撤回消息失败。", error=str(e))
 
 
 async def set_group_name_logic(
@@ -1712,3 +2127,4 @@ async def set_group_kick_members_logic(
         )
     except Exception as e:
         return _json_error("批量踢人失败。", error=str(e))
+

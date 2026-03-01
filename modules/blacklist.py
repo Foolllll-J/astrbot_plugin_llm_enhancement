@@ -14,7 +14,7 @@ import aiosqlite
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent
 import astrbot.api.message_components as Comp
-from .info_utils import validate_write_permission, is_tool_admin_required
+from .qq_utils import validate_write_permission, is_tool_admin_required
 
 try:
     from PIL import Image, ImageDraw, ImageFont

@@ -20,10 +20,11 @@ from .modules.video_parser import (
 )
 import os
 import shutil
-from .modules.info_utils import (
+from .modules.qq_utils import (
     process_group_info,
     process_group_notices,
     process_group_essence,
+    process_group_msg_history,
     process_group_members_info,
     process_group_member_info,
     inject_sender_group_member_info,
@@ -35,6 +36,7 @@ from .modules.info_utils import (
     set_group_special_title_logic,
     set_essence_msg_logic,
     delete_essence_msg_logic,
+    delete_msg_logic,
     set_group_name_logic,
     send_group_notice_logic,
     delete_group_notice_logic,
@@ -789,6 +791,36 @@ class LLMEnhancement(Star):
         """
         return await process_group_essence(event=event, group_id=group_id, limit=limit)
 
+    @filter.llm_tool(name="get_group_msg_history")
+    async def get_group_msg_history(
+        self,
+        event: AstrMessageEvent,
+        group_id: str = None,
+        count: int = 50,
+        search_keywords: str = "",
+        time_range: str = "",
+    ) -> str:
+        """
+        获取群历史消息，支持关键词搜索与时间范围过滤。
+        使用场景:
+            1) 用户明确要求“查历史/回看聊天记录/谁说过某句话/查某时间段消息”。
+            2) 需要补充上下文时，且用户确实在问“过去说过什么”。
+
+        Args:
+            group_id (str, optional): 目标群号。在私聊使用时必填，在群聊使用时可选（默认当前群）。
+            count (int, optional): 返回条数上限，默认 50，最大 300。
+            search_keywords (str, optional): 搜索关键词。支持多个，使用逗号/竖线/换行分隔。
+            time_range (str, optional): 时间范围。支持:
+                YYYY-MM-DD HH:MM 到 YYYY-MM-DD HH:MM / 今天 / 昨天 / 最近N小时
+        """
+        return await process_group_msg_history(
+            event=event,
+            group_id=group_id,
+            count=count,
+            search_keywords=search_keywords,
+            time_range=time_range,
+        )
+
     @filter.llm_tool(name="set_group_ban")
     async def set_group_ban(
         self,
@@ -950,13 +982,16 @@ class LLMEnhancement(Star):
         )
 
     @filter.llm_tool(name="set_essence_msg")
-    async def set_essence_msg(self, event: AstrMessageEvent) -> str:
+    async def set_essence_msg(self, event: AstrMessageEvent, message_id: str = "") -> str:
         """
-        将指定消息设置为群精华消息。
-        仅通过当前消息的引用(reply)自动提取目标消息 ID。仅支持群聊中使用。
+        将指定消息设置为群精华消息。仅支持群聊中使用。
+
+        Args:
+            message_id (str, optional): 目标消息 ID。若未通过工具获取目标 message_id，则无需填写，将尝试从当前消息引用(reply)自动提取。
         """
         return await set_essence_msg_logic(
             event=event,
+            message_id=message_id,
             admin_required_tools=self._tool_admin_required_tools(),
             enabled_dangerous_tools=self._enabled_dangerous_tools(),
         )
@@ -972,10 +1007,29 @@ class LLMEnhancement(Star):
         将指定消息移出群精华列表。
 
         Args:
-            message_id (str, optional): 目标消息 ID。可先调用 get_group_essence 获取后再传入。
+            message_id (str, optional): 目标消息 ID。可先调用 get_group_essence 获取后再传入；若未传入，则无需填写。
             confirm_token (str, optional): 二次确认令牌。首次调用可能返回 token，第二次原参数不变并携带 token 才执行。
         """
         return await delete_essence_msg_logic(
+            event=event,
+            message_id=message_id,
+            admin_required_tools=self._tool_admin_required_tools(),
+            enabled_dangerous_tools=self._enabled_dangerous_tools(),
+            confirm_required_tools=self._confirm_required_tools(),
+            confirm_timeout_sec=self._confirm_timeout_sec(),
+            confirm_token=confirm_token,
+        )
+
+    @filter.llm_tool(name="delete_msg")
+    async def delete_msg(self, event: AstrMessageEvent, message_id: str = "", confirm_token: str = "") -> str:
+        """
+        撤回一条消息。
+
+        Args:
+            message_id (str, optional): 目标消息 ID。若未通过工具获取目标 message_id，则无需填写，将尝试从当前消息引用(reply)自动提取。
+            confirm_token (str, optional): 二次确认令牌。首次调用可能返回 token，第二次原参数不变并携带 token 才执行。
+        """
+        return await delete_msg_logic(
             event=event,
             message_id=message_id,
             admin_required_tools=self._tool_admin_required_tools(),

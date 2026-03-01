@@ -1,4 +1,4 @@
-import asyncio
+﻿import asyncio
 import json
 import time
 import random
@@ -378,7 +378,7 @@ class LLMEnhancement(Star):
         except (TypeError, ValueError):
             merge_max_count = 5
         cache_keep_sec = max(merge_delay * 6, 60.0)
-        merged_skip_ttl = max(merge_delay * 2, 20.0)
+        merged_skip_ttl = max(merge_delay * 6, 120.0)
         merged_window_tolerance = 0.3
 
         async with member.lock:

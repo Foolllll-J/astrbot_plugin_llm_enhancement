@@ -138,8 +138,7 @@ def prepare_initial_merge_snapshots(
         msg_id = str(item.get("msg_id") or "")
         if msg_id:
             add_pending_msg_id(msg_id)
-            if current_msg_id and msg_id != current_msg_id:
-                member.merged_msg_ids[msg_id] = time.time() + merged_skip_ttl
+            member.merged_msg_ids[msg_id] = time.time() + merged_skip_ttl
 
     trigger_msg_id = current_msg_id or (str(preselected_snapshots[0].get("msg_id") or "") if preselected_snapshots else None)
     return preselected_snapshots, trigger_msg_id

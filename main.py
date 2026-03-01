@@ -1,4 +1,4 @@
-﻿import asyncio
+import asyncio
 import json
 import time
 import random
@@ -605,8 +605,10 @@ class LLMEnhancement(Star):
             else:
                 merged_msg = " ".join([msg for _, _, msg in message_buffer])
 
+            original_prompt = (req.prompt or "").strip()
             event.message_str = merged_msg
-            req.prompt = merged_msg
+            req.prompt = f"{original_prompt}\n\n{merged_msg}".strip()
+                
             log_prefix = f"群({gid})" if gid else "私聊"
             logger.info(f"{log_prefix}合并：用户({uid})触发，共合并了{len(message_buffer)}条消息 (涉及{len(senders)}人)")
         else:

@@ -306,6 +306,24 @@
         "description": "QQ平台配置",
         "hint": "集中配置 QQ 群聊场景的上下文注入与工具权限控制。",
         "items": {
+            "perception_injection_fields": {
+                "type": "list",
+                "default": [
+                    "发送时间"
+                ],
+                "options": [
+                    "发送时间",
+                    "星期",
+                    "节假日",
+                    "时间段",
+                    "平台",
+                    "会话类型",
+                    "群名",
+                    "群号"
+                ],
+                "description": "环境感知注入字段",
+                "hint": "按需勾选注入给 LLM 的环境信息。留空表示关闭该注入；节假日字段在非节假日时会自动跳过。"
+            },
             "extra_info_injection_fields": {
                 "type": "list",
                 "default": [

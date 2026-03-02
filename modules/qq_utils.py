@@ -3,7 +3,8 @@ import hashlib
 import secrets
 import time
 import re
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
+import zoneinfo
 from typing import List, Dict, Any, Optional, Literal
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent
@@ -15,6 +16,12 @@ try:
     IS_AIOCQHTTP = True 
 except ImportError: 
     IS_AIOCQHTTP = False 
+
+try:
+    import chinese_calendar as calendar_cn
+    CHINESE_CALENDAR_AVAILABLE = True
+except Exception:
+    CHINESE_CALENDAR_AVAILABLE = False
 
 PermissionPolicy = Literal["admin_only", "admin_or_self"]
 INJECTABLE_MEMBER_FIELDS: Dict[str, str] = {
@@ -32,6 +39,27 @@ INJECTABLE_MEMBER_FIELDS: Dict[str, str] = {
     "area": "地区",
     "shut_up_timestamp": "禁言时间戳",
     "qage": "Q龄",
+}
+INJECTABLE_PERCEPTION_FIELDS: Dict[str, str] = {
+    "send_time": "发送时间",
+    "weekday": "星期",
+    "holiday": "节假日",
+    "time_period": "时间段",
+    "platform": "平台",
+    "chat_type": "会话类型",
+    "group_name": "群名",
+    "group_id": "群号",
+}
+WEEKDAY_NAMES = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
+PLATFORM_DISPLAY_NAMES = {
+    "aiocqhttp": "QQ",
+    "telegram": "Telegram",
+    "discord": "Discord",
+    "weixin_official_account": "微信公众号",
+    "wecom": "企业微信",
+    "wecom_ai_bot": "企业微信AI机器人",
+    "satori": "Satori",
+    "misskey": "Misskey",
 }
 TOOL_OPTION_LABEL_TO_ID: Dict[str, str] = {
     "禁言成员": "set_group_ban",
@@ -350,6 +378,177 @@ def _check_write_tool_access(
     return None
 
 
+def _normalize_perception_injection_fields(raw_fields: Any) -> List[str]:
+    """将配置中的环境感知字段列表规范化为内部字段 key 列表。"""
+    if not isinstance(raw_fields, list):
+        return []
+
+    normalized: List[str] = []
+    alias_map = {
+        "发送时间": "send_time",
+        "星期": "weekday",
+        "节假日": "holiday",
+        "时间段": "time_period",
+        "平台": "platform",
+        "会话类型": "chat_type",
+        "群名": "group_name",
+        "群号": "group_id",
+    }
+
+    for item in raw_fields:
+        text = str(item or "").strip()
+        if not text:
+            continue
+        if "(" in text and text.endswith(")"):
+            text = text.split("(", 1)[0].strip()
+        key = alias_map.get(text, text.lower())
+        if key in INJECTABLE_PERCEPTION_FIELDS and key not in normalized:
+            normalized.append(key)
+    return normalized
+
+
+def _resolve_timezone(timezone_name: str) -> zoneinfo.ZoneInfo:
+    name = str(timezone_name or "").strip() or "Asia/Shanghai"
+    try:
+        return zoneinfo.ZoneInfo(name)
+    except Exception:
+        logger.debug(f"[LLMEnhancement] 无效时区配置: {name}，回退 Asia/Shanghai")
+        return zoneinfo.ZoneInfo("Asia/Shanghai")
+
+
+def _resolve_weekday_label(current_time: datetime) -> str:
+    """返回中文星期标签（周一...周日）。"""
+    return WEEKDAY_NAMES[int(current_time.weekday())]
+
+
+def _resolve_holiday_label(current_time: datetime, holiday_country: str = "CN") -> str:
+    """
+    返回节假日名称；非节假日时返回空字符串。
+    """
+    country = str(holiday_country or "CN").strip().upper()
+    if country != "CN" or not CHINESE_CALENDAR_AVAILABLE:
+        return ""
+    current_date = date(current_time.year, current_time.month, current_time.day)
+    try:
+        is_holiday = bool(calendar_cn.is_holiday(current_date))
+        if not is_holiday:
+            return ""
+        holiday_detail = calendar_cn.get_holiday_detail(current_date)
+        holiday_name = str(holiday_detail[1] if holiday_detail and holiday_detail[1] else "").strip()
+        return holiday_name or "法定节假日"
+    except Exception as e:
+        logger.debug(f"[LLMEnhancement] 节假日识别失败: {e}")
+        return ""
+
+
+def _resolve_time_period_label(current_time: datetime) -> str:
+    hour = int(current_time.hour)
+    if 0 <= hour < 3:
+        return "凌晨"
+    if 3 <= hour < 6:
+        return "黎明"
+    if 6 <= hour < 9:
+        return "早晨"
+    if 9 <= hour < 12:
+        return "上午"
+    if 12 <= hour < 14:
+        return "中午"
+    if 14 <= hour < 17:
+        return "下午"
+    if 17 <= hour < 19:
+        return "傍晚"
+    if 19 <= hour < 22:
+        return "晚上"
+    return "深夜"
+
+
+async def _resolve_group_name_for_perception(event: AstrMessageEvent, no_cache: bool = False) -> str:
+    """解析群名，优先用事件内字段，必要时回源 get_group_info。"""
+    group_id = str(event.get_group_id() or "").strip()
+    if not group_id:
+        return ""
+
+    message_obj = getattr(event, "message_obj", None)
+    raw_message = getattr(message_obj, "raw_message", None) if message_obj is not None else None
+    if isinstance(raw_message, dict):
+        group_name = str(raw_message.get("group_name") or "").strip()
+        if group_name:
+            return group_name
+
+    group_info = await get_group_info_internal(event=event, group_id=group_id, no_cache=no_cache)
+    if isinstance(group_info, dict):
+        return str(group_info.get("group_name") or "").strip()
+    return ""
+
+
+async def inject_perception_context_info(
+    event: AstrMessageEvent,
+    req: Any,
+    raw_fields: Any,
+    timezone_name: str = "Asia/Shanghai",
+    holiday_country: str = "CN",
+    no_cache: bool = False,
+) -> bool:
+    """
+    按配置将环境感知信息注入到 ProviderRequest.prompt。
+    """
+    if not req or not hasattr(req, "prompt"):
+        return False
+
+    selected_fields = _normalize_perception_injection_fields(raw_fields)
+    if not selected_fields:
+        return False
+
+    now_dt = datetime.now(_resolve_timezone(timezone_name))
+    payload: Dict[str, Any] = {}
+
+    if "send_time" in selected_fields:
+        payload["send_time"] = now_dt.strftime("%Y-%m-%d %H:%M:%S")
+    if "weekday" in selected_fields:
+        value = _resolve_weekday_label(now_dt)
+        if value:
+            payload["weekday"] = value
+    if "holiday" in selected_fields:
+        value = _resolve_holiday_label(now_dt, holiday_country=holiday_country)
+        if value:
+            payload["holiday"] = value
+    if "time_period" in selected_fields:
+        payload["time_period"] = _resolve_time_period_label(now_dt)
+    if "platform" in selected_fields:
+        platform_name = str(getattr(event, "get_platform_name", lambda: "")() or "").strip()
+        if platform_name:
+            payload["platform"] = PLATFORM_DISPLAY_NAMES.get(platform_name, platform_name)
+    if "chat_type" in selected_fields:
+        payload["chat_type"] = "群聊" if str(event.get_group_id() or "").strip() else "私聊"
+    if "group_name" in selected_fields and str(event.get_group_id() or "").strip():
+        group_name = await _resolve_group_name_for_perception(event=event, no_cache=no_cache)
+        if group_name:
+            payload["group_name"] = group_name
+    if "group_id" in selected_fields:
+        group_id = str(event.get_group_id() or "").strip()
+        if group_id:
+            payload["group_id"] = group_id
+    if not payload:
+        return False
+
+    display_payload: Dict[str, Any] = {}
+    for field in selected_fields:
+        if field in payload:
+            display_payload[INJECTABLE_PERCEPTION_FIELDS.get(field, field)] = payload[field]
+
+    if not display_payload:
+        return False
+
+    context_prompt = f"\n\n[环境感知]{json.dumps(display_payload, ensure_ascii=False, separators=(',', ':'))}"
+    user_question = str(getattr(req, "prompt", "") or "").strip()
+    req.prompt = (user_question + context_prompt) if user_question else context_prompt.strip()
+    logger.debug(
+        "[LLMEnhancement] 环境感知注入完成："
+        f"payload={json.dumps(display_payload, ensure_ascii=False, separators=(',', ':'))}"
+    )
+    return True
+
+
 def _normalize_member_injection_fields(raw_fields: Any) -> List[str]:
     """将配置中的字段列表规范化为内部字段 key 列表。"""
     if not isinstance(raw_fields, list):
@@ -385,6 +584,21 @@ def _normalize_member_injection_fields(raw_fields: Any) -> List[str]:
         if key in INJECTABLE_MEMBER_FIELDS and key not in normalized:
             normalized.append(key)
     return normalized
+
+
+def _is_meaningful_member_value(field: str, value: Any) -> bool:
+    """过滤空值与低价值默认值，减少注入 token。"""
+    if value is None:
+        return False
+    if isinstance(value, str):
+        return bool(value.strip())
+    if field == "shut_up_timestamp":
+        number = _safe_int(value)
+        return bool(number is not None and number > 0)
+    if field in {"join_time", "last_sent_time", "age"}:
+        number = _safe_int(value)
+        return bool(number is not None and number > 0)
+    return True
 
 
 async def inject_sender_group_member_info(
@@ -469,19 +683,15 @@ async def _inject_group_member_info(
             value = member_info[field]
             if field in {"user_id"}:
                 value = str(value)
+            if not _is_meaningful_member_value(field, value):
+                continue
             payload[field] = value
 
     if not payload:
         return False
 
-    readable_fields = [INJECTABLE_MEMBER_FIELDS.get(f, f) for f in payload.keys()]
-    context_prompt = (
-        f"\n\n以下是{subject_label}群成员信息，请结合这些信息理解用户意图并回答：\n"
-        f"(注入字段: {', '.join(readable_fields)})\n"
-        "--- 注入内容开始 ---\n"
-        f"{json.dumps(payload, ensure_ascii=False, indent=2)}\n"
-        "--- 注入内容结束 ---"
-    )
+    compact_payload = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    context_prompt = f"\n\n[成员信息:{subject_label}]{compact_payload}"
     user_question = str(getattr(req, "prompt", "") or "").strip()
     req.prompt = (user_question + context_prompt) if user_question else context_prompt.strip()
     logger.debug(
@@ -788,6 +998,7 @@ def _parse_time_range_to_ts(raw_time_range: str) -> tuple[Optional[int], Optiona
     - 昨天 / 昨日
     - 最近N小时
     - YYYY-MM-DD HH:MM 到 YYYY-MM-DD HH:MM
+    - 今天 HH:MM 到 HH:MM / 昨天 HH:MM 到 HH:MM
     - 10位时间戳范围: start,end
     """
     text = str(raw_time_range or "").strip()
@@ -827,6 +1038,40 @@ def _parse_time_range_to_ts(raw_time_range: str) -> tuple[Optional[int], Optiona
         except Exception:
             return None, None, "time_range 时间解析失败，请使用 YYYY-MM-DD HH:MM 到 YYYY-MM-DD HH:MM。"
 
+    day_time_match = re.fullmatch(
+        r"(今天|昨天|昨日)\s*(\d{1,2}:\d{2})\s*(?:到|至|~|～)\s*(\d{1,2}:\d{2})",
+        text,
+    )
+    if day_time_match:
+        day_label = day_time_match.group(1)
+        start_hhmm = day_time_match.group(2)
+        end_hhmm = day_time_match.group(3)
+
+        def _parse_hhmm(hhmm: str) -> Optional[tuple[int, int]]:
+            parts = str(hhmm).split(":")
+            if len(parts) != 2:
+                return None
+            try:
+                hh = int(parts[0])
+                mm = int(parts[1])
+            except Exception:
+                return None
+            if hh < 0 or hh > 23 or mm < 0 or mm > 59:
+                return None
+            return hh, mm
+
+        start_parts = _parse_hhmm(start_hhmm)
+        end_parts = _parse_hhmm(end_hhmm)
+        if not start_parts or not end_parts:
+            return None, None, "time_range 时间段解析失败，HH:MM 必须是 00:00-23:59。"
+
+        base_day = today_start if day_label == "今天" else (today_start - timedelta(days=1))
+        start_dt = base_day.replace(hour=start_parts[0], minute=start_parts[1], second=0)
+        end_dt = base_day.replace(hour=end_parts[0], minute=end_parts[1], second=0)
+        if start_dt > end_dt:
+            start_dt, end_dt = end_dt, start_dt
+        return int(start_dt.timestamp()), int(end_dt.timestamp()), None
+
     ts_match = re.fullmatch(r"(\d{10})\s*(?:,|，|到|至|~|～)\s*(\d{10})", text)
     if ts_match:
         start_ts = int(ts_match.group(1))
@@ -837,7 +1082,7 @@ def _parse_time_range_to_ts(raw_time_range: str) -> tuple[Optional[int], Optiona
 
     return None, None, (
         "time_range 格式不支持。请使用：今天 / 昨天 / 最近N小时 / "
-        "YYYY-MM-DD HH:MM 到 YYYY-MM-DD HH:MM"
+        "YYYY-MM-DD HH:MM 到 YYYY-MM-DD HH:MM / 今天 HH:MM 到 HH:MM"
     )
 
 
@@ -904,6 +1149,60 @@ def _history_item_sort_key(item: Dict[str, Any]) -> tuple[int, int]:
     ts = _safe_int(item.get("time"))
     seq = _safe_int(item.get("message_seq")) or _safe_int(item.get("message_id"))
     return (ts if ts is not None else -1, seq if seq is not None else -1)
+
+
+HISTORY_CONTENT_MAX_CHARS_PER_MESSAGE = 300
+HISTORY_CONTENT_MAX_CHARS_TOTAL = 6000
+
+
+def _extract_history_messages(raw_result: Any) -> List[Dict[str, Any]]:
+    """
+    解析历史消息结果。
+    按当前 NapCat 场景仅处理两种返回：
+    - 直接 list
+    - dict 且包含顶层 messages
+    """
+    if isinstance(raw_result, list):
+        return [x for x in raw_result if isinstance(x, dict)]
+    if isinstance(raw_result, dict):
+        messages = raw_result.get("messages")
+        if isinstance(messages, list):
+            return [x for x in messages if isinstance(x, dict)]
+    return []
+
+
+def _trim_history_content(
+    text: str,
+    current_total: int,
+    *,
+    per_message_limit: int = HISTORY_CONTENT_MAX_CHARS_PER_MESSAGE,
+    total_limit: int = HISTORY_CONTENT_MAX_CHARS_TOTAL,
+) -> tuple[str, bool, int, bool]:
+    """
+    历史消息内容截断:
+    - 单条上限 per_message_limit
+    - 总字符上限 total_limit
+
+    Returns:
+      (new_text, truncated, new_total, budget_reached)
+    """
+    content = str(text or "")
+    truncated = False
+
+    if len(content) > per_message_limit:
+        content = content[:per_message_limit]
+        truncated = True
+
+    remain = total_limit - current_total
+    if remain <= 0:
+        return "", True, current_total, True
+
+    if len(content) > remain:
+        content = content[:remain]
+        truncated = True
+        return content, truncated, current_total + len(content), True
+
+    return content, truncated, current_total + len(content), False
 
 
 def _segment_to_text(seg: Any) -> str:
@@ -1411,33 +1710,41 @@ async def get_group_msg_history_internal(
             params["message_seq"] = seq_text
 
         raw_result = await _call_action(event, "get_group_msg_history", **params)
-        data = _unwrap_action_data(raw_result)
-
-        # 常见结构: data={"messages":[...]} 或 data=[...]
-        if isinstance(data, dict):
-            for key in ("messages", "message", "list", "records"):
-                messages = data.get(key)
-                if isinstance(messages, list):
-                    return messages
-            return None
-        if isinstance(data, list):
-            return data
-
-        if isinstance(raw_result, dict):
-            for key in ("messages", "message", "list", "records"):
-                messages = raw_result.get(key)
-                if isinstance(messages, list):
-                    return messages
-            inner_data = raw_result.get("data")
-            if isinstance(inner_data, dict):
-                for key in ("messages", "message", "list", "records"):
-                    messages = inner_data.get(key)
-                    if isinstance(messages, list):
-                        return messages
-
-        return None
+        messages = _extract_history_messages(raw_result)
+        return messages or None
     except Exception as e:
         logger.info(f"获取群历史消息 API 调用失败: {e}")
+        return None
+
+
+async def get_friend_msg_history_internal(
+    event: AstrMessageEvent,
+    user_id: str,
+    count: int = 50,
+    message_seq: str = "",
+) -> Optional[List[Dict[str, Any]]]:
+    """调用 API 获取一页好友历史消息。"""
+    try:
+        target_user_id = str(user_id or "").strip()
+        if not target_user_id:
+            return None
+        if not IS_AIOCQHTTP or not isinstance(event, AiocqhttpMessageEvent):
+            return None
+
+        page_size = max(1, min(int(count or 50), 50))
+        params: Dict[str, Any] = {
+            "user_id": _coerce_numeric_id(target_user_id),
+            "count": page_size,
+        }
+        seq_text = str(message_seq or "").strip()
+        if seq_text:
+            params["message_seq"] = seq_text
+
+        raw_result = await _call_action(event, "get_friend_msg_history", **params)
+        messages = _extract_history_messages(raw_result)
+        return messages or None
+    except Exception as e:
+        logger.info(f"获取好友历史消息 API 调用失败: {e}")
         return None
 
 
@@ -1478,6 +1785,9 @@ async def process_group_msg_history(
         matched: List[Dict[str, Any]] = []
         seen_msg_keys: set[str] = set()
         seen_seq: set[str] = set()
+        content_total_chars = 0
+        content_truncated_count = 0
+        content_budget_reached = False
 
         while scanned < scan_limit and len(matched) < safe_count:
             page = await get_group_msg_history_internal(
@@ -1524,6 +1834,19 @@ async def process_group_msg_history(
                 if keywords and not any(k in text for k in keywords):
                     continue
 
+                text, truncated, content_total_chars, reached_budget = _trim_history_content(
+                    text,
+                    content_total_chars,
+                )
+                if reached_budget:
+                    content_budget_reached = True
+                if not text:
+                    if reached_budget:
+                        break
+                    continue
+                if truncated:
+                    content_truncated_count += 1
+
                 item_payload: Dict[str, Any] = {
                     "message_id": msg_id,
                     "time": msg_ts,
@@ -1539,11 +1862,15 @@ async def process_group_msg_history(
                 # message_seq 在大多数平台实现里常与 message_id 一致，冗余时不返回以节省 token。
                 if msg_seq and (not msg_id or msg_seq != msg_id):
                     item_payload["message_seq"] = msg_seq
+                if truncated:
+                    item_payload["content_truncated"] = True
                 matched.append(item_payload)
                 if len(matched) >= safe_count:
                     break
 
             if len(matched) >= safe_count:
+                break
+            if content_budget_reached:
                 break
             if stop_by_time_window and start_ts is not None:
                 break
@@ -1568,12 +1895,18 @@ async def process_group_msg_history(
             matched = matched[:safe_count]
 
         result = {
+            "chat_type": "group",
             "group_id": str(target_group_id),
             "requested_count": safe_count,
             "returned_count": len(matched),
             "scanned_count": scanned,
             "scan_limit": scan_limit,
             "sort_order": "time_desc",
+            "content_char_limit_per_message": HISTORY_CONTENT_MAX_CHARS_PER_MESSAGE,
+            "content_char_limit_total": HISTORY_CONTENT_MAX_CHARS_TOTAL,
+            "content_total_chars": content_total_chars,
+            "content_truncated_count": content_truncated_count,
+            "content_budget_reached": content_budget_reached,
             "search_keywords": keywords,
             "time_range": str(time_range or "").strip(),
             "start_ts": start_ts,
@@ -1587,6 +1920,177 @@ async def process_group_msg_history(
         elapsed_time = time.time() - start_time
         logger.info(f"获取群历史消息时发生错误: {e}，耗时 {elapsed_time:.2f}s")
         return _json_error("获取群历史消息时发生内部错误。", error=str(e))
+
+
+async def process_friend_msg_history(
+    event: AstrMessageEvent,
+    user_id: Optional[str] = None,
+    count: int = 50,
+    search_keywords: str = "",
+    time_range: str = "",
+) -> str:
+    """
+    获取并处理好友历史消息，支持:
+    - 关键词包含匹配(多个关键词)
+    - 时间范围过滤
+    """
+    start_time = time.time()
+    try:
+        if not IS_AIOCQHTTP or not isinstance(event, AiocqhttpMessageEvent):
+            return _json_error(
+                f"此功能仅支持 QQ 平台 (aiocqhttp)，当前平台为 {event.get_platform_name()}"
+            )
+
+        target_user_id = str(user_id or "").strip()
+        if not target_user_id and not event.get_group_id():
+            target_user_id = str(event.get_sender_id() or "").strip()
+        if not target_user_id:
+            return _json_error("未识别到私聊目标，请提供 user_id。")
+
+        safe_count = max(1, min(int(count or 50), 300))
+        keywords = _parse_search_keywords(search_keywords)
+        start_ts, end_ts, range_err = _parse_time_range_to_ts(time_range)
+        if range_err:
+            return _json_error(range_err)
+
+        page_size = 50
+        scan_limit = max(200, min(5000, safe_count * 20))
+        cursor_seq = "0"
+        scanned = 0
+        matched: List[Dict[str, Any]] = []
+        seen_msg_keys: set[str] = set()
+        seen_seq: set[str] = set()
+        content_total_chars = 0
+        content_truncated_count = 0
+        content_budget_reached = False
+
+        while scanned < scan_limit and len(matched) < safe_count:
+            page = await get_friend_msg_history_internal(
+                event=event,
+                user_id=target_user_id,
+                count=page_size,
+                message_seq=cursor_seq,
+            )
+            if not page:
+                break
+
+            oldest_ts_in_page: Optional[int] = None
+            stop_by_time_window = False
+            page_old_to_new = _is_page_old_to_new(page)
+            iter_page = list(reversed(page)) if page_old_to_new else page
+            for item in iter_page:
+                if not isinstance(item, dict):
+                    continue
+                scanned += 1
+
+                msg_id = _extract_msg_id(item)
+                msg_seq = _extract_msg_seq(item)
+                uniq_key = msg_id or f"seq:{msg_seq}" or f"scan:{scanned}"
+                if uniq_key in seen_msg_keys:
+                    continue
+                seen_msg_keys.add(uniq_key)
+
+                msg_ts = _extract_msg_time(item)
+                if msg_ts is not None:
+                    if oldest_ts_in_page is None or msg_ts < oldest_ts_in_page:
+                        oldest_ts_in_page = msg_ts
+                    if end_ts is not None and msg_ts > end_ts:
+                        continue
+                    if start_ts is not None and msg_ts < start_ts:
+                        stop_by_time_window = True
+                        continue
+
+                sender = item.get("sender")
+                text = _message_to_text(item.get("message"), str(item.get("raw_message") or ""))
+                if not text:
+                    text = "[空消息]"
+
+                if keywords and not any(k in text for k in keywords):
+                    continue
+
+                text, truncated, content_total_chars, reached_budget = _trim_history_content(
+                    text,
+                    content_total_chars,
+                )
+                if reached_budget:
+                    content_budget_reached = True
+                if not text:
+                    if reached_budget:
+                        break
+                    continue
+                if truncated:
+                    content_truncated_count += 1
+
+                item_payload: Dict[str, Any] = {
+                    "message_id": msg_id,
+                    "time": msg_ts,
+                    "time_text": (
+                        datetime.fromtimestamp(msg_ts).strftime("%Y-%m-%d %H:%M:%S")
+                        if isinstance(msg_ts, int) and msg_ts > 0
+                        else ""
+                    ),
+                    "user_id": str((sender or {}).get("user_id") or item.get("user_id") or ""),
+                    "sender_name": _sender_to_name(sender),
+                    "content": text,
+                }
+                if msg_seq and (not msg_id or msg_seq != msg_id):
+                    item_payload["message_seq"] = msg_seq
+                if truncated:
+                    item_payload["content_truncated"] = True
+                matched.append(item_payload)
+                if len(matched) >= safe_count:
+                    break
+
+            if len(matched) >= safe_count:
+                break
+            if content_budget_reached:
+                break
+            if stop_by_time_window and start_ts is not None:
+                break
+
+            oldest_item = page[0] if page_old_to_new else page[-1]
+            next_seq = _extract_msg_seq(oldest_item) or _extract_msg_id(oldest_item)
+            next_seq = str(next_seq or "").strip()
+            if not next_seq:
+                break
+            if next_seq == cursor_seq or next_seq in seen_seq:
+                break
+            seen_seq.add(next_seq)
+            cursor_seq = next_seq
+
+            if oldest_ts_in_page is not None and start_ts is not None and oldest_ts_in_page < start_ts:
+                break
+
+        matched.sort(key=_history_item_sort_key, reverse=True)
+        if len(matched) > safe_count:
+            matched = matched[:safe_count]
+
+        result = {
+            "chat_type": "friend",
+            "user_id": target_user_id,
+            "requested_count": safe_count,
+            "returned_count": len(matched),
+            "scanned_count": scanned,
+            "scan_limit": scan_limit,
+            "sort_order": "time_desc",
+            "content_char_limit_per_message": HISTORY_CONTENT_MAX_CHARS_PER_MESSAGE,
+            "content_char_limit_total": HISTORY_CONTENT_MAX_CHARS_TOTAL,
+            "content_total_chars": content_total_chars,
+            "content_truncated_count": content_truncated_count,
+            "content_budget_reached": content_budget_reached,
+            "search_keywords": keywords,
+            "time_range": str(time_range or "").strip(),
+            "start_ts": start_ts,
+            "end_ts": end_ts,
+            "messages": matched,
+        }
+        elapsed_time = time.time() - start_time
+        logger.info(f"成功获取好友 {target_user_id} 历史消息，返回 {len(matched)} 条，耗时 {elapsed_time:.2f}s")
+        return json.dumps(result, ensure_ascii=False, indent=2)
+    except Exception as e:
+        elapsed_time = time.time() - start_time
+        logger.info(f"获取好友历史消息时发生错误: {e}，耗时 {elapsed_time:.2f}s")
+        return _json_error("获取好友历史消息时发生内部错误。", error=str(e))
 
 
 async def set_group_ban_logic(
@@ -2339,4 +2843,3 @@ async def set_group_kick_members_logic(
         )
     except Exception as e:
         return _json_error("批量踢人失败。", error=str(e))
-

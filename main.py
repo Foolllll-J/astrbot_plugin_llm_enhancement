@@ -27,8 +27,10 @@ from .modules.qq_utils import (
     process_group_notices,
     process_group_essence,
     process_group_msg_history,
+    process_friend_msg_history,
     process_group_members_info,
     process_group_member_info,
+    inject_perception_context_info,
     inject_sender_group_member_info,
     inject_bot_group_member_info,
     kick_group_member_logic,
@@ -836,34 +838,55 @@ class LLMEnhancement(Star):
             auto_escape=auto_escape,
         )
 
-    @filter.llm_tool(name="get_group_msg_history")
-    async def get_group_msg_history(
+    @filter.llm_tool(name="get_msg_history")
+    async def get_msg_history(
         self,
         event: AstrMessageEvent,
-        group_id: str = None,
+        chat_type: str,
+        group_id: str = "",
+        user_id: str = "",
         count: int = 50,
         search_keywords: str = "",
         time_range: str = "",
     ) -> str:
         """
-        获取群历史消息，支持关键词搜索与时间范围过滤。
-        使用场景:
-            1) 用户明确要求“查历史/回看聊天记录/谁说过某句话/查某时间段消息”。
-            2) 需要补充上下文时，且用户确实在问“过去说过什么”。
+        获取历史消息（群聊/私聊），支持关键词搜索与时间范围过滤。
+        仅在用户明确要求需查历史消息时调用，避免无关上下文扩张。
 
         Args:
-            group_id (str, optional): 目标群号。在私聊使用时必填，在群聊使用时可选（默认当前群）。
+            chat_type (str): 查询类型。仅支持 group 或 private。
+            group_id (str, optional): 当 chat_type=group 时必填。
+            user_id (str, optional): 当 chat_type=private 时必填。
             count (int, optional): 返回条数上限，默认 50，最大 300。
             search_keywords (str, optional): 搜索关键词。支持多个，使用逗号/竖线/换行分隔。
-            time_range (str, optional): 时间范围。支持:
-                YYYY-MM-DD HH:MM 到 YYYY-MM-DD HH:MM / 今天 / 昨天 / 最近N小时
+            time_range (str, optional): 时间范围（严格格式，不要使用“今天下午/刚刚/晚点”等自然语言）。
+                仅支持:
+                1) 今天
+                2) 昨天
+                3) 最近N小时 (示例: 最近6小时)
+                4) YYYY-MM-DD HH:MM 到 YYYY-MM-DD HH:MM
+                5) 今天 HH:MM 到 HH:MM / 昨天 HH:MM 到 HH:MM
         """
-        return await process_group_msg_history(
-            event=event,
-            group_id=group_id,
-            count=count,
-            search_keywords=search_keywords,
-            time_range=time_range,
+        mode = str(chat_type or "").strip().lower()
+        if mode == "group":
+            return await process_group_msg_history(
+                event=event,
+                group_id=group_id or None,
+                count=count,
+                search_keywords=search_keywords,
+                time_range=time_range,
+            )
+        if mode == "private":
+            return await process_friend_msg_history(
+                event=event,
+                user_id=user_id,
+                count=count,
+                search_keywords=search_keywords,
+                time_range=time_range,
+            )
+        return json.dumps(
+            {"error": "chat_type 参数无效。仅支持 group 或 private。"},
+            ensure_ascii=False,
         )
 
     @filter.llm_tool(name="set_group_ban")
@@ -1362,6 +1385,18 @@ class LLMEnhancement(Star):
                     member.silence_until = now + silence_sec
                     logger.info(f"用户({uid})触发辱骂沉默{silence_sec:.1f}秒(下次生效)")
 
+            perception_fields = self._get_cfg("perception_injection_fields", [])
+            perception_injected = bool(
+                await inject_perception_context_info(
+                    event=event,
+                    req=req,
+                    raw_fields=perception_fields,
+                    timezone_name="Asia/Shanghai",
+                    holiday_country="CN",
+                    no_cache=bool(self._get_cfg("extra_info_injection_no_cache", False)),
+                )
+            )
+
             selected_fields = self._get_cfg("extra_info_injection_fields", [])
             inject_no_cache = bool(self._get_cfg("extra_info_injection_no_cache", False))
             sender_member_injected = bool(
@@ -1384,6 +1419,7 @@ class LLMEnhancement(Star):
                 )
 
             injection_summary = {
+                "perception": perception_injected,
                 "member_info": sender_member_injected,
                 "bot_member_info": bot_member_injected,
                 "json": False,
@@ -1409,6 +1445,7 @@ class LLMEnhancement(Star):
                 logger.debug(
                     "[LLMEnhancement] 注入摘要: "
                     f"uid={uid}, group={gid or 'private'}, "
+                    f"perception={injection_summary['perception']}, "
                     f"member_info={injection_summary['member_info']}, "
                     f"bot_member_info={injection_summary['bot_member_info']}, "
                     f"json={injection_summary['json']}, file={injection_summary['file']}, "
@@ -1434,6 +1471,7 @@ class LLMEnhancement(Star):
                 logger.debug(
                     "[LLMEnhancement] 注入摘要: "
                     f"uid={uid}, group={gid or 'private'}, "
+                    f"perception={injection_summary['perception']}, "
                     f"member_info={injection_summary['member_info']}, "
                     f"bot_member_info={injection_summary['bot_member_info']}, "
                     f"json={injection_summary['json']}, file={injection_summary['file']}, "
@@ -1455,6 +1493,7 @@ class LLMEnhancement(Star):
             logger.debug(
                 "[LLMEnhancement] 注入摘要: "
                 f"uid={uid}, group={gid or 'private'}, "
+                f"perception={injection_summary['perception']}, "
                 f"member_info={injection_summary['member_info']}, "
                 f"bot_member_info={injection_summary['bot_member_info']}, "
                 f"json={injection_summary['json']}, file={injection_summary['file']}, "

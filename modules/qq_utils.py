@@ -868,6 +868,44 @@ def _extract_msg_id(msg: Dict[str, Any]) -> str:
     return ""
 
 
+def _safe_int(value: Any) -> Optional[int]:
+    try:
+        text = str(value or "").strip()
+        if not text:
+            return None
+        return int(float(text))
+    except Exception:
+        return None
+
+
+def _is_page_old_to_new(page: List[Dict[str, Any]]) -> bool:
+    """
+    判断单页消息是否按“旧 -> 新”排序。
+    优先用 time 判定，兜底使用 message_seq。
+    """
+    if len(page) < 2:
+        return True
+
+    first_ts = _extract_msg_time(page[0])
+    last_ts = _extract_msg_time(page[-1])
+    if first_ts is not None and last_ts is not None:
+        return first_ts <= last_ts
+
+    first_seq = _safe_int(_extract_msg_seq(page[0]) or _extract_msg_id(page[0]))
+    last_seq = _safe_int(_extract_msg_seq(page[-1]) or _extract_msg_id(page[-1]))
+    if first_seq is not None and last_seq is not None:
+        return first_seq <= last_seq
+
+    return True
+
+
+def _history_item_sort_key(item: Dict[str, Any]) -> tuple[int, int]:
+    """历史消息排序键：优先 time，其次 seq/id。值越大表示越新。"""
+    ts = _safe_int(item.get("time"))
+    seq = _safe_int(item.get("message_seq")) or _safe_int(item.get("message_id"))
+    return (ts if ts is not None else -1, seq if seq is not None else -1)
+
+
 def _segment_to_text(seg: Any) -> str:
     if isinstance(seg, str):
         return seg
@@ -932,6 +970,169 @@ def _sender_to_name(sender: Any) -> str:
         return nickname
     uid = str(sender.get("user_id") or "").strip()
     return uid
+
+
+def _extract_sent_message_id(raw_result: Any) -> str:
+    """从发送消息接口返回中提取 message_id。"""
+    for payload in (_unwrap_action_data(raw_result), raw_result):
+        if isinstance(payload, dict):
+            for key in ("message_id", "msg_id", "id"):
+                value = payload.get(key)
+                if value is not None and str(value).strip():
+                    return str(value).strip()
+    return ""
+
+
+def _coerce_numeric_id(value: str) -> Any:
+    text = str(value or "").strip()
+    if text.isdigit():
+        return int(text)
+    return text
+
+
+async def process_contact_list(event: AstrMessageEvent, limit_each: int = 200) -> str:
+    """
+    查看通讯录：同时获取群列表与好友列表。
+    仅支持 QQ(aiocqhttp) 平台。
+    """
+    start_time = time.time()
+    try:
+        if not IS_AIOCQHTTP or not isinstance(event, AiocqhttpMessageEvent):
+            return _json_error(f"此功能仅支持 QQ 平台 (aiocqhttp)，当前平台为 {event.get_platform_name()}")
+
+        safe_limit = max(1, min(int(limit_each or 200), 1000))
+
+        raw_group = await _call_action(event, "get_group_list", fallback_method="get_group_list")
+        raw_friend = await _call_action(event, "get_friend_list", fallback_method="get_friend_list")
+
+        group_list = _unwrap_action_data(raw_group)
+        if not isinstance(group_list, list):
+            group_list = raw_group if isinstance(raw_group, list) else []
+        friend_list = _unwrap_action_data(raw_friend)
+        if not isinstance(friend_list, list):
+            friend_list = raw_friend if isinstance(raw_friend, list) else []
+
+        groups: List[Dict[str, Any]] = []
+        for item in group_list[:safe_limit]:
+            if not isinstance(item, dict):
+                continue
+            gid = str(item.get("group_id") or "").strip()
+            if not gid:
+                continue
+            groups.append(
+                {
+                    "group_id": gid,
+                    "group_name": str(item.get("group_name") or ""),
+                    "member_count": item.get("member_count"),
+                    "max_member_count": item.get("max_member_count"),
+                }
+            )
+
+        friends: List[Dict[str, Any]] = []
+        for item in friend_list[:safe_limit]:
+            if not isinstance(item, dict):
+                continue
+            uid = str(item.get("user_id") or item.get("uin") or "").strip()
+            if not uid:
+                continue
+            friends.append(
+                {
+                    "user_id": uid,
+                    "nickname": str(item.get("nickname") or ""),
+                    "remark": str(item.get("remark") or ""),
+                }
+            )
+
+        elapsed_time = time.time() - start_time
+        logger.info(
+            f"成功获取通讯录信息：groups={len(groups)}/{len(group_list)}, "
+            f"friends={len(friends)}/{len(friend_list)}，耗时 {elapsed_time:.2f}s"
+        )
+
+        return json.dumps(
+            {
+                "success": True,
+                "message": "已获取通讯录。",
+                "limit_each": safe_limit,
+                "group_total": len(group_list),
+                "group_returned": len(groups),
+                "friend_total": len(friend_list),
+                "friend_returned": len(friends),
+                "groups": groups,
+                "friends": friends,
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+    except Exception as e:
+        elapsed_time = time.time() - start_time
+        logger.info(f"获取通讯录时发生错误: {e}，耗时 {elapsed_time:.2f}s")
+        return _json_error("获取通讯录失败。", error=str(e))
+
+
+async def send_message_logic(
+    event: AstrMessageEvent,
+    chat_type: str,
+    message: str,
+    group_id: Optional[str] = None,
+    user_id: Optional[str] = None,
+    auto_escape: bool = False,
+) -> str:
+    """
+    统一消息发送逻辑：
+    - chat_type=group 时调用 send_group_msg
+    - chat_type=private 时调用 send_private_msg
+    """
+    try:
+        if not IS_AIOCQHTTP or not isinstance(event, AiocqhttpMessageEvent):
+            return _json_error(f"此功能仅支持 QQ 平台 (aiocqhttp)，当前平台为 {event.get_platform_name()}")
+
+        normalized_type = str(chat_type or "").strip().lower()
+        msg_text = str(message or "")
+        if not msg_text.strip():
+            return _json_error("请提供要发送的消息内容(message)。")
+
+        if normalized_type in {"group", "群", "group_chat"}:
+            target_group_id = str(group_id or event.get_group_id() or "").strip()
+            if not target_group_id:
+                return _json_error("chat_type=group 时请提供 group_id，或在群聊环境中调用。")
+            raw_result = await _call_action(
+                event,
+                "send_group_msg",
+                fallback_method="send_group_msg",
+                group_id=_coerce_numeric_id(target_group_id),
+                message=msg_text,
+                auto_escape=_to_bool(auto_escape, False),
+            )
+            return _json_success(
+                "群消息发送成功。",
+                chat_type="group",
+                group_id=target_group_id,
+                message_id=_extract_sent_message_id(raw_result),
+            )
+
+        if normalized_type in {"private", "好友", "friend", "private_chat"}:
+            target_user_id = str(user_id or event.get_sender_id() or "").strip()
+            if not target_user_id:
+                return _json_error("chat_type=private 时请提供 user_id。")
+            raw_result = await _call_action(
+                event,
+                "send_private_msg",
+                fallback_method="send_private_msg",
+                user_id=_coerce_numeric_id(target_user_id),
+                message=msg_text,
+                auto_escape=_to_bool(auto_escape, False),
+            )
+            return _json_success(
+                "私聊消息发送成功。",
+                chat_type="private",
+                user_id=target_user_id,
+                message_id=_extract_sent_message_id(raw_result),
+            )
+
+        return _json_error("chat_type 仅支持 group 或 private。")
+    except Exception as e:
+        return _json_error("发送消息失败。", error=str(e))
 
 
 async def get_group_info_internal(
@@ -1271,7 +1472,8 @@ async def process_group_msg_history(
         # 50 为接口单页上限，按页向前翻，直到满足返回条件或达到扫描上限。
         page_size = 50
         scan_limit = max(200, min(5000, safe_count * 20))
-        cursor_seq = ""
+        # message_seq=0 表示从“最新窗口”开始拉取，避免命中陈旧缓存窗口。
+        cursor_seq = "0"
         scanned = 0
         matched: List[Dict[str, Any]] = []
         seen_msg_keys: set[str] = set()
@@ -1289,7 +1491,9 @@ async def process_group_msg_history(
 
             oldest_ts_in_page: Optional[int] = None
             stop_by_time_window = False
-            for item in page:
+            page_old_to_new = _is_page_old_to_new(page)
+            iter_page = list(reversed(page)) if page_old_to_new else page
+            for item in iter_page:
                 if not isinstance(item, dict):
                     continue
                 scanned += 1
@@ -1320,21 +1524,22 @@ async def process_group_msg_history(
                 if keywords and not any(k in text for k in keywords):
                     continue
 
-                matched.append(
-                    {
-                        "message_id": msg_id,
-                        "message_seq": msg_seq,
-                        "time": msg_ts,
-                        "time_text": (
-                            datetime.fromtimestamp(msg_ts).strftime("%Y-%m-%d %H:%M:%S")
-                            if isinstance(msg_ts, int) and msg_ts > 0
-                            else ""
-                        ),
-                        "user_id": str((sender or {}).get("user_id") or item.get("user_id") or ""),
-                        "sender_name": _sender_to_name(sender),
-                        "content": text,
-                    }
-                )
+                item_payload: Dict[str, Any] = {
+                    "message_id": msg_id,
+                    "time": msg_ts,
+                    "time_text": (
+                        datetime.fromtimestamp(msg_ts).strftime("%Y-%m-%d %H:%M:%S")
+                        if isinstance(msg_ts, int) and msg_ts > 0
+                        else ""
+                    ),
+                    "user_id": str((sender or {}).get("user_id") or item.get("user_id") or ""),
+                    "sender_name": _sender_to_name(sender),
+                    "content": text,
+                }
+                # message_seq 在大多数平台实现里常与 message_id 一致，冗余时不返回以节省 token。
+                if msg_seq and (not msg_id or msg_seq != msg_id):
+                    item_payload["message_seq"] = msg_seq
+                matched.append(item_payload)
                 if len(matched) >= safe_count:
                     break
 
@@ -1343,8 +1548,9 @@ async def process_group_msg_history(
             if stop_by_time_window and start_ts is not None:
                 break
 
-            last_item = page[-1] if page else {}
-            next_seq = _extract_msg_seq(last_item) or _extract_msg_id(last_item)
+            # 翻页锚点始终取“本页最旧消息”的 seq/id，向更早历史继续翻。
+            oldest_item = page[0] if page_old_to_new else page[-1]
+            next_seq = _extract_msg_seq(oldest_item) or _extract_msg_id(oldest_item)
             next_seq = str(next_seq or "").strip()
             if not next_seq:
                 break
@@ -1356,12 +1562,18 @@ async def process_group_msg_history(
             if oldest_ts_in_page is not None and start_ts is not None and oldest_ts_in_page < start_ts:
                 break
 
+        # 兜底统一排序，确保返回结果始终按“最新 -> 最旧”。
+        matched.sort(key=_history_item_sort_key, reverse=True)
+        if len(matched) > safe_count:
+            matched = matched[:safe_count]
+
         result = {
             "group_id": str(target_group_id),
             "requested_count": safe_count,
             "returned_count": len(matched),
             "scanned_count": scanned,
             "scan_limit": scan_limit,
+            "sort_order": "time_desc",
             "search_keywords": keywords,
             "time_range": str(time_range or "").strip(),
             "start_ts": start_ts,

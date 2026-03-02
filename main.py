@@ -21,6 +21,8 @@ from .modules.video_parser import (
 import os
 import shutil
 from .modules.qq_utils import (
+    process_contact_list,
+    send_message_logic,
     process_group_info,
     process_group_notices,
     process_group_essence,
@@ -792,6 +794,47 @@ class LLMEnhancement(Star):
             limit (int, optional): 返回条数上限，默认 10，最大 50。
         """
         return await process_group_essence(event=event, group_id=group_id, limit=limit)
+
+    @filter.llm_tool(name="get_contact_list")
+    async def get_contact_list(self, event: AstrMessageEvent, limit_each: int = 200) -> str:
+        """
+        查看通讯录：同时返回群列表与好友列表。
+
+        Args:
+            limit_each (int, optional): 群列表和好友列表各自返回上限，默认 200，最大 1000。
+        """
+        return await process_contact_list(event=event, limit_each=limit_each)
+
+    @filter.llm_tool(name="send_message")
+    async def send_message(
+        self,
+        event: AstrMessageEvent,
+        chat_type: str,
+        message: str,
+        group_id: str = None,
+        user_id: str = None,
+        auto_escape: bool = False,
+    ) -> str:
+        """
+        发送消息到 QQ 私聊或群聊。仅用于被要求发送消息至非当前会话时调用，例如“帮我发消息给某人/某群”。
+        本工具只执行基础发送，不参与其他插件的二次语义解析。
+        不要在 message 中附加“表情包触发标记/特殊控制标记”等约定字符串来触发额外行为。
+
+        Args:
+            chat_type (str): 发送类型。仅支持 group 或 private。
+            message (str): 要发送的消息文本。
+            group_id (str, optional): 当 chat_type=group 时必填。
+            user_id (str, optional): 当 chat_type=private 时必填。
+            auto_escape (bool, optional): 是否将 CQ 码按纯文本发送（True=不解析，False=按 CQ 码解析），默认 False。
+        """
+        return await send_message_logic(
+            event=event,
+            chat_type=chat_type,
+            message=message,
+            group_id=group_id,
+            user_id=user_id,
+            auto_escape=auto_escape,
+        )
 
     @filter.llm_tool(name="get_group_msg_history")
     async def get_group_msg_history(

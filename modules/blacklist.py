@@ -312,14 +312,18 @@ class BlacklistManager:
             value = min_value
         return value
 
-    def _cfg_bool(self, key: str, default: bool) -> bool:
-        return bool(self._get_cfg(key, default))
+    def _cfg_str(self, key: str, default: str) -> str:
+        raw = self._get_cfg(key, default)
+        return str(raw if raw is not None else default).strip()
 
     def max_blacklist_duration(self) -> int:
         return self._cfg_int("max_blacklist_duration", 86400, min_value=0)
 
-    def blacklist_block_commands(self) -> bool:
-        return self._cfg_bool("blacklist_block_commands", True)
+    def blacklist_intercept_level(self) -> str:
+        raw = self._cfg_str("blacklist_intercept_level", "llm_only").lower()
+        if raw in {"llm_only", "command_and_llm", "all_messages"}:
+            return raw
+        return "llm_only"
 
     def tool_write_require_admin(self, tool_id: str) -> bool:
         selected = self._get_cfg("tool_admin_required_tools", [])

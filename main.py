@@ -164,6 +164,17 @@ class LLMEnhancement(Star):
             value = 90
         return max(10, min(600, value))
 
+    def _blacklist_intercept_level(self) -> str:
+        return self.blacklist.blacklist_intercept_level()
+
+    def _is_command_trigger_event(self, event: AstrMessageEvent) -> bool:
+        handlers = event.get_extra("activated_handlers", default=[]) or []
+        for handler in handlers:
+            for event_filter in getattr(handler, "event_filters", []) or []:
+                if event_filter.__class__.__name__ in {"CommandFilter", "CommandGroupFilter"}:
+                    return True
+        return False
+
 
     def _build_recall_key(self, umo: str, msg_id: str) -> str:
         return f"{umo}::{msg_id}"
@@ -235,8 +246,12 @@ class LLMEnhancement(Star):
         if uid == bid:
             return
         
-        # 1.0 内置黑名单拦截（开启“拦截指令”时在消息阶段直接拦截）
-        if self._get_cfg("blacklist_block_commands", True):
+        # 1.0 内置黑名单拦截（三档：仅LLM/指令+LLM/全消息）
+        blacklist_level = self._blacklist_intercept_level()
+        if blacklist_level == "all_messages":
+            if await self.blacklist.intercept_event(event):
+                return
+        elif blacklist_level == "command_and_llm" and self._is_command_trigger_event(event):
             if await self.blacklist.intercept_event(event):
                 return
 
@@ -1300,10 +1315,9 @@ class LLMEnhancement(Star):
         if not uid:
             return
 
-        # 关闭“拦截指令”时，在请求阶段拦截黑名单用户，避免误伤指令。
-        if not self._get_cfg("blacklist_block_commands", True):
-            if await self.blacklist.intercept_llm_request(event):
-                return
+        # 任意拦截等级都会拦截 LLM 请求。
+        if await self.blacklist.intercept_llm_request(event):
+            return
         
         g = StateManager.get_group(gid or f"private_{uid}")
         if uid not in g.members:

@@ -7,7 +7,7 @@
     },
     "group_blacklist": {
         "description": "群聊黑名单",
-        "hint": "屏蔽黑名单中的群聊，该群消息无法唤醒bot(bot管理员不受影响)。",
+        "hint": "屏蔽黑名单中的群聊，该群消息无法唤醒bot。",
         "type": "list",
         "default": []
     },
@@ -18,7 +18,7 @@
         "items": {
             "request_cd": {
                 "description": "请求CD(秒)",
-                "hint": "防止频繁发送LLM请求的冷却时间。距离上次发送请求小于此时间的所有消息会被阻止。设为0时关闭检测。",
+                "hint": "防止频繁发送LLM请求的冷却时间。距离上次发送请求小于此时间的所有消息会被阻止。设为 0 时关闭检测。",
                 "type": "float",
                 "default": 1.0
             },
@@ -32,11 +32,11 @@
                 "description": "合并数量上限",
                 "hint": "单次最多可合并的消息条数，超过上限后将停止继续收集。",
                 "type": "int",
-                "default": 5
+                "default": 3
             },
             "merge_multi_user": {
                 "description": "允许合并多人消息",
-                "hint": "开启后，合并延迟期间若有其他群成员发送消息，也会被一并收集。消息格式将变为“[昵称]: 消息内容”。",
+                "hint": "开启后，合并延迟期间若有其他群成员发送消息，也会被一并收集。",
                 "type": "bool",
                 "default": false
             },
@@ -54,7 +54,7 @@
             },
             "wake_extend_similarity": {
                 "description": "唤醒延长相关性阈值",
-                "hint": "唤醒延长期间，当前消息与上文的相关性阈值。降低阈值可更容易保持对话连续性。",
+                "hint": "唤醒延长期间，当前消息与上文的相关性阈值。",
                 "type": "float",
                 "default": 0.1
             },
@@ -73,25 +73,25 @@
             },
             "relevant_wake": {
                 "description": "相关性唤醒阈值",
-                "hint": "当前消息与上文bot的消息相关性大时，唤醒bot。降低阈值可更容易唤醒，保持对话连续性。设为0时关闭检测。",
+                "hint": "当前消息与上文bot的消息相关性超过阈值时，唤醒bot。设为 0 时关闭检测。",
                 "type": "float",
                 "default": 0.71
             },
             "ask_wake": {
                 "description": "答疑唤醒阈值",
-                "hint": "当群里有人问专业性问题时，唤醒bot。建议阈值高一点，日常聊天疑问句出现的频率非常高。设为0时关闭检测。",
+                "hint": "当群里有人问专业性问题时，唤醒bot。设为 0 时关闭检测。",
                 "type": "float",
                 "default": 0.88
             },
             "shutup": {
                 "description": "闭嘴检测阈值",
-                "hint": "有人感觉bot太多话时，bot自动闭嘴一段时间。低阈值更容易让bot闭嘴。设为0时关闭检测。",
+                "hint": "有人感觉bot太多话时，bot自动闭嘴一段时间。设为 0 时关闭检测。",
                 "type": "float",
                 "default": 0.69
             },
             "insult": {
                 "description": "辱骂检测阈值",
-                "hint": "有人辱骂bot时，bot自动沉默一段时间。低阈值更容易让bot沉默，玻璃心更重。设为0时关闭检测。",
+                "hint": "有人辱骂bot时，bot自动沉默一段时间。设为 0 时关闭检测。",
                 "type": "float",
                 "default": 0.69
             },
@@ -109,7 +109,7 @@
             },
             "wake_forbidden_words": {
                 "description": "屏蔽唤醒规则",
-                "hint": "支持普通文本包含、re:pattern 与 /pattern/flags（flags: i,m,s,x,a,u,L）。命中规则时不会唤醒bot（bot管理员不受影响）。",
+                "hint": "支持格式同唤醒规则。命中规则时不会唤醒bot。",
                 "type": "list",
                 "default": [
                     "政治",
@@ -119,7 +119,7 @@
             },
             "block_builtin": {
                 "description": "屏蔽内置指令",
-                "hint": "内置指令即指Astrbot自带的命令，如help, tts, llm等，内置指令被屏蔽后不再会唤醒bot(bot管理员不受影响)。",
+                "hint": "内置指令即指 Astrbot 自带的命令，如 help, tts, llm 等，内置指令被屏蔽后不再会唤醒bot。",
                 "type": "bool",
                 "default": false
             }
@@ -441,11 +441,21 @@
                 "description": "黑名单最长时长（秒）",
                 "hint": "仅对 LLM 工具生效。设置为 0 表示允许永久拉黑。"
             },
-            "blacklist_block_commands": {
-                "type": "bool",
-                "default": true,
-                "description": "黑名单是否拦截指令",
-                "hint": "开启时在消息阶段拦截黑名单用户（包括指令）；关闭时放行指令处理，仅拦截 LLM 请求。"
+            "blacklist_intercept_level": {
+                "type": "string",
+                "default": "llm_only",
+                "options": [
+                    "llm_only",
+                    "command_and_llm",
+                    "all_messages"
+                ],
+                "labels": [
+                    "LLM 请求",
+                    "指令与 LLM 请求",
+                    "所有消息"
+                ],
+                "description": "黑名单拦截等级",
+                "hint": "可按需选择黑名单拦截强度。"
             }
         }
     }

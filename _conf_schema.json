@@ -77,6 +77,13 @@
                 "default": "",
                 "hint": "留空时不启用模型判定。配置后会让该模型仅输出 T/F，用于判断是否继续响应。"
             },
+            "wake_continue_provider_id": {
+                "description": "继续回复判定 Provider ID",
+                "type": "string",
+                "_special": "select_provider",
+                "default": "",
+                "hint": "仅用于普通 @ / 唤醒前缀请求的继续回复判定。留空表示不启用该判定。"
+            },
             "mention_wake": {
                 "description": "提及唤醒规则",
                 "hint": "支持普通文本包含、re:pattern 与 /pattern/flags（flags: i,m,s,x,a,u,L）。不填时关闭提及检测。",

@@ -55,8 +55,10 @@ from .modules.runtime_helpers import (
 )
 from .modules.wake_logic import (
     evaluate_wake_extend,
+    apply_post_wake_continue_gate,
     detect_wake_media_components,
     normalize_wake_trigger_message,
+    prepare_empty_mention_context,
     evaluate_mention_wake,
     contains_forbidden_wake_word,
 )
@@ -382,7 +384,8 @@ class LLMEnhancement(Star):
         now = time.time()
 
         # 4. 唤醒条件判断
-        wake = event.is_at_or_wake_command
+        direct_wake = bool(event.is_at_or_wake_command)
+        wake = direct_wake
         reason = "at_or_cmd"
 
         message_chain = []
@@ -411,6 +414,14 @@ class LLMEnhancement(Star):
             msg = normalized_msg
             event.message_str = msg
             reason = normalized_reason
+            if normalized_reason == "空@唤醒":
+                await prepare_empty_mention_context(
+                    event=event,
+                    gid=gid,
+                    uid=uid,
+                    current_msg_id=get_event_msg_id(event) or "",
+                    history_count=30,
+                )
 
         if not msg:
             if not wake:
@@ -536,6 +547,30 @@ class LLMEnhancement(Star):
                 if random.random() < prob_wake:
                     wake = True
                     reason = "概率唤醒"
+
+        wake, continue_detail = await apply_post_wake_continue_gate(
+            event=event,
+            msg=msg,
+            gid=gid,
+            wake=wake,
+            wake_reason=reason,
+            command_trigger_event=command_trigger_event,
+            direct_wake=direct_wake,
+            force_dynamic_followup=force_dynamic_followup,
+            get_cfg=self._get_cfg,
+            get_history_msg=lambda ev, count: get_history_messages(self.context, ev, count=count),
+            find_provider=lambda provider_id: resolve_provider(self.context, provider_id),
+        )
+        if continue_detail.startswith("model:") or continue_detail.startswith("fallback_allow:"):
+            logger.debug(
+                "[LLMEnhancement] 唤醒后继续响应判定："
+                f"group={gid or 'private'}, uid={uid}, reason={reason}, detail={continue_detail}, wake={wake}"
+            )
+        if direct_wake and (not wake):
+            if continue_detail.startswith("model:F"):
+                logger.info("[LLMEnhancement] 继续响应判定为F，已跳过本次回复。")
+            event.is_at_or_wake_command = False
+            return
 
         if dynamic_merge_mode and (not force_dynamic_followup) and (not command_trigger_event):
             target_uid = select_dynamic_owner_uid(
@@ -1651,6 +1686,10 @@ class LLMEnhancement(Star):
                     silence_sec = insult_th * self._get_cfg("silence_multiple", 500)
                     sender_member.silence_until = now + silence_sec
                     logger.info(f"用户({uid})触发辱骂沉默{silence_sec:.1f}秒(下次生效)")
+
+            empty_mention_ctx = str(event.get_extra("_llme_empty_mention_context", default="") or "").strip()
+            if empty_mention_ctx:
+                req.prompt = f"{(req.prompt or '').strip()}\n\n{empty_mention_ctx}".strip()
 
             perception_fields = self._get_cfg("perception_injection_fields", [])
             perception_injected = bool(

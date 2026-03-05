@@ -26,7 +26,19 @@
                 "description": "合并延迟(秒)",
                 "hint": "用户快速连续发送多条消息时，等待此时间后合并为一条发送给 LLM。设为 0 时关闭合并。",
                 "type": "float",
-                "default": 10.0
+                "default": 0
+            },
+            "merge_dynamic_mode": {
+                "description": "动态合并模式",
+                "hint": "开启后检测到新消息时丢弃上一轮响应并在下一轮合并重算；将不再根据合并延迟时间进行硬等待。",
+                "type": "bool",
+                "default": false
+            },
+            "merge_followup_require_wake": {
+                "description": "后续合并需再次唤醒",
+                "hint": "开启后，仅并入满足唤醒条件的后续消息；关闭时并入窗口内后续消息。",
+                "type": "bool",
+                "default": false
             },
             "merge_max_count": {
                 "description": "合并数量上限",

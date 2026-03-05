@@ -4,8 +4,46 @@ import jieba
 import re
 from astrbot.api import logger
 
-# 扩充jieba词典, 后续补充
-jieba.add_word("傻逼")
+# 扩充 jieba 词典，优先补充分词易拆散的高价值词
+CUSTOM_JIEBA_WORDS = (
+    # insult
+    "傻逼",
+    "神经病",
+    "草泥马",
+    # shutup
+    "闭嘴",
+    "安静",
+    # bored
+    "无聊",
+    "没劲",
+    "没意思",
+    "有人吗",
+    # ask
+    "请问",
+    "求教",
+    "求助",
+    "请教",
+    "求解",
+    "怎么办",
+    "如何解决",
+    "怎么处理",
+    "怎么做",
+    "怎么回事",
+    "什么原因",
+    "可不可以",
+    "能不能",
+    "会不会",
+    "有没有",
+    "谁知道",
+    "谁懂",
+    "有人会",
+    # discourse
+    "别骂人",
+    "不要骂人",
+)
+
+for _word in CUSTOM_JIEBA_WORDS:
+    jieba.add_word(_word)
 
 class Sentiment:
     """
@@ -164,30 +202,6 @@ class Sentiment:
         "有人会": (0.7, 1.3),
     }
 
-    # 人机检测关键词 - 常见AI口癖
-    AI_WORDS = {
-        # 明显AI用语 (权重1.0, 强度1.8-2.0)
-        "一个ai": (1.0, 2.0),
-        "人工智能": (1.0, 2.0),
-        "我是ai": (1.0, 1.9),
-        "ai助手": (1.0, 1.8),
-        "智能助手": (1.0, 1.8),
-        # 常见AI口癖 (权重0.8-0.9, 强度1.4-1.6)
-        "作为一个": (0.9, 1.5),
-        "根据你的描述": (0.9, 1.5),
-        "上下文": (0.8, 1.4),
-        "抱歉": (0.8, 1.4),
-        "模型": (0.9, 1.5),
-        "不能保证": (0.8, 1.5),
-        "无法提供": (0.8, 1.5),
-        "无法回答": (0.8, 1.5),
-        # 可疑AI特征 (权重0.6-0.7, 强度1.1-1.3)
-        "理解": (0.7, 1.2),
-        "希望": (0.7, 1.2),
-        "请注意": (0.7, 1.2),
-        "参考": (0.6, 1.1),
-    }
-
     # 否定词表 - 用于降低可信度
     NEGATION_WORDS = {
         "不",
@@ -208,6 +222,118 @@ class Sentiment:
 
     # 反问词表 - 可能改变语义
     RHETORICAL_WORDS = {"难道", "何必", "怎么可以", "怎么可能", "哪能", "岂能", "谁还"}
+    QUESTION_CUES = (
+        "请问",
+        "求教",
+        "求助",
+        "怎么",
+        "如何",
+        "为啥",
+        "为什么",
+        "啥意思",
+        "什么",
+        "哪",
+        "吗",
+        "么",
+        "嘛",
+        "呢",
+        "有没有",
+        "能不能",
+        "可不可以",
+        "谁知道",
+        "谁懂",
+    )
+    BORED_WAKE_CUES = (
+        "无聊",
+        "好无聊",
+        "太无聊",
+        "好闲",
+        "寂寞",
+        "冷清",
+        "冷场",
+        "死群",
+        "没人",
+        "求聊天",
+        "有人吗",
+        "在吗",
+        "滴滴",
+        "打发时间",
+        "没事做",
+        "闷",
+        "闷死了",
+        "好没劲",
+        "真没意思",
+    )
+    ASK_STRONG_CUES = (
+        "请问",
+        "求教",
+        "求助",
+        "怎么",
+        "如何",
+        "为什么",
+        "啥意思",
+        "什么意思",
+    )
+    SHUT_IMPERATIVE_CUES = (
+        "你闭嘴",
+        "给我闭嘴",
+        "闭嘴",
+        "住口",
+        "安静",
+        "安静点",
+        "别说话",
+        "别吵",
+        "别出声",
+        "别嚷嚷",
+        "少说点",
+        "少说话",
+        "小点声",
+    )
+    SHUT_REPORTING_CUES = (
+        "让我闭嘴",
+        "叫我闭嘴",
+        "让我住口",
+        "说我闭嘴",
+        "说我话多",
+        "不是让你闭嘴",
+        "并不是让你闭嘴",
+        "我闭嘴",
+        "那我闭嘴",
+        "我先闭嘴",
+        "我不说了",
+        "我不说话了",
+        "闭嘴了",
+    )
+    INSULT_DIRECT_CUES = (
+        "你这",
+        "你个",
+        "你是",
+        "你真",
+        "你也配",
+        "给我滚",
+        "滚开",
+        "滚蛋",
+    )
+    INSULT_DISCOURSE_CUES = (
+        "别骂人",
+        "不要骂人",
+        "别骂",
+        "不要骂",
+        "别喷",
+        "不要喷",
+        "文明点",
+    )
+    INSULT_REPORTING_CUES = (
+        "他说",
+        "她说",
+        "他说我",
+        "她说我",
+        "说我",
+        "骂我",
+        "被骂",
+        "有人骂",
+        "刚刚骂",
+    )
 
     @classmethod
     async def _seg(cls, text: str) -> list:
@@ -227,38 +353,93 @@ class Sentiment:
         return words
 
     @classmethod
-    def _calculate_confidence(cls, words: list, keyword_dict: dict) -> float:
+    def _normalize_text(cls, text: str) -> str:
+        s = str(text or "").lower()
+        s = re.sub(r"\s+", " ", s).strip()
+        return s
+
+    @classmethod
+    def _keyword_text_fallback_pos(cls, text: str, keyword: str) -> int:
+        """分词未命中时的原文短语兜底匹配位置。"""
+        kw = str(keyword or "").strip().lower()
+        if not kw:
+            return -1
+
+        # 单字词不做原文兜底，避免大量误命中（如“吗”“啥”）。
+        if len(kw) <= 1:
+            return -1
+
+        # 英文/数字关键词使用词边界匹配，避免子串误命中。
+        if re.fullmatch(r"[a-z0-9 ]+", kw):
+            pattern = rf"(?<![a-z0-9]){re.escape(kw)}(?![a-z0-9])"
+            m = re.search(pattern, text)
+            return m.start() if m else -1
+
+        return text.find(kw)
+
+    @classmethod
+    def _has_negation_near_phrase(cls, text: str, phrase_pos: int) -> bool:
+        if phrase_pos < 0:
+            return False
+        # 取短窗口，近似 token 级“前3词”效果。
+        left = text[max(0, phrase_pos - 8) : phrase_pos]
+        return any(neg in left for neg in cls.NEGATION_WORDS)
+
+    @classmethod
+    def _calculate_confidence(cls, words: list, keyword_dict: dict, raw_text: str = "") -> float:
         """计算语义可信度"""
-        # 1. 基础匹配分数
+        norm_text = cls._normalize_text(raw_text)
+
+        # 1) 构建 token 索引，确保每个关键词只计一次
+        token_index: dict[str, int] = {}
+        for i, w in enumerate(words):
+            if w not in token_index:
+                token_index[w] = i
+
+        # 2) 基础匹配分数
         base_score = 0
-        matched_keywords = []
+        matched_keywords: list[str] = []
 
-        # 检查反问表达
-        has_rhetorical = any(r_word in words for r_word in cls.RHETORICAL_WORDS)
+        # 反问表达：token 或原文任一命中即视为存在
+        has_rhetorical = any(r_word in token_index for r_word in cls.RHETORICAL_WORDS) or any(
+            r_word in norm_text for r_word in cls.RHETORICAL_WORDS
+        )
 
-        for i, word in enumerate(words):
-            if word in keyword_dict:
-                weight, intensity = keyword_dict[word]
+        for keyword, (weight, intensity) in keyword_dict.items():
+            matched = False
+            has_negation = False
 
-                # 检查否定词
+            # A. 优先 token 精确命中
+            if keyword in token_index:
+                matched = True
+                kw_idx = token_index[keyword]
                 has_negation = any(
-                    neg_word in words[max(0, i - 3) : i]
+                    neg_word in words[max(0, kw_idx - 3) : kw_idx]
                     for neg_word in cls.NEGATION_WORDS
                 )
+            else:
+                # B. 分词未命中时，走原文短语兜底
+                phrase_pos = cls._keyword_text_fallback_pos(norm_text, keyword)
+                if phrase_pos >= 0:
+                    matched = True
+                    has_negation = cls._has_negation_near_phrase(norm_text, phrase_pos)
 
-                # 否定词降低权重
-                if has_negation:
-                    weight *= 0.3
-                    intensity *= 0.5
-                # 反问句可能反转语义
-                elif has_rhetorical:
-                    weight *= 0.7
-                    intensity *= 0.8
+            if not matched:
+                continue
 
-                base_score += weight * intensity
-                matched_keywords.append(word)
+            # 否定词降低权重
+            if has_negation:
+                weight *= 0.3
+                intensity *= 0.5
+            # 反问句可能反转语义
+            elif has_rhetorical:
+                weight *= 0.7
+                intensity *= 0.8
 
-        # 2. 上下文增强分数
+            base_score += weight * intensity
+            matched_keywords.append(keyword)
+
+        # 3) 上下文增强分数
         context_score = 0
         if matched_keywords:
             # 关键词密度增强
@@ -269,44 +450,110 @@ class Sentiment:
             if len(matched_keywords) > 1:
                 context_score += min(1.0, (len(matched_keywords) - 1) * 0.4)
 
-        # 3. 总分数计算
+        # 4) 总分数计算
         total_score = base_score + context_score
 
-        # 4. 应用Sigmoid函数转换为概率值
+        # 5) 应用 Sigmoid 函数转换为概率值
         confidence = 1 / (1 + math.exp(-4 * (total_score - 1.5)))
 
-        # 5. 上限控制
+        # 6) 上限控制
         return min(0.99, confidence)
+
+    @classmethod
+    def is_question_like_message(cls, text: str) -> bool:
+        """答疑唤醒前置门槛：先判断是否像提问，再进入 ask 评分。"""
+        s = str(text or "").strip().lower()
+        if not s:
+            return False
+
+        if "?" in s or "？" in s:
+            return True
+
+        return any(cue in s for cue in cls.QUESTION_CUES)
+
+    @classmethod
+    def is_bored_like_message(cls, text: str) -> bool:
+        """无聊唤醒前置门槛：过滤明显非无聊语境，减少误唤醒。"""
+        s = str(text or "").strip().lower()
+        if not s:
+            return False
+
+        if len(s) > 30 and not any(cue in s for cue in ("无聊", "寂寞", "冷清", "冷场", "死群", "好闲")):
+            return False
+
+        if cls.is_question_like_message(s) and any(cue in s for cue in cls.ASK_STRONG_CUES):
+            return False
+
+        return any(cue in s for cue in cls.BORED_WAKE_CUES)
+
+    @classmethod
+    def _shut_intent_multiplier(cls, text: str) -> float:
+        """闭嘴语境倍率：命令语气增强，转述/自述降权。"""
+        s = str(text or "").strip().lower()
+        if not s:
+            return 1.0
+
+        multiplier = 1.0
+        if any(cue in s for cue in cls.SHUT_REPORTING_CUES):
+            multiplier *= 0.45
+        elif any(cue in s for cue in cls.SHUT_IMPERATIVE_CUES):
+            multiplier *= 1.08
+
+        return min(1.2, max(0.2, multiplier))
+
+    @classmethod
+    def _insult_intent_multiplier(cls, text: str) -> float:
+        """辱骂语境倍率：直接攻击增强，劝阻/转述降权。"""
+        s = str(text or "").strip().lower()
+        if not s:
+            return 1.0
+
+        multiplier = 1.0
+        if any(cue in s for cue in cls.INSULT_DISCOURSE_CUES):
+            multiplier *= 0.45
+        elif any(cue in s for cue in cls.INSULT_REPORTING_CUES):
+            multiplier *= 0.65
+
+        if any(cue in s for cue in cls.INSULT_DIRECT_CUES):
+            multiplier *= 1.10
+
+        return min(1.25, max(0.2, multiplier))
 
     # 对外接口
     @classmethod
     async def shut(cls, text: str) -> float:
         """判断是否要闭嘴"""
         words = await cls._seg(text)
-        return cls._calculate_confidence(words, cls.SHUT_WORDS)
+        score = cls._calculate_confidence(words, cls.SHUT_WORDS, raw_text=text)
+        if score <= 0:
+            return score
+
+        score *= cls._shut_intent_multiplier(text)
+        return min(0.99, max(0.0, score))
 
     @classmethod
     async def insult(cls, text: str) -> float:
         """判断是否辱骂"""
         words = await cls._seg(text)
-        return cls._calculate_confidence(words, cls.INSULT_WORDS)
+        score = cls._calculate_confidence(words, cls.INSULT_WORDS, raw_text=text)
+        if score <= 0:
+            return score
+
+        score *= cls._insult_intent_multiplier(text)
+        return min(0.99, max(0.0, score))
 
     @classmethod
     async def bored(cls, text: str) -> float:
         """判断是否无聊"""
+        if not cls.is_bored_like_message(text):
+            return 0.0
         words = await cls._seg(text)
-        return cls._calculate_confidence(words, cls.BORED_WORDS)
+        return cls._calculate_confidence(words, cls.BORED_WORDS, raw_text=text)
 
     @classmethod
     async def ask(cls, text: str) -> float:
         """判断是否疑惑"""
+        if not cls.is_question_like_message(text):
+            return 0.0
         words = await cls._seg(text)
-        return cls._calculate_confidence(words, cls.ASK_WORDS)
-
-    @classmethod
-    async def is_ai(cls, text: str) -> float:
-        """
-        判断是否为AI口吻
-        """
-        words = await cls._seg(text)
-        return cls._calculate_confidence(words, cls.AI_WORDS)
+        return cls._calculate_confidence(words, cls.ASK_WORDS, raw_text=text)

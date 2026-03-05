@@ -87,37 +87,43 @@
                 "description": "相关性唤醒阈值",
                 "hint": "当前消息与上文bot的消息相关性超过阈值时，唤醒bot。设为 0 时关闭检测。",
                 "type": "float",
-                "default": 0.71
+                "default": 0.68
             },
             "ask_wake": {
                 "description": "答疑唤醒阈值",
                 "hint": "当群里有人问专业性问题时，唤醒bot。设为 0 时关闭检测。",
                 "type": "float",
-                "default": 0.88
+                "default": 0.78
+            },
+            "bored_wake": {
+                "description": "无聊唤醒阈值",
+                "hint": "当群里出现无聊/冷场/求聊天等表达时，唤醒bot。设为 0 时关闭检测。",
+                "type": "float",
+                "default": 0.74
             },
             "shutup": {
                 "description": "闭嘴检测阈值",
                 "hint": "有人感觉bot太多话时，bot自动闭嘴一段时间。设为 0 时关闭检测。",
                 "type": "float",
-                "default": 0.69
+                "default": 0.72
             },
             "insult": {
                 "description": "辱骂检测阈值",
                 "hint": "有人辱骂bot时，bot自动沉默一段时间。设为 0 时关闭检测。",
                 "type": "float",
-                "default": 0.69
+                "default": 0.75
             },
             "silence_multiple": {
                 "description": "沉默时间倍数",
                 "hint": "触发bot沉默时的阈值（0~1） * 沉默时间倍数 = 沉默时间。",
                 "type": "float",
-                "default": 500
+                "default": 300
             },
             "prob_wake": {
                 "description": "兜底唤醒概率",
                 "hint": "上述所有唤醒机制都没能唤醒bot时，最后会按照此概率尝试唤醒bot。",
                 "type": "float",
-                "default": 0.0005
+                "default": 0.0002
             },
             "wake_forbidden_words": {
                 "description": "屏蔽唤醒规则",

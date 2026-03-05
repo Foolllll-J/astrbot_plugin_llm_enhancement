@@ -176,11 +176,22 @@ class LLMEnhancement(Star):
         return max(10, min(600, value))
 
     def _is_command_trigger_event(self, event: AstrMessageEvent) -> bool:
-        handlers = event.get_extra("activated_handlers", default=[]) or []
-        for handler in handlers:
-            for event_filter in getattr(handler, "event_filters", []) or []:
-                if event_filter.__class__.__name__ in {"CommandFilter", "CommandGroupFilter"}:
-                    return True
+        handlers_parsed_params = event.get_extra("handlers_parsed_params", default={}) or {}
+        if not isinstance(handlers_parsed_params, dict) or not handlers_parsed_params:
+            return False
+
+        activated_handlers = event.get_extra("activated_handlers", default=[]) or []
+        activated_full_names = {
+            str(getattr(h, "handler_full_name", "") or "").strip()
+            for h in activated_handlers
+            if str(getattr(h, "handler_full_name", "") or "").strip()
+        }
+        if not activated_full_names:
+            return bool(handlers_parsed_params)
+
+        for full_name in handlers_parsed_params.keys():
+            if str(full_name or "").strip() in activated_full_names:
+                return True
         return False
 
     def _build_recall_key(self, umo: str, msg_id: str) -> str:
@@ -332,6 +343,7 @@ class LLMEnhancement(Star):
         msg: str = event.message_str.strip() if event.message_str else ""
         
         g = StateManager.get_group(gid or f"private_{uid}")
+        command_trigger_event = self._is_command_trigger_event(event)
 
         # 1. 全局屏蔽检查
         if uid == bid:
@@ -342,7 +354,7 @@ class LLMEnhancement(Star):
         if blacklist_level == "all_messages":
             if await self.blacklist.intercept_event(event):
                 return
-        elif blacklist_level == "command_and_llm" and self._is_command_trigger_event(event):
+        elif blacklist_level == "command_and_llm" and command_trigger_event:
             if await self.blacklist.intercept_event(event):
                 return
 
@@ -492,7 +504,8 @@ class LLMEnhancement(Star):
         if gid and not wake:
             relevant_wake = self._get_cfg("relevant_wake")
             if relevant_wake:
-                if bmsgs := await get_history_messages(self.context, event, count=5):
+                relevant_ctx_count = self.similarity.context_count_for_query(msg)
+                if bmsgs := await get_history_messages(self.context, event, count=relevant_ctx_count):
                     simi = await self.similarity.similarity(gid, msg, bmsgs)
                     if simi >= relevant_wake:
                         wake = True
@@ -502,9 +515,19 @@ class LLMEnhancement(Star):
         if gid and not wake:
             ask_wake = self._get_cfg("ask_wake")
             if ask_wake:  
-                if (await self.sent.ask(msg)) >= ask_wake:
+                ask_score = await self.sent.ask(msg)
+                if ask_score >= ask_wake:
                     wake = True
                     reason = "答疑唤醒"
+
+        # 无聊唤醒 (仅群聊)
+        if gid and not wake:
+            bored_wake = self._get_cfg("bored_wake")
+            if bored_wake:
+                bored_score = await self.sent.bored(msg)
+                if bored_score >= bored_wake:
+                    wake = True
+                    reason = "无聊唤醒"
 
         # 概率唤醒 (仅群聊)
         if gid and not wake:
@@ -514,7 +537,7 @@ class LLMEnhancement(Star):
                     wake = True
                     reason = "概率唤醒"
 
-        if dynamic_merge_mode and (not force_dynamic_followup):
+        if dynamic_merge_mode and (not force_dynamic_followup) and (not command_trigger_event):
             target_uid = select_dynamic_owner_uid(
                 own_inflight_seq=member.dynamic_inflight_seq,
                 dynamic_owner_uid=g.dynamic_owner_uid,
@@ -537,6 +560,11 @@ class LLMEnhancement(Star):
                             f"inflight_seq={inflight_seq}, msg_id={str(dynamic_snap.get('msg_id') or 'unknown')}, "
                             f"require_wake={followup_require_wake}"
                         )
+        elif dynamic_merge_mode and command_trigger_event and member.dynamic_inflight_seq > 0:
+            logger.debug(
+                "[LLMEnhancement] 跳过命令消息的动态软重算，保留正在进行中的 LLM 响应："
+                f"group={gid or 'private'}, uid={uid}, msg={msg[:50]}, inflight_seq={member.dynamic_inflight_seq}"
+            )
 
         # 违禁词检查
         if (not force_dynamic_followup) and (not event.is_admin()):
@@ -554,14 +582,20 @@ class LLMEnhancement(Star):
             logger.debug(f"{log_prefix}用户({uid}) {reason}: {msg[:50]}")
             merge_delay = float(self._get_cfg("merge_delay", 10.0) or 10.0)
             keep_sec = max(merge_delay * 6, 60.0)
-            snap = {}
-            async with member.lock:
-                prune_member_msg_cache(member, keep_sec=keep_sec)
-                snap = build_event_snapshot(event, gid, uid)
-                ensure_snapshot_merge_key(snap)
-                upsert_recent_wake_snapshot(member, snap)
-                if dynamic_merge_mode and dynamic_state_uid is None:
-                    upsert_dynamic_unresolved_snapshot(member, snap)
+            if command_trigger_event:
+                logger.debug(
+                    "[LLMEnhancement] 命令触发消息跳过合并缓存入池："
+                    f"group={gid or 'private'}, uid={uid}, msg={msg[:50]}"
+                )
+            else:
+                snap = {}
+                async with member.lock:
+                    prune_member_msg_cache(member, keep_sec=keep_sec)
+                    snap = build_event_snapshot(event, gid, uid)
+                    ensure_snapshot_merge_key(snap)
+                    upsert_recent_wake_snapshot(member, snap)
+                    if dynamic_merge_mode and dynamic_state_uid is None:
+                        upsert_dynamic_unresolved_snapshot(member, snap)
 
     # ==================== 消息合并处理 ====================
 
@@ -1788,6 +1822,7 @@ class LLMEnhancement(Star):
                     )
                     clear_pending_msg_ids(g, member)
                     member.cancel_merge = False
+                    event.set_extra("_llme_pending_last_response_update", False)
                     event.stop_event()
                     return
 
@@ -1799,7 +1834,8 @@ class LLMEnhancement(Star):
                 )
                 member.cancel_merge = False
                 clear_pending_msg_ids(g, member)
-                event.stop_event() # 拦截响应
+                event.set_extra("_llme_pending_last_response_update", False)
+                event.stop_event()
                 return
 
             event.set_extra("_llme_pending_last_response_update", True)
@@ -1847,4 +1883,3 @@ class LLMEnhancement(Star):
     async def terminate(self):
         await self.blacklist.terminate()
         logger.info("[LLMEnhancement] 插件已终止")
-

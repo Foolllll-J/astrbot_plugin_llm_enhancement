@@ -1,39 +1,30 @@
-# \modules\similarity.py
-
 import asyncio
 import math
 import re
-from collections import defaultdict, deque
-from typing import Any, List, Dict, Optional
+from collections import defaultdict, deque, OrderedDict
+from typing import Any
 
 import jieba
 
 class Similarity:
     """
-    最终稳定版话题相关性检测
-    - 群号隔离
-    - TF-IDF 稳定无膨胀
-    - 内置 bot 消息预处理（去噪、去重、过滤模板）
+    相关性检测（TF-IDF + 语义降噪）
     """
 
     def __init__(
         self,
-        history_limit: int = 120,
         stopwords=None,
         bot_template_threshold: int = 2,
         early_stop: float = 0.92,
+        idf_window_docs: int = 400,
+        token_cache_size: int = 1024,
     ):
-        """
-        :param history_limit: 每个群最大历史窗口
-        :param stopwords: 停用词
-        :param bot_template_threshold: bot token 数 ≤ N 时视为模板句
-        :param early_stop: 若相似度超该值，提前返回
-        """
+        """初始化相关性计算参数。"""
         self._GROUP_DATA = defaultdict(
             lambda: {
-                "history": deque(maxlen=history_limit),
                 "idf": defaultdict(int),
                 "total_docs": 0,
+                "docs": deque(),
             }
         )
 
@@ -45,6 +36,9 @@ class Similarity:
 
         self.bot_template_threshold = bot_template_threshold
         self.early_stop = early_stop
+        self.idf_window_docs = max(50, int(idf_window_docs))
+        self.token_cache_size = max(128, int(token_cache_size))
+        self._token_cache: OrderedDict[str, list[str]] = OrderedDict()
 
     def _to_plain_text(self, msg: Any) -> str:
         """将消息（可能是字符串、列表或字典）转换为纯文本"""
@@ -62,21 +56,67 @@ class Similarity:
             return " ".join(texts)
         return str(msg)
 
-    # ---------------------------------------------------------
-    # 分词
-    # ---------------------------------------------------------
+    def _is_question_like(self, text: str) -> bool:
+        s = (text or "").strip().lower()
+        if not s:
+            return False
+        if "?" in s or "？" in s:
+            return True
+        cues = ("请问", "求教", "求助", "怎么", "如何", "为什么", "啥意思", "什么", "吗", "呢")
+        return any(c in s for c in cues)
+
+    def _has_min_semantic_content(self, text: str, tokens: list[str]) -> bool:
+        """最小语义门槛：过滤过短/过空泛消息，降低相关性误唤醒。"""
+        if len(tokens) >= 2:
+            return True
+
+        # 单 token 时，要求至少有 3 个连续中文，避免“在吗/啊/嗯”这类空泛触发
+        zh_spans = re.findall(r"[\u4e00-\u9fa5]{3,}", text)
+        if zh_spans:
+            return True
+        return False
+
+    def _query_relevance_multiplier(self, text: str) -> float:
+        """查询文本的相关性倍率：短句与问句轻微降权，避免与 ask_wake 抢触发。"""
+        s = (text or "").strip().lower()
+        if not s:
+            return 1.0
+
+        multiplier = 1.0
+        if len(s) <= 2:
+            multiplier *= 0.60
+        elif len(s) <= 4:
+            multiplier *= 0.82
+
+        if self._is_question_like(s):
+            multiplier *= 0.90
+
+        return min(1.0, max(0.2, multiplier))
+
     async def _tokenize(self, text: Any):
         text = self._to_plain_text(text)
         text = re.sub(r"[^\w\u4e00-\u9fa5]", " ", text)
-        if len(text) > 500:
-            tokens = await asyncio.to_thread(jieba.lcut, text)
-        else:
-            tokens = jieba.lcut(text)
-        return [t for t in tokens if t not in self.stopwords and t.strip()]
+        key = text.strip()
+        if not key:
+            return []
 
-    # ---------------------------------------------------------
-    # 噪音检测（表情、纯符号、纯引用等）
-    # ---------------------------------------------------------
+        cached = self._token_cache.get(key)
+        if cached is not None:
+            self._token_cache.move_to_end(key, last=True)
+            return cached
+
+        if len(key) > 500:
+            tokens = await asyncio.to_thread(jieba.lcut, key)
+        else:
+            tokens = jieba.lcut(key)
+        filtered = [t for t in tokens if t not in self.stopwords and t.strip()]
+
+        self._token_cache[key] = filtered
+        self._token_cache.move_to_end(key, last=True)
+        if len(self._token_cache) > self.token_cache_size:
+            self._token_cache.popitem(last=False)
+        return filtered
+
     def _is_noise_msg(self, text: Any) -> bool:
         s = self._to_plain_text(text).strip()
 
@@ -98,9 +138,6 @@ class Similarity:
 
         return False
 
-    # ---------------------------------------------------------
-    # bot 消息预处理
-    # ---------------------------------------------------------
     async def _preprocess_bot_msgs(self, msgs: list) -> list[str]:
         cleaned = []
         seen = set()
@@ -129,11 +166,19 @@ class Similarity:
 
         return cleaned
 
-    # ---------------------------------------------------------
-    # TF-IDF 构建
-    # ---------------------------------------------------------
     def _update_idf(self, group_id: str, tokens: set):
         data = self._GROUP_DATA[group_id]
+        docs = data["docs"]  # type: ignore
+
+        while len(docs) >= self.idf_window_docs:
+            old_tokens = docs.popleft()
+            for t in old_tokens:
+                data["idf"][t] -= 1  # type: ignore
+                if data["idf"][t] <= 0:  # type: ignore
+                    del data["idf"][t]  # type: ignore
+            data["total_docs"] = max(0, data["total_docs"] - 1)  # type: ignore
+
+        docs.append(tokens)
         for t in tokens:
             data["idf"][t] += 1 # type: ignore
         data["total_docs"] += 1  # type: ignore
@@ -153,9 +198,6 @@ class Similarity:
 
         return vec
 
-    # ---------------------------------------------------------
-    # Cosine
-    # ---------------------------------------------------------
     def _cosine(self, v1, v2):
         if not v1 or not v2:
             return 0.0
@@ -169,9 +211,16 @@ class Similarity:
 
         return dot / (norm1 * norm2)
 
-    # ---------------------------------------------------------
-    # 主接口
-    # ---------------------------------------------------------
+    def context_count_for_query(self, user_msg: str) -> int:
+        """根据当前消息长度动态选择相关性上下文条数。"""
+        s = self._to_plain_text(user_msg)
+        semantic_len = len(re.sub(r"\s+", "", s))
+        if semantic_len <= 8:
+            return 3
+        if semantic_len >= 25:
+            return 7
+        return 5
+
     async def similarity(
         self,
         group_id: str,
@@ -182,15 +231,17 @@ class Similarity:
         """
         计算用户消息与一组 bot 消息的最大相似度
         """
+        raw_user = self._to_plain_text(user_msg).strip()
+        if self._is_noise_msg(raw_user):
+            return 0.0
+
         # 分词
-        user_tokens = await self._tokenize(user_msg)
-        if not user_tokens:
+        user_tokens = await self._tokenize(raw_user)
+        if (not user_tokens) or (not self._has_min_semantic_content(raw_user, user_tokens)):
             return 0.0
 
         # 更新历史（可关闭）
         if update_history:
-            # entry = " ".join(user_tokens)
-            # self._GROUP_DATA[group_id]["history"].append(entry)  # type: ignore
             self._update_idf(group_id, set(user_tokens))
 
         # 用户向量
@@ -200,12 +251,15 @@ class Similarity:
         bot_list = (await self._preprocess_bot_msgs(bot_msgs))[::-1]
 
         best = 0.0
-        for bm in bot_list:
+        for idx, bm in enumerate(bot_list):
             btokens = await self._tokenize(bm)
             bvec = self._tfidf_vector(group_id, btokens)
             sim = self._cosine(user_vec, bvec)
-            if sim > best:
-                best = sim
+            # 最近消息权重更高，降低被旧上下文“误相关”唤醒的概率
+            recency_weight = max(0.75, 1.0 - idx * 0.04)
+            adjusted = sim * recency_weight
+            if adjusted > best:
+                best = adjusted
             if best >= self.early_stop:
                 break
-        return best
+        return best * self._query_relevance_multiplier(raw_user)

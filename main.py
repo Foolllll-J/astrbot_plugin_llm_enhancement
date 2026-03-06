@@ -55,7 +55,7 @@ from .modules.runtime_helpers import (
 )
 from .modules.wake_logic import (
     evaluate_wake_extend,
-    apply_post_wake_continue_gate,
+    apply_post_wake_judge_gate,
     detect_wake_media_components,
     normalize_wake_trigger_message,
     prepare_empty_mention_context,
@@ -504,7 +504,13 @@ class LLMEnhancement(Star):
                 group_state=g,
                 member=member,
                 get_cfg=self._get_cfg,
-                get_history_msg=lambda ev, count: get_history_messages(self.context, ev, count=count),
+                get_history_msg=lambda ev, count: get_history_messages(
+                    self.context,
+                    ev,
+                    role=None,
+                    count=count,
+                    with_role_prefix=True,
+                ),
                 similarity_fn=self.similarity.similarity,
                 find_provider=lambda provider_id: resolve_provider(self.context, provider_id),
             )
@@ -548,7 +554,7 @@ class LLMEnhancement(Star):
                     wake = True
                     reason = "概率唤醒"
 
-        wake, continue_detail = await apply_post_wake_continue_gate(
+        wake, wake_judge_detail = await apply_post_wake_judge_gate(
             event=event,
             msg=msg,
             gid=gid,
@@ -558,17 +564,23 @@ class LLMEnhancement(Star):
             direct_wake=direct_wake,
             force_dynamic_followup=force_dynamic_followup,
             get_cfg=self._get_cfg,
-            get_history_msg=lambda ev, count: get_history_messages(self.context, ev, count=count),
+            get_history_msg=lambda ev, count: get_history_messages(
+                self.context,
+                ev,
+                role=None,
+                count=count,
+                with_role_prefix=True,
+            ),
             find_provider=lambda provider_id: resolve_provider(self.context, provider_id),
         )
-        if continue_detail.startswith("model:") or continue_detail.startswith("fallback_allow:"):
+        if wake_judge_detail.startswith("model:") or wake_judge_detail.startswith("fallback_allow:"):
             logger.debug(
-                "[LLMEnhancement] 唤醒后继续响应判定："
-                f"group={gid or 'private'}, uid={uid}, reason={reason}, detail={continue_detail}, wake={wake}"
+                "[LLMEnhancement] 唤醒判定："
+                f"group={gid or 'private'}, uid={uid}, reason={reason}, detail={wake_judge_detail}, wake={wake}"
             )
         if direct_wake and (not wake):
-            if continue_detail.startswith("model:F"):
-                logger.info("[LLMEnhancement] 继续响应判定为F，已跳过本次回复。")
+            if wake_judge_detail.startswith("model:F"):
+                logger.info("[LLMEnhancement] 唤醒判定结果=F，已跳过本次回复。")
             event.is_at_or_wake_command = False
             return
 

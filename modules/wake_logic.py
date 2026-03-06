@@ -1,4 +1,5 @@
 import re
+from datetime import datetime
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
 from astrbot.api import logger
@@ -9,6 +10,34 @@ from .state_manager import GroupState, MemberState
 
 _MENTION_WAKE_REGEX_CACHE: dict[str, re.Pattern[str]] = {}
 _MENTION_WAKE_REGEX_INVALID: set[str] = set()
+_WAKE_JUDGE_PROMPT_DEFAULT = """你是群聊“唤醒判定器”。请判断机器人是否应该响应这条显式唤醒请求。
+
+[当前时间]
+{time}
+
+[用户ID]
+{user_id}
+
+[用户名]
+{user_name}
+
+[群组ID]
+{group_id}
+
+[最近上下文]
+{history}
+
+[当前消息]
+{message}
+
+[判定规则]
+1) 用户明确表示“别回复/不用回/闭嘴/停下”等，输出 F。
+2) 当前消息仅为收尾确认（如“嗯/好/知道了/收到/晚安/拜拜/谢谢”）且没有新问题或新任务，输出 F。
+3) 含有新的问题、任务、追问，或明确要求继续，输出 T。
+4) 不确定时优先输出 T，避免漏回关键请求。
+
+[输出格式]
+只能输出一个大写字母：T 或 F。"""
 
 
 def _parse_regex_flags(flags_text: str) -> int:
@@ -418,7 +447,7 @@ async def wake_extend_llm_decision(
         logger.warning(f"[LLMEnhancement] 未找到唤醒延长判定 Provider: {provider_id}")
         return None
 
-    history_text = "\n".join([f"{idx + 1}. {h}" for idx, h in enumerate(history_msgs[-3:])]) or "<empty>"
+    history_text = "\n".join([f"{idx + 1}. {h}" for idx, h in enumerate(history_msgs[-5:])]) or "<empty>"
     prompt = (
         "请判断当前消息是否与上文足够相关，是否需要继续响应。\n"
         f"相关性阈值参考: {threshold:.2f}（0~1，越高越严格）\n"
@@ -450,37 +479,37 @@ async def wake_extend_llm_decision(
         return None
 
 
-async def wake_continue_llm_decision(
+async def wake_judge_llm_decision(
     event: AstrMessageEvent,
     msg: str,
     history_msgs: List[str],
-    wake_reason: str,
     provider_id: str,
+    prompt_template: str,
     find_provider: Callable[[str], Any],
 ) -> Tuple[Optional[bool], str]:
-    """使用专门提示词判定“本次是否继续回复”。"""
+    """使用可配置提示词模板执行唤醒判定。"""
     provider = find_provider(provider_id)
     if not provider:
-        logger.warning(f"[LLMEnhancement] 未找到继续回复判定 Provider: {provider_id}")
+        logger.warning(f"[LLMEnhancement] 未找到唤醒判定 Provider: {provider_id}")
         return None, "provider_not_found"
 
+    sender_id = str(event.get_sender_id() or "")
+    sender_name = str(event.get_sender_name() or sender_id or "unknown")
+    group_id = str(event.get_group_id() or "") or "private"
+    now_text = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     history_text = "\n".join([f"{idx + 1}. {h}" for idx, h in enumerate(history_msgs[-5:])]) or "<empty>"
-    prompt = (
-        "你是群聊“是否继续回复”判定器。请根据上下文与当前消息，判断机器人这一次是否应该回复。\n"
-        "目标是模拟真人对话节奏，避免机械地每条都回。\n\n"
-        "[判定规则]\n"
-        "1) 明确要求机器人闭嘴/别回/不用回/停下 -> 可考虑返回 F。\n"
-        "2) 当前消息是收尾（如仅“嗯/好/知道了/ok/收到/晚安/拜拜/谢谢”等），且没有新的问题或新任务 -> 可考虑返回 F。\n"
-        "3) 当前消息包含新的问题、请求、任务、追问，或明确点名让机器人继续 -> 返回 T。\n"
-        "4) 若不确定，优先返回 T（宁可少量误回，避免漏回关键请求）。\n\n"
-        "[输出格式]\n"
-        "只能输出一个大写字母：T 或 F。禁止输出其他内容。\n\n"
-        f"[唤醒原因]\n{wake_reason}\n\n"
-        f"[最近对话]\n{history_text}\n\n"
-        f"[当前消息]\n{msg}"
-    )
+
+    placeholders: Dict[str, str] = {
+        "time": now_text,
+        "user_id": sender_id,
+        "user_name": sender_name,
+        "group_id": group_id,
+        "history": history_text,
+        "message": str(msg or ""),
+    }
+    prompt = _render_prompt_template(prompt_template, placeholders)
     system_prompt = (
-        "你是继续回复判定器。"
+        "你是唤醒判定器。"
         "严格只输出一个大写字母：T 或 F。"
         "不要输出解释、标点、换行或其他字符。"
     )
@@ -497,11 +526,32 @@ async def wake_continue_llm_decision(
             return True, "model:T"
         if text.startswith("F"):
             return False, "model:F"
-        logger.warning(f"[LLMEnhancement] 继续回复判定返回无效结果: {text[:20]}")
+        logger.warning(f"[LLMEnhancement] 唤醒判定返回无效结果: {text[:20]}")
         return None, "invalid_output"
     except Exception as e:
-        logger.warning(f"[LLMEnhancement] 继续回复判定失败: {e}")
+        logger.warning(f"[LLMEnhancement] 唤醒判定失败: {e}")
         return None, "model_error"
+
+
+
+def _get_wake_judge_provider_id(get_cfg: Callable[[str, Any], Any]) -> str:
+    return str(get_cfg("wake_judge_provider_id", "") or "").strip()
+
+def _get_wake_judge_prompt_template(get_cfg: Callable[[str, Any], Any]) -> str:
+    template = str(get_cfg("wake_judge_prompt", "") or "").strip()
+    if template:
+        return template
+    return _WAKE_JUDGE_PROMPT_DEFAULT
+
+def _render_prompt_template(template: str, values: Dict[str, str]) -> str:
+    def repl(match: re.Match[str]) -> str:
+        key = match.group(1)
+        if key in values:
+            return str(values.get(key, ""))
+        return match.group(0)
+
+    return re.sub(r"\{([a-zA-Z_][a-zA-Z0-9_]*)\}", repl, template)
+
 
 
 def should_apply_post_wake_gate(
@@ -511,50 +561,46 @@ def should_apply_post_wake_gate(
     force_dynamic_followup: bool = False,
 ) -> bool:
     """
-    是否执行“唤醒后继续响应判定”。
+    是否执行“唤醒判定”流程。
     仅作用于普通显式唤醒（@ / 唤醒前缀），不影响插件主动处理的特殊唤醒场景。
     """
     if command_trigger_event or (not direct_wake) or force_dynamic_followup:
         return False
 
     reason = str(wake_reason or "")
-    # 仅普通文本显式唤醒(@ / 唤醒前缀)走继续回复判定
+    # 仅普通文本显式唤醒（@ / 唤醒前缀）走唤醒判定
     return reason == "at_or_cmd"
 
 
 def is_post_wake_gate_enabled(
     get_cfg: Callable[[str, Any], Any],
 ) -> bool:
-    """是否启用“唤醒后继续响应判定”。"""
-    provider_id = str(get_cfg("wake_continue_provider_id", "") or "").strip()
-    return bool(provider_id)
+    """是否启用“唤醒判定”。"""
+    return bool(_get_wake_judge_provider_id(get_cfg))
 
 
-async def evaluate_post_wake_continue(
+async def evaluate_post_wake_judge(
     event: AstrMessageEvent,
     msg: str,
     gid: str,
-    wake_reason: str,
     get_cfg: Callable[[str, Any], Any],
     get_history_msg: Callable[[AstrMessageEvent, int], Awaitable[List[str]]],
     find_provider: Callable[[str], Any],
 ) -> Tuple[bool, str]:
-    """
-    对“已经唤醒”的请求做一次继续响应判定。
-    返回 (allow_continue, detail)。
-    """
-    provider_id = str(get_cfg("wake_continue_provider_id", "") or "").strip()
+    """对显式唤醒请求执行唤醒判定，返回 (allow_continue, detail)。"""
+    provider_id = _get_wake_judge_provider_id(get_cfg)
     if not provider_id:
         return True, "skip:disabled"
 
-    history_count = 3
+    prompt_template = _get_wake_judge_prompt_template(get_cfg)
+    history_count = 5
     history_msgs = await get_history_msg(event, history_count)
-    llm_decision, detail = await wake_continue_llm_decision(
+    llm_decision, detail = await wake_judge_llm_decision(
         event=event,
         msg=msg,
         history_msgs=history_msgs,
-        wake_reason=wake_reason,
         provider_id=provider_id,
+        prompt_template=prompt_template,
         find_provider=find_provider,
     )
     if llm_decision is None:
@@ -562,7 +608,9 @@ async def evaluate_post_wake_continue(
     return llm_decision, detail
 
 
-async def apply_post_wake_continue_gate(
+
+
+async def apply_post_wake_judge_gate(
     event: AstrMessageEvent,
     msg: str,
     gid: str,
@@ -576,7 +624,7 @@ async def apply_post_wake_continue_gate(
     find_provider: Callable[[str], Any],
 ) -> Tuple[bool, str]:
     """
-    对已唤醒请求应用“继续响应”判定 gate。
+    对已唤醒请求应用“唤醒判定” gate。
     返回 (new_wake, detail)。
     """
     if not gid or not wake:
@@ -591,11 +639,10 @@ async def apply_post_wake_continue_gate(
     if not is_post_wake_gate_enabled(get_cfg):
         return wake, "skip:disabled"
 
-    allow_continue, detail = await evaluate_post_wake_continue(
+    allow_continue, detail = await evaluate_post_wake_judge(
         event=event,
         msg=msg,
         gid=gid,
-        wake_reason=wake_reason,
         get_cfg=get_cfg,
         get_history_msg=get_history_msg,
         find_provider=find_provider,
@@ -603,6 +650,8 @@ async def apply_post_wake_continue_gate(
     if not allow_continue:
         return False, detail
     return True, detail
+
+
 
 
 async def evaluate_wake_extend(
@@ -656,7 +705,7 @@ async def evaluate_wake_extend(
     if threshold <= 0:
         return True, "唤醒延长(阈值0)"
 
-    history_msgs = await get_history_msg(event, 3)
+    history_msgs = await get_history_msg(event, 5)
     if not history_msgs:
         return False, None
 

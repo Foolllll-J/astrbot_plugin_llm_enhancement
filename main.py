@@ -1742,6 +1742,7 @@ class LLMEnhancement(Star):
                 "bot_member_info": bot_member_injected,
                 "json": False,
                 "file": False,
+                "url": False,
                 "forward": False,
                 "video": False,
             }
@@ -1759,6 +1760,7 @@ class LLMEnhancement(Star):
             )
             injection_summary["json"] = bool(getattr(ref_result, "injected_json", False))
             injection_summary["file"] = bool(getattr(ref_result, "injected_file", False))
+            injection_summary["url"] = bool(getattr(ref_result, "injected_url", False))
             if ref_result.blocked:
                 logger.debug(
                     "[LLMEnhancement] 注入摘要: "
@@ -1766,7 +1768,7 @@ class LLMEnhancement(Star):
                     f"perception={injection_summary['perception']}, "
                     f"member_info={injection_summary['member_info']}, "
                     f"bot_member_info={injection_summary['bot_member_info']}, "
-                    f"json={injection_summary['json']}, file={injection_summary['file']}, "
+                    f"json={injection_summary['json']}, file={injection_summary['file']}, url={injection_summary['url']}, "
                     f"forward={injection_summary['forward']}, video={injection_summary['video']}, "
                     "blocked_by_reference=true"
                 )
@@ -1792,7 +1794,7 @@ class LLMEnhancement(Star):
                     f"perception={injection_summary['perception']}, "
                     f"member_info={injection_summary['member_info']}, "
                     f"bot_member_info={injection_summary['bot_member_info']}, "
-                    f"json={injection_summary['json']}, file={injection_summary['file']}, "
+                    f"json={injection_summary['json']}, file={injection_summary['file']}, url={injection_summary['url']}, "
                     f"forward={injection_summary['forward']}, video={injection_summary['video']}"
                 )
                 return
@@ -1814,7 +1816,7 @@ class LLMEnhancement(Star):
                 f"perception={injection_summary['perception']}, "
                 f"member_info={injection_summary['member_info']}, "
                 f"bot_member_info={injection_summary['bot_member_info']}, "
-                f"json={injection_summary['json']}, file={injection_summary['file']}, "
+                f"json={injection_summary['json']}, file={injection_summary['file']}, url={injection_summary['url']}, "
                 f"forward={injection_summary['forward']}, video={injection_summary['video']}"
             )
         

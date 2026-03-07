@@ -1,4 +1,5 @@
 import os
+import re
 from typing import Any, Optional
 
 import astrbot.api.message_components as Comp
@@ -9,6 +10,11 @@ try:
     import chardet
 except ImportError:
     chardet = None
+
+try:
+    from pypdf import PdfReader
+except ImportError:
+    PdfReader = None
 
 TEXT_FILE_EXTENSIONS = {
     ".txt",
@@ -47,6 +53,11 @@ TEXT_FILE_EXTENSIONS = {
     ".env",
 }
 
+PDF_FILE_EXTENSION = ".pdf"
+PDF_PARSE_MAX_PAGES = 8
+PDF_PARSE_MAX_CHARS = 20000
+FILE_INJECT_MAX_SIZE_MB_DEFAULT = 20
+
 
 def _normalize_local_path(path_or_url: str) -> str:
     candidate = str(path_or_url or "").strip()
@@ -61,9 +72,24 @@ def _normalize_local_path(path_or_url: str) -> str:
     return ""
 
 
+def _file_ext(name: str) -> str:
+    return os.path.splitext(str(name or "").lower())[1]
+
+
 def _is_text_file_name(file_name: str) -> bool:
-    ext = os.path.splitext(str(file_name or "").lower())[1]
-    return ext in TEXT_FILE_EXTENSIONS
+    return _file_ext(file_name) in TEXT_FILE_EXTENSIONS
+
+
+def _is_pdf_file_name(file_name: str) -> bool:
+    return _file_ext(file_name) == PDF_FILE_EXTENSION
+
+
+def _looks_like_pdf_file(path: str) -> bool:
+    try:
+        with open(path, "rb") as f:
+            return f.read(5) == b"%PDF-"
+    except Exception:
+        return False
 
 
 def _read_text_excerpt(path: str, max_chars: int) -> str:
@@ -90,7 +116,6 @@ def _read_text_excerpt(path: str, max_chars: int) -> str:
 
     detected_enc = ""
     detected_confidence = 0.0
-    # 1) 参考 file_checker：优先使用 chardet 探测编码
     if chardet is not None:
         try:
             detection = chardet.detect(raw)
@@ -99,7 +124,6 @@ def _read_text_excerpt(path: str, max_chars: int) -> str:
         except Exception:
             pass
 
-    # 高置信度时直接优先按探测编码解码（允许忽略个别脏字节，避免误判导致整段乱码）
     if detected_enc and detected_confidence >= 0.8:
         try:
             text = raw.decode(detected_enc, errors="ignore").replace("\x00", "").strip()
@@ -115,13 +139,11 @@ def _read_text_excerpt(path: str, max_chars: int) -> str:
         except Exception:
             pass
 
-    # 2) BOM 作为次级线索，不再强优先
     if raw.startswith(b"\xff\xfe") or raw.startswith(b"\xfe\xff"):
         _push_encoding("utf-16")
     elif raw.startswith(b"\xef\xbb\xbf"):
         _push_encoding("utf-8-sig")
 
-    # 3) 常规回退编码（不使用 latin-1，避免无意义“成功解码”导致乱码注入）
     if detected_enc:
         _push_encoding(detected_enc)
     for enc in ("utf-8-sig", "utf-8", "gb18030", "gbk", "utf-16", "utf-16-le", "utf-16-be"):
@@ -142,7 +164,6 @@ def _read_text_excerpt(path: str, max_chars: int) -> str:
             break
 
     if not text:
-        # 最后一次温和回退，避免因为个别脏字节导致整段丢失
         for enc in ("utf-8", "gb18030", "gbk"):
             try:
                 text = raw.decode(enc, errors="ignore").replace("\x00", "").strip()
@@ -167,6 +188,62 @@ def _read_text_excerpt(path: str, max_chars: int) -> str:
         f"chardet={detected_enc or 'none'}({detected_confidence:.2f})"
     )
 
+    if len(text) > safe_max:
+        return text[: max(1, safe_max - 3)] + "..."
+    return text
+
+
+def _normalize_pdf_text(raw_text: str) -> str:
+    text = str(raw_text or "").replace("\x00", "")
+    text = re.sub(r"\r\n?", "\n", text)
+    text = re.sub(r"[ \t\f\v]+", " ", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
+def _read_pdf_excerpt(path: str, max_chars: int) -> str:
+    if max_chars <= 0:
+        return ""
+    if PdfReader is None:
+        logger.debug("[LLMEnhancement] PDF 文本注入已启用，但未安装 pypdf，跳过 PDF 解析")
+        return ""
+
+    safe_max = min(max_chars, PDF_PARSE_MAX_CHARS)
+    try:
+        reader = PdfReader(path)
+    except Exception as e:
+        logger.debug(f"[LLMEnhancement] 读取 PDF 失败: file={os.path.basename(path)}, err={e}")
+        return ""
+
+    if getattr(reader, "is_encrypted", False):
+        try:
+            reader.decrypt("")
+        except Exception as e:
+            logger.debug(f"[LLMEnhancement] PDF 已加密且解密失败: file={os.path.basename(path)}, err={e}")
+            return ""
+
+    parts: list[str] = []
+    total_len = 0
+    for idx, page in enumerate(getattr(reader, "pages", []) or []):
+        if idx >= PDF_PARSE_MAX_PAGES:
+            break
+        try:
+            extracted = page.extract_text() or ""
+        except Exception:
+            extracted = ""
+
+        cleaned = _normalize_pdf_text(extracted)
+        if not cleaned:
+            continue
+
+        parts.append(cleaned)
+        total_len += len(cleaned)
+        if total_len >= safe_max * 2:
+            break
+
+    text = "\n\n".join(parts).strip()
+    if not text:
+        return ""
     if len(text) > safe_max:
         return text[: max(1, safe_max - 3)] + "..."
     return text
@@ -209,17 +286,32 @@ async def extract_file_infos_from_chain(
     event: AstrMessageEvent,
     chain: list[Any],
     max_chars: int,
+    max_file_size_mb: int = FILE_INJECT_MAX_SIZE_MB_DEFAULT,
     cleanup_paths: Optional[list[str]] = None,
 ) -> list[tuple[str, str]]:
-    """从消息链提取可读取文本文件内容，返回 [(文件名, 摘录内容)]。"""
-    if max_chars <= 0 or not isinstance(chain, list):
+    """从消息链提取可读文件内容，返回 [(文件名, 摘录内容)]。"""
+    if not isinstance(chain, list):
         return []
+
+    try:
+        max_chars = max(0, int(max_chars))
+    except (TypeError, ValueError):
+        max_chars = 0
+    try:
+        max_file_size_mb = max(0, int(max_file_size_mb))
+    except (TypeError, ValueError):
+        max_file_size_mb = FILE_INJECT_MAX_SIZE_MB_DEFAULT
+
+    if max_chars <= 0:
+        return []
+    max_file_size_bytes = max_file_size_mb * 1024 * 1024 if max_file_size_mb > 0 else 0
 
     results: list[tuple[str, str]] = []
     seen: set[str] = set()
     file_seg_count = 0
     skip_non_text = 0
     skip_path_missing = 0
+    skip_too_large = 0
     skip_empty_excerpt = 0
     skip_duplicate = 0
     error_count = 0
@@ -233,7 +325,7 @@ async def extract_file_infos_from_chain(
             if isinstance(seg, Comp.File):
                 file_seg_count += 1
                 file_name = str(getattr(seg, "name", "") or "")
-                if not _is_text_file_name(file_name):
+                if file_name and (not _is_text_file_name(file_name)) and (not _is_pdf_file_name(file_name)):
                     skip_non_text += 1
                     continue
                 download_path = await seg.get_file()
@@ -250,7 +342,7 @@ async def extract_file_infos_from_chain(
                 file_name = str(
                     data.get("name") or data.get("file_name") or data.get("file") or ""
                 ).strip()
-                if not _is_text_file_name(file_name):
+                if file_name and (not _is_text_file_name(file_name)) and (not _is_pdf_file_name(file_name)):
                     skip_non_text += 1
                     continue
 
@@ -263,7 +355,7 @@ async def extract_file_infos_from_chain(
                             file_url = await _resolve_file_url_by_id(event, file_id)
 
                     if file_url:
-                        file_comp = Comp.File(name=file_name or "file.txt", url=file_url)
+                        file_comp = Comp.File(name=file_name or "file.bin", url=file_url)
                         download_path = await file_comp.get_file()
                         local_path = _normalize_local_path(download_path)
             else:
@@ -273,17 +365,42 @@ async def extract_file_infos_from_chain(
                 skip_path_missing += 1
                 continue
 
-            excerpt = _read_text_excerpt(local_path, max_chars)
+            effective_name = str(file_name or os.path.basename(local_path) or "")
+            if max_file_size_bytes > 0:
+                try:
+                    file_size = os.path.getsize(local_path)
+                except OSError:
+                    file_size = -1
+                too_large = file_size > max_file_size_bytes
+                if too_large:
+                    skip_too_large += 1
+                    logger.debug(
+                        "[LLMEnhancement] 文件超过注入大小上限，跳过文本提取: "
+                        f"file={effective_name or os.path.basename(local_path)}, "
+                        f"size_bytes={file_size}, limit_mb={max_file_size_mb}"
+                    )
+                    continue
+
+            is_pdf = _is_pdf_file_name(effective_name) or _looks_like_pdf_file(local_path)
+
+            if is_pdf:
+                excerpt = _read_pdf_excerpt(local_path, max_chars)
+            elif _is_text_file_name(effective_name):
+                excerpt = _read_text_excerpt(local_path, max_chars)
+            else:
+                skip_non_text += 1
+                continue
+
             if not excerpt:
                 skip_empty_excerpt += 1
                 continue
 
-            key = f"{file_name}::{excerpt}"
+            key = f"{effective_name}::{excerpt}"
             if key in seen:
                 skip_duplicate += 1
                 continue
             seen.add(key)
-            results.append((file_name or os.path.basename(local_path), excerpt))
+            results.append((effective_name or os.path.basename(local_path), excerpt))
 
             if cleanup_paths is not None and download_path and os.path.exists(download_path):
                 if download_path not in cleanup_paths:
@@ -297,8 +414,9 @@ async def extract_file_infos_from_chain(
             "[LLMEnhancement] 文件文本提取结果: "
             f"segments={file_seg_count}, success={len(results)}, "
             f"skip_non_text={skip_non_text}, skip_path_missing={skip_path_missing}, "
-            f"skip_empty_excerpt={skip_empty_excerpt}, skip_duplicate={skip_duplicate}, "
-            f"errors={error_count}, max_chars={max_chars}"
+            f"skip_too_large={skip_too_large}, skip_empty_excerpt={skip_empty_excerpt}, "
+            f"skip_duplicate={skip_duplicate}, errors={error_count}, max_chars={max_chars}, "
+            f"max_file_size_mb={max_file_size_mb}"
         )
 
     return results

@@ -10,6 +10,7 @@ from astrbot.api.provider import ProviderRequest
 
 from .file_parser import extract_file_infos_from_chain
 from .json_parser import extract_json_infos_from_chain, parse_json_segment_data
+from .url_parser import extract_url_infos_from_chain
 
 try:
     from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import AiocqhttpMessageEvent
@@ -34,6 +35,7 @@ class ReferenceContextResult:
     forward_id: Optional[str] = None
     injected_json: bool = False
     injected_file: bool = False
+    injected_url: bool = False
     blocked: bool = False
 
 
@@ -130,6 +132,10 @@ async def parse_reply_context(
             file_text_inject_len = max(0, int(get_cfg("inject_file_text_length", 0) or 0))
         except (TypeError, ValueError):
             file_text_inject_len = 0
+        try:
+            file_inject_max_size_mb = max(0, int(get_cfg("inject_file_max_size_mb", 20) or 0))
+        except (TypeError, ValueError):
+            file_inject_max_size_mb = 20
 
         for segment in original_message_chain:
             if not isinstance(segment, dict):
@@ -170,12 +176,14 @@ async def parse_reply_context(
                         event=event,
                         chain=[segment],
                         max_chars=file_text_inject_len,
+                        max_file_size_mb=file_inject_max_size_mb,
                         cleanup_paths=req._cleanup_paths,
                     )
                     if not file_infos:
                         logger.debug(
                             "[LLMEnhancement] 引用文件未提取到文本摘要: "
-                            f"file={file_name or 'unknown'}, max_chars={file_text_inject_len}"
+                            f"file={file_name or 'unknown'}, max_chars={file_text_inject_len}, "
+                            f"max_file_size_mb={file_inject_max_size_mb}"
                         )
                     for fn, excerpt in file_infos[:2]:
                         quoted_file_infos.append(f"{fn}: {excerpt}")
@@ -308,6 +316,10 @@ async def process_reference_context(
             file_text_inject_len = max(0, int(get_cfg("inject_file_text_length", 0) or 0))
         except (TypeError, ValueError):
             file_text_inject_len = 0
+        try:
+            file_inject_max_size_mb = max(0, int(get_cfg("inject_file_max_size_mb", 20) or 0))
+        except (TypeError, ValueError):
+            file_inject_max_size_mb = 20
         if file_text_inject_len <= 0:
             logger.debug("[LLMEnhancement] 文件文本注入关闭: inject_file_text_length<=0")
         if file_text_inject_len > 0:
@@ -319,6 +331,7 @@ async def process_reference_context(
                     event=event,
                     chain=chain_for_file,
                     max_chars=file_text_inject_len,
+                    max_file_size_mb=file_inject_max_size_mb,
                     cleanup_paths=req._cleanup_paths,
                 )
                 if direct_file_infos:
@@ -341,7 +354,57 @@ async def process_reference_context(
                 elif any(isinstance(seg, Comp.File) or (isinstance(seg, dict) and str(seg.get('type') or '').lower() == 'file') for seg in chain_for_file):
                     logger.debug(
                         "[LLMEnhancement] 检测到文件组件，但未提取到可注入文本摘要: "
-                        f"max_chars={file_text_inject_len}"
+                        f"max_chars={file_text_inject_len}, max_file_size_mb={file_inject_max_size_mb}"
                     )
 
+
+    if bool(get_cfg("url_parse_enable", True)):
+        chain_for_url = _build_chain(event, all_components)
+        if chain_for_url or str(getattr(event, "message_str", "") or "").strip():
+            try:
+                timeout_sec = max(2, int(get_cfg("inject_url_timeout_sec", 8) or 8))
+            except (TypeError, ValueError):
+                timeout_sec = 8
+            try:
+                max_download_kb = max(32, int(get_cfg("inject_url_max_download_kb", 512) or 512))
+            except (TypeError, ValueError):
+                max_download_kb = 512
+            block_private_network = bool(get_cfg("inject_url_block_private_network", True))
+            blocked_domains_raw = get_cfg("inject_url_blocked_domains", [])
+            blocked_domains = (
+                [str(x or "").strip() for x in blocked_domains_raw if str(x or "").strip()]
+                if isinstance(blocked_domains_raw, list)
+                else []
+            )
+            try:
+                cache_ttl_sec = max(0, int(get_cfg("inject_url_cache_ttl_sec", 600) or 600))
+            except (TypeError, ValueError):
+                cache_ttl_sec = 600
+
+            url_result = await extract_url_infos_from_chain(
+                event=event,
+                chain=chain_for_url,
+                timeout_sec=timeout_sec,
+                max_download_kb=max_download_kb,
+                block_private_network=block_private_network,
+                blocked_domains=blocked_domains,
+                cache_ttl_sec=cache_ttl_sec,
+            )
+            if url_result.injected and url_result.details:
+                sender_name = event.get_sender_name() or "未知用户"
+                _append_prompt_context(
+                    req,
+                    [
+                        f"{sender_name} 发送的链接解析信息："
+                        + "；".join(str(x).strip() for x in url_result.details[:2] if str(x).strip())
+                        + "。"
+                    ],
+                )
+                result.injected_url = True
+                logger.debug(
+                    "[LLMEnhancement] 已注入当前消息 URL 摘要: "
+                    f"count={len(url_result.details[:2])}, sender={sender_name}"
+                )
+    else:
+        logger.debug("[LLMEnhancement] URL 注入关闭: url_parse_enable=false")
     return result

@@ -1,4 +1,4 @@
-{
+﻿{
     "group_whitelist": {
         "description": "群聊白名单",
         "hint": "仅在群聊白名单里的群启用本插件功能，不填表示所有群聊都启用。",
@@ -188,6 +188,12 @@
                 "type": "bool",
                 "default": true,
                 "hint": "关闭后，不再提取引用消息中的 JSON 卡片关键信息（如分享卡片标题、摘要、链接）。"
+            },
+            "url_parse_enable": {
+                "description": "启用 URL 解析注入",
+                "type": "bool",
+                "default": true,
+                "hint": "关闭后，不再抓取并注入消息中的 URL 内容摘要。"
             }
         }
     },
@@ -316,12 +322,19 @@
                 "default": true,
                 "hint": "开启后，引用消息中的文件名会注入到上下文。"
             },
+            "inject_file_max_size_mb": {
+                "description": "文件内容解析大小上限（MB）",
+                "type": "int",
+                "default": 20,
+                "minimum": 0,
+                "hint": "超过该大小的文件不会解析内容并注入；设为 0 表示不限制。"
+            },
             "inject_file_text_length": {
-                "description": "注入文件文本长度",
+                "description": "文件文本注入长度",
                 "type": "int",
                 "default": 0,
                 "minimum": 0,
-                "hint": "大于 0 时会读取可直接解析的文本文件并注入前 N 个字符；设为 0 表示关闭。"
+                "hint": "大于 0 时会读取可直接解析的文件并注入前 N 个字符；设为 0 表示关闭。"
             },
             "quote_self_file_block_prob": {
                 "description": "引用 Bot 自身文件的请求屏蔽概率",
@@ -333,6 +346,49 @@
                     "step": 0.01
                 },
                 "default": 0
+            }
+        }
+    },
+    "url_parsing": {
+        "type": "object",
+        "description": "URL 解析注入",
+        "hint": "配置 URL 抓取与安全策略。",
+        "items": {
+            "inject_url_timeout_sec": {
+                "description": "URL 抓取超时（秒）",
+                "type": "int",
+                "default": 8,
+                "minimum": 2,
+                "hint": "单个链接抓取的超时时间。"
+            },
+            "inject_url_max_download_kb": {
+                "description": "URL 下载大小上限（KB）",
+                "type": "int",
+                "default": 512,
+                "minimum": 32,
+                "hint": "单个链接最多下载的内容大小，超出将停止正文解析。"
+            },
+            "inject_url_block_private_network": {
+                "description": "拦截内网 URL",
+                "type": "bool",
+                "default": true,
+                "hint": "开启后，非 bot 管理员不允许解析内网地址。"
+            },
+            "inject_url_blocked_domains": {
+                "description": "URL 黑名单域名",
+                "type": "list",
+                "items": {
+                    "type": "string"
+                },
+                "default": [],
+                "hint": "命中黑名单域名（含子域名）时直接跳过解析。"
+            },
+            "inject_url_cache_ttl_sec": {
+                "description": "URL 解析缓存时长（秒）",
+                "type": "int",
+                "default": 600,
+                "minimum": 0,
+                "hint": "同一链接在缓存有效期内复用解析结果；设为 0 表示不缓存。"
             }
         }
     },

@@ -1,4 +1,4 @@
-﻿import json
+import json
 import time
 import random
 from typing import List, Any, Optional

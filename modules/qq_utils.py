@@ -1,3 +1,4 @@
+import base64
 import json
 import hashlib
 import secrets
@@ -891,6 +892,86 @@ def _json_success(message: str, **extra: Any) -> str:
     payload.update(extra)
     return json.dumps(payload, ensure_ascii=False, indent=2)
 
+
+async def process_user_avatar(event: AstrMessageEvent, user_id: str) -> Any:
+    """
+    获取指定 QQ 用户头像，并作为 Tool 的图片结果返回给 LLM。
+    """
+    start_time = time.time()
+    try:
+        if not IS_AIOCQHTTP or not isinstance(event, AiocqhttpMessageEvent):
+            return _json_error(f"此功能仅支持 QQ 平台 (aiocqhttp)，当前平台为 {event.get_platform_name()}")
+
+        target_user_id = str(user_id or "").strip()
+        if not target_user_id:
+            return _json_error("user_id 参数无效，请提供目标 QQ 号。")
+
+        avatar_url = f"https://q1.qlogo.cn/g?b=qq&nk={target_user_id}&s=640"
+
+        from .video_parser import download_video_to_temp
+
+        local_avatar_path = str(await download_video_to_temp(avatar_url, 5) or "").strip()
+        if not local_avatar_path:
+            logger.info(
+                "[LLMEnhancement] 头像注入失败："
+                f"uid={target_user_id}, reason=download_failed, avatar_url={avatar_url}"
+            )
+            return _json_error("头像下载失败，未能完成注入。", user_id=target_user_id)
+
+        req = getattr(event, "_provider_req", None) or getattr(event, "request", None)
+        cleanup_registered = False
+        cleanup_count = 0
+        if req is not None:
+            cleanup_paths = getattr(req, "_cleanup_paths", None)
+            if cleanup_paths is None:
+                cleanup_paths = []
+                setattr(req, "_cleanup_paths", cleanup_paths)
+            elif not isinstance(cleanup_paths, list):
+                try:
+                    cleanup_paths = [str(p).strip() for p in list(cleanup_paths) if str(p).strip()]
+                except Exception:
+                    single = str(cleanup_paths).strip()
+                    cleanup_paths = [single] if single else []
+                setattr(req, "_cleanup_paths", cleanup_paths)
+            if local_avatar_path not in cleanup_paths:
+                cleanup_paths.append(local_avatar_path)
+                cleanup_registered = True
+            cleanup_count = len(cleanup_paths)
+
+        lower_path = local_avatar_path.lower()
+        mime_type = "image/jpeg"
+        if lower_path.endswith(".png"):
+            mime_type = "image/png"
+        elif lower_path.endswith(".gif"):
+            mime_type = "image/gif"
+        elif lower_path.endswith(".webp"):
+            mime_type = "image/webp"
+
+        with open(local_avatar_path, "rb") as f:
+            avatar_bs64 = base64.b64encode(f.read()).decode("utf-8")
+
+        import mcp
+
+        elapsed = time.time() - start_time
+        logger.debug(
+            "[LLMEnhancement] 头像工具图片已准备："
+            f"uid={target_user_id}, avatar_url={avatar_url}, local_path={local_avatar_path}, "
+            f"mime_type={mime_type}, cleanup_registered={cleanup_registered}, cleanup_count={cleanup_count}, elapsed={elapsed:.2f}s"
+        )
+
+        return mcp.types.CallToolResult(
+            content=[
+                mcp.types.ImageContent(
+                    type="image",
+                    data=avatar_bs64,
+                    mimeType=mime_type,
+                )
+            ]
+        )
+    except Exception as e:
+        elapsed = time.time() - start_time
+        logger.info(f"头像注入时发生错误: {e}，耗时 {elapsed:.2f}s")
+        return _json_error("头像注入失败。", error=str(e))
 
 def _ensure_group_write_context(
     event: AstrMessageEvent,

@@ -19,6 +19,7 @@ from .modules.video_parser import (
 )
 from .modules.qq_utils import (
     process_contact_list,
+    process_user_avatar,
     send_message_logic,
     process_group_info,
     process_group_notices,
@@ -135,7 +136,8 @@ class LLMEnhancement(Star):
             data_dir=StarTools.get_data_dir("astrbot_plugin_llm_enhancement"),
             get_cfg=self._get_cfg,
         )
-        logger.info(f"[LLMEnhancement] 插件初始化完成。IS_AIOCQHTTP: {IS_AIOCQHTTP}")
+        qq_adapter_status = "可用" if IS_AIOCQHTTP else "不可用"
+        logger.info(f"[LLMEnhancement] 插件初始化完成。QQ 平台适配器（aiocqhttp）状态：{qq_adapter_status}")
 
     async def initialize(self):
         await self.blacklist.initialize()
@@ -969,7 +971,7 @@ class LLMEnhancement(Star):
         yield event.plain_result(result)
 
     @filter.llm_tool(name="get_user_avatar")
-    async def get_user_avatar(self, event: AstrMessageEvent, user_id: str) -> str:
+    async def get_user_avatar(self, event: AstrMessageEvent, user_id: str) -> Any:
         """
         获取指定 QQ 用户的头像并将其作为图片附件注入到当前对话中。
         当你需要识别、描述某个人头像特征，或者用户明确要求“看看某人的头像”时使用。
@@ -977,35 +979,7 @@ class LLMEnhancement(Star):
         Args:
             user_id (str): 目标用户的 QQ 号。必须是纯数字字符串。
         """
-        if not (IS_AIOCQHTTP and isinstance(event, AiocqhttpMessageEvent)):
-            return "当前平台未查看到目标头像。"
-
-        avatar_url = f"https://q4.qlogo.cn/headimg_dl?dst_uin={user_id}&spec=640"
-        
-        try:
-            req:  ProviderRequest = getattr(event, "_provider_req", None)
-            if not req:
-                req = getattr(event, "request", None)
-            
-            if not req:
-                logger.error("无法获取当前请求对象 ProviderRequest，注入失败。")
-                return f"获取头像成功，但内部错误导致无法注入到当前请求中。"
-
-            user_question = req.prompt.strip()
-            context_prompt = (
-                f"\n\n以下是系统为你获取到的用户 {user_id} 的头像信息，请根据该头像内容来响应用户的要求。信息如下：\n"
-                f"--- 注入内容开始 ---\n"
-                f"[图片] 用户 {user_id} 的头像已作为图片附件注入到本次请求的 image_urls 中。\n"
-                f"--- 注入内容结束 ---"
-            )
-            req.prompt = user_question + context_prompt
-            req.image_urls.append(avatar_url)
-            
-            logger.debug(f"成功将用户 {user_id} 的头像注入到 LLM 请求中。")
-            return f"已成功获取用户 {user_id} 的头像并注入到请求上下文中。"
-        except Exception as e:
-            logger.error(f"注入头像到请求时发生错误: {e}")
-            return f"注入头像失败:  {e}"
+        return await process_user_avatar(event=event, user_id=user_id)
 
     @filter.llm_tool(name="get_group_members_info")
     async def get_group_members(self, event: AstrMessageEvent, group_id: str = None) -> str:

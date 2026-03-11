@@ -9,7 +9,11 @@ from astrbot.api.event import AstrMessageEvent
 from astrbot.api.provider import ProviderRequest
 
 from .file_parser import extract_file_infos_from_chain
-from .json_parser import extract_json_infos_from_chain, parse_json_segment_data
+from .json_parser import (
+    extract_json_infos_from_chain,
+    parse_forward_card_info_from_json_segment_data,
+    parse_json_segment_data,
+)
 from .url_parser import extract_url_infos_from_chain
 
 try:
@@ -93,6 +97,22 @@ async def parse_reply_context(
             has_video = any(s.get("type") == "video" for s in message_list if isinstance(s, dict))
             has_file = any(s.get("type") == "file" for s in message_list if isinstance(s, dict))
             has_forward = any(s.get("type") == "forward" for s in message_list if isinstance(s, dict))
+            if (not has_forward) and enable_forward_parse and enable_json_parse:
+                for s in message_list:
+                    if not isinstance(s, dict) or s.get("type") != "json":
+                        continue
+                    inner_data = (s.get("data") or {}).get("data")
+                    if not inner_data:
+                        continue
+                    raw_json = (
+                        json.dumps(inner_data, ensure_ascii=False)
+                        if isinstance(inner_data, dict)
+                        else str(inner_data)
+                    )
+                    is_forward_card, _ = parse_forward_card_info_from_json_segment_data(raw_json)
+                    if is_forward_card:
+                        has_forward = True
+                        break
 
             video_prob = float(get_cfg("quote_self_video_block_prob", 0) or 0)
             file_prob = float(get_cfg("quote_self_file_block_prob", 0) or 0)
@@ -193,6 +213,20 @@ async def parse_reply_context(
                 if not inner_data:
                     continue
                 raw_json = json.dumps(inner_data, ensure_ascii=False) if isinstance(inner_data, dict) else str(inner_data)
+                is_forward_card, forward_id_from_json = parse_forward_card_info_from_json_segment_data(raw_json)
+                if enable_forward_parse and is_forward_card:
+                    if forward_id_from_json:
+                        result.forward_id = forward_id_from_json
+                        logger.debug(
+                            "[LLMEnhancement] 引用JSON识别为合并转发卡片，已提取 forward_id: "
+                            f"{forward_id_from_json}"
+                        )
+                        break
+                    logger.debug(
+                        "[LLMEnhancement] 引用JSON识别为合并转发卡片，但未提取到 forward_id，"
+                        "跳过 JSON 摘要注入。"
+                    )
+                    continue
                 forward_news_texts, key_info = parse_json_segment_data(raw_json)
                 if key_info:
                     quoted_json_infos.append(key_info)

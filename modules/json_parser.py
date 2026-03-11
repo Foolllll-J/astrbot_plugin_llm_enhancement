@@ -2,6 +2,42 @@ import json
 from typing import Any, Dict, List, Tuple
 
 
+def _extract_forward_card_info(inner_json: Dict[str, Any]) -> Tuple[bool, str]:
+    """识别是否为合并转发卡片，并尽力提取可用于 get_forward_msg 的 ID。"""
+    if not isinstance(inner_json, dict):
+        return False, ""
+
+    is_forward_card = (
+        inner_json.get("app") == "com.tencent.multimsg"
+        and inner_json.get("config", {}).get("forward") == 1
+    )
+    if not is_forward_card:
+        return False, ""
+
+    candidates: list[str] = []
+    meta = inner_json.get("meta")
+    if isinstance(meta, dict):
+        dict_nodes: list[Dict[str, Any]] = []
+        detail = meta.get("detail")
+        if isinstance(detail, dict):
+            dict_nodes.append(detail)
+        for node in meta.values():
+            if isinstance(node, dict):
+                dict_nodes.append(node)
+
+        for node in dict_nodes:
+            for key in ("resid", "id", "forward_id", "resourceid", "uniseq"):
+                value = node.get(key)
+                if value is None:
+                    continue
+                text = str(value).strip()
+                if text:
+                    candidates.append(text)
+
+    forward_id = next((x for x in candidates if x), "")
+    return True, forward_id
+
+
 def _truncate_text(value: str, limit: int = 120) -> str:
     text = str(value or "").strip()
     if not text:
@@ -62,6 +98,20 @@ def parse_json_segment_data(raw_data: str) -> Tuple[List[str], str]:
     return _parse_json_data(inner_json)
 
 
+def parse_forward_card_info_from_json_segment_data(raw_data: str) -> Tuple[bool, str]:
+    """解析 OneBot json 段，返回 (是否为合并转发卡片, 提取到的 forward_id)。"""
+    if not raw_data:
+        return False, ""
+
+    normalized = str(raw_data).replace("&#44;", ",")
+    try:
+        inner_json = json.loads(normalized)
+    except Exception:
+        return False, ""
+
+    return _extract_forward_card_info(inner_json)
+
+
 def extract_json_infos_from_chain(chain: List[Any]) -> Tuple[List[str], List[str]]:
     """从消息链提取 JSON 信息，返回 (news_texts, key_infos)。"""
     news_texts: List[str] = []
@@ -107,10 +157,8 @@ def extract_json_infos_from_chain(chain: List[Any]) -> Tuple[List[str], List[str
 def _parse_json_data(inner_json: Dict[str, Any]) -> Tuple[List[str], str]:
     """从反序列化后的 JSON 对象提取可注入信息。"""
     news_texts: List[str] = []
-    if (
-        inner_json.get("app") == "com.tencent.multimsg"
-        and inner_json.get("config", {}).get("forward") == 1
-    ):
+    is_forward_card, _ = _extract_forward_card_info(inner_json)
+    if is_forward_card:
         news_items = inner_json.get("meta", {}).get("detail", {}).get("news", [])
         if isinstance(news_items, list):
             for item in news_items:
@@ -124,4 +172,3 @@ def _parse_json_data(inner_json: Dict[str, Any]) -> Tuple[List[str], str]:
 
     key_info = extract_json_key_info(inner_json)
     return news_texts, key_info
-

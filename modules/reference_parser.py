@@ -43,6 +43,30 @@ class ReferenceContextResult:
     blocked: bool = False
 
 
+async def _fetch_messages_by_ids(
+    event: AstrMessageEvent,
+    msg_ids: list[str],
+) -> list[dict[str, Any]]:
+    if not (IS_AIOCQHTTP and isinstance(event, AiocqhttpMessageEvent)):
+        return []
+    if not msg_ids:
+        return []
+    try:
+        client = event.bot
+    except Exception:
+        return []
+
+    messages: list[dict[str, Any]] = []
+    for msg_id in msg_ids:
+        try:
+            original_msg = await client.api.call_action("get_msg", message_id=msg_id)
+        except Exception:
+            continue
+        if isinstance(original_msg, dict) and isinstance(original_msg.get("message"), list):
+            messages.append(original_msg)
+    return messages
+
+
 def _build_chain(event: AstrMessageEvent, all_components: list[Any]) -> list[Any]:
     chain: list[Any] = []
     if (
@@ -56,14 +80,133 @@ def _build_chain(event: AstrMessageEvent, all_components: list[Any]) -> list[Any
     return chain
 
 
-def _append_prompt_context(req: ProviderRequest, details: list[str]) -> None:
+def _append_context_block(
+    req: ProviderRequest,
+    details: list[str],
+    *,
+    block_title: str,
+    log_title: str,
+) -> None:
     if not details:
         return
-    req.prompt += (
-        "\n\n[引用内容补充] "
-        + "；".join([str(x).strip() for x in details if str(x).strip()])
+    normalized_details = [str(x).strip().rstrip("。；;，,") for x in details if str(x).strip()]
+    if not normalized_details:
+        return
+    injected_text = (
+        f"\n\n[{block_title}] "
+        + "；".join(normalized_details)
         + "。请结合这些补充信息回答。"
     )
+    req.prompt += injected_text
+    logger.debug("[LLMEnhancement] %s: injected=%s", log_title, injected_text.strip())
+
+
+def _append_prompt_context(req: ProviderRequest, details: list[str]) -> None:
+    _append_context_block(
+        req,
+        details,
+        block_title="引用内容补充",
+        log_title="引用上下文注入完成",
+    )
+
+
+def _segment_is_emoji_image(seg_data: dict[str, Any]) -> bool:
+    sub_type = seg_data.get("sub_type", seg_data.get("subType"))
+    try:
+        if sub_type is not None and int(sub_type) == 1:
+            return True
+    except (TypeError, ValueError):
+        pass
+
+    for key in ("type", "image_type", "imageType"):
+        value = seg_data.get(key)
+        if isinstance(value, str) and value.strip().lower() in {"emoji", "sticker", "face", "meme"}:
+            return True
+
+    summary = seg_data.get("summary")
+    if isinstance(summary, str):
+        lowered = summary.lower()
+        if ("表情" in summary) or ("emoji" in lowered) or ("sticker" in lowered):
+            return True
+
+    return False
+
+
+def _extract_raw_message_segments(event: AstrMessageEvent) -> list[dict[str, Any]]:
+    raw_message = getattr(getattr(event, "message_obj", None), "raw_message", None)
+    if raw_message is None:
+        return []
+    try:
+        segments = raw_message.get("message")
+    except Exception:
+        segments = getattr(raw_message, "message", None)
+    if isinstance(segments, list):
+        return [seg for seg in segments if isinstance(seg, dict)]
+    return []
+
+
+def _extract_chain_image_datas(event: AstrMessageEvent) -> list[dict[str, Any]]:
+    chain = getattr(getattr(event, "message_obj", None), "message", None)
+    if not isinstance(chain, list):
+        return []
+
+    image_datas: list[dict[str, Any]] = []
+    for comp in chain:
+        if not isinstance(comp, Comp.Image):
+            continue
+        seg_data: dict[str, Any] = {}
+        for attr in ("subType", "summary", "file", "url"):
+            value = getattr(comp, attr, None)
+            if value not in (None, ""):
+                key = "sub_type" if attr == "subType" else attr
+                seg_data[key] = value
+        try:
+            comp_dict = comp.toDict()
+            if isinstance(comp_dict, dict):
+                data = comp_dict.get("data")
+                if isinstance(data, dict):
+                    for key, value in data.items():
+                        if value not in (None, "") and key not in seg_data:
+                            seg_data[key] = value
+        except Exception:
+            pass
+        if seg_data:
+            image_datas.append(seg_data)
+    return image_datas
+
+
+async def inject_current_message_image_context(
+    event: AstrMessageEvent,
+    req: ProviderRequest,
+) -> bool:
+    raw_segments = _extract_raw_message_segments(event)
+    chain_image_datas = _extract_chain_image_datas(event)
+    image_labels: list[str] = []
+    for segment in raw_segments:
+        if str(segment.get("type") or "").lower() != "image":
+            continue
+        seg_data = segment.get("data", {}) or {}
+        label = "表情包" if _segment_is_emoji_image(seg_data) else "图片"
+        if label not in image_labels:
+            image_labels.append(label)
+
+    if not image_labels:
+        for seg_data in chain_image_datas:
+            label = "表情包" if _segment_is_emoji_image(seg_data) else "图片"
+            if label not in image_labels:
+                image_labels.append(label)
+
+    if not image_labels:
+        return False
+
+    image_desc = "和".join(image_labels)
+    _append_context_block(
+        req,
+        [f"当前用户发送了{image_desc}"],
+        block_title="消息内容补充",
+        log_title="当前消息媒体注入完成",
+    )
+    return True
 
 
 async def parse_reply_context(
@@ -136,11 +279,10 @@ async def parse_reply_context(
         if not isinstance(original_message_chain, list):
             return result
 
-        has_extracted_media = False
+        quoted_image_labels: list[str] = []
         quoted_file_names: list[str] = []
         quoted_file_infos: list[str] = []
         quoted_json_infos: list[str] = []
-        max_size = get_cfg("video_max_size_mb", 50)
 
         if not hasattr(req, "image_urls") or req.image_urls is None:
             req.image_urls = []
@@ -170,22 +312,9 @@ async def parse_reply_context(
                     break
 
             elif seg_type == "image":
-                url = seg_data.get("url")
-                if not url:
-                    continue
-                has_extracted_media = True
-                if url.startswith(("http://", "https://")):
-                    try:
-                        local_path = await download_media(url, max_size)
-                        if local_path and local_path not in req.image_urls:
-                            req.image_urls.append(local_path)
-                            req._cleanup_paths.append(local_path)
-                        if local_path:
-                            continue
-                    except Exception:
-                        pass
-                if url not in req.image_urls:
-                    req.image_urls.append(url)
+                label = "表情包" if _segment_is_emoji_image(seg_data) else "图片"
+                if label not in quoted_image_labels:
+                    quoted_image_labels.append(label)
 
             elif enable_file_parse and seg_type == "file":
                 file_name = seg_data.get("name") or seg_data.get("file_name") or seg_data.get("file")
@@ -238,32 +367,23 @@ async def parse_reply_context(
                         f"has_key_info={bool(key_info)}, news_count={len(forward_news_texts)}"
                     )
 
-        if has_extracted_media or quoted_file_names or quoted_file_infos or quoted_json_infos:
+        if quoted_image_labels or quoted_file_names or quoted_file_infos or quoted_json_infos:
             quoted_sender = getattr(req, "_quoted_sender", "未知用户")
             parts: list[str] = []
-            if has_extracted_media:
-                parts.append(f"你引用了 {quoted_sender} 发送的图片。")
+            if quoted_image_labels:
+                image_desc = "和".join(quoted_image_labels)
+                parts.append(f"当前用户引用了 {quoted_sender} 发送的{image_desc}。")
             if quoted_file_names:
-                parts.append(f"你引用了 {quoted_sender} 发送的文件：{'；'.join(quoted_file_names)}。")
+                parts.append(f"当前用户引用了 {quoted_sender} 发送的文件：{'；'.join(quoted_file_names)}。")
             if quoted_file_infos:
-                parts.append(f"你引用文件的内容摘要：{'；'.join(quoted_file_infos[:2])}。")
+                parts.append(f"被引用文件的内容摘要：{'；'.join(quoted_file_infos[:2])}。")
             if quoted_json_infos:
-                parts.append(f"你引用卡片的关键信息：{'；'.join(quoted_json_infos[:2])}。")
+                parts.append(f"被引用卡片的关键信息：{'；'.join(quoted_json_infos[:2])}。")
             _append_prompt_context(req, parts)
             if quoted_json_infos:
                 result.injected_json = True
             if quoted_file_names or quoted_file_infos:
                 result.injected_file = True
-            if quoted_file_infos:
-                logger.debug(
-                    "[LLMEnhancement] 已注入引用文件文本摘要: "
-                    f"count={len(quoted_file_infos[:2])}, sender={quoted_sender}"
-                )
-            if quoted_json_infos:
-                logger.debug(
-                    "[LLMEnhancement] 已注入引用JSON卡片摘要: "
-                    f"count={len(quoted_json_infos[:2])}, sender={quoted_sender}"
-                )
 
     except Exception as e:
         logger.warning(f"解析引用上下文失败: {e}")
@@ -282,6 +402,8 @@ async def process_reference_context(
     result = ReferenceContextResult()
     if not (IS_AIOCQHTTP and isinstance(event, AiocqhttpMessageEvent)):
         return result
+    dynamic_batch_msg_ids = event.get_extra("_llme_dynamic_batch_msg_ids", default=[]) or []
+    dynamic_batch_msg_ids = [str(mid).strip() for mid in dynamic_batch_msg_ids if str(mid).strip()]
 
     for seg in all_components:
         if isinstance(seg, Comp.Forward) and not result.forward_id:
@@ -309,15 +431,11 @@ async def process_reference_context(
             quoted_sender = getattr(req, "_quoted_sender", "未知用户")
             _append_prompt_context(
                 req,
-                [f"你引用了 {quoted_sender} 的 JSON 卡片，提取到文本：{'；'.join(parsed_reply.json_extracted_texts[:5])}。"],
+                [f"当前用户引用了 {quoted_sender} 的 JSON 卡片，提取到文本：{'；'.join(parsed_reply.json_extracted_texts[:5])}。"],
             )
             result.injected_json = True
-            logger.debug(
-                "[LLMEnhancement] 已注入引用JSON正文摘录: "
-                f"count={len(parsed_reply.json_extracted_texts[:5])}, sender={quoted_sender}"
-            )
 
-    if bool(get_cfg("json_parse_enable", True)):
+    if (not dynamic_batch_msg_ids) and bool(get_cfg("json_parse_enable", True)):
         chain_for_json = _build_chain(event, all_components)
         direct_json_news_texts, direct_json_infos = extract_json_infos_from_chain(chain_for_json)
         direct_json_news_texts = list(dict.fromkeys(direct_json_news_texts))
@@ -331,11 +449,6 @@ async def process_reference_context(
                 parts.append(f"分享卡片正文摘录：{'；'.join(direct_json_news_texts[:5])}。")
             _append_prompt_context(req, parts)
             result.injected_json = True
-            logger.debug(
-                "[LLMEnhancement] 已注入当前消息JSON摘要: "
-                f"info_count={len(direct_json_infos[:2])}, news_count={len(direct_json_news_texts[:5])}, "
-                f"sender={sender_name}"
-            )
         elif any(
             isinstance(seg, Comp.Json)
             or (isinstance(seg, dict) and str(seg.get("type") or "").lower() == "json")
@@ -345,7 +458,7 @@ async def process_reference_context(
     else:
         logger.debug("[LLMEnhancement] JSON注入关闭: json_parse_enable=false")
 
-    if bool(get_cfg("file_parse_enable", True)):
+    if (not dynamic_batch_msg_ids) and bool(get_cfg("file_parse_enable", True)):
         try:
             file_text_inject_len = max(0, int(get_cfg("inject_file_text_length", 0) or 0))
         except (TypeError, ValueError):
@@ -381,10 +494,6 @@ async def process_reference_context(
                         ],
                     )
                     result.injected_file = True
-                    logger.debug(
-                        "[LLMEnhancement] 已注入当前消息文件文本摘要: "
-                        f"count={len(direct_file_infos[:2])}, sender={sender_name}"
-                    )
                 elif any(isinstance(seg, Comp.File) or (isinstance(seg, dict) and str(seg.get('type') or '').lower() == 'file') for seg in chain_for_file):
                     logger.debug(
                         "[LLMEnhancement] 检测到文件组件，但未提取到可注入文本摘要: "
@@ -392,7 +501,7 @@ async def process_reference_context(
                     )
 
 
-    if bool(get_cfg("url_parse_enable", True)):
+    if (not dynamic_batch_msg_ids) and bool(get_cfg("url_parse_enable", True)):
         chain_for_url = _build_chain(event, all_components)
         if chain_for_url or str(getattr(event, "message_str", "") or "").strip():
             try:
@@ -435,10 +544,135 @@ async def process_reference_context(
                     ],
                 )
                 result.injected_url = True
-                logger.debug(
-                    "[LLMEnhancement] 已注入当前消息 URL 摘要: "
-                    f"count={len(url_result.details[:2])}, sender={sender_name}"
-                )
     else:
         logger.debug("[LLMEnhancement] URL 注入关闭: url_parse_enable=false")
+
+    if dynamic_batch_msg_ids:
+        original_msgs = await _fetch_messages_by_ids(event, dynamic_batch_msg_ids)
+        if original_msgs:
+            merged_raw_chain: list[Any] = []
+            merged_sender_names: list[str] = []
+            merged_forward_ids: list[str] = []
+            merged_image_parts: list[str] = []
+
+            for original_msg in original_msgs:
+                sender_info = original_msg.get("sender", {}) or {}
+                sender_name = str(
+                    sender_info.get("nickname") or sender_info.get("card") or "未知用户"
+                ).strip() or "未知用户"
+                chain = original_msg.get("message") or []
+                if not isinstance(chain, list):
+                    continue
+                merged_raw_chain.extend(chain)
+                if sender_name not in merged_sender_names:
+                    merged_sender_names.append(sender_name)
+                for segment in chain:
+                    if not isinstance(segment, dict):
+                        continue
+                    seg_type = str(segment.get("type") or "").lower()
+                    seg_data = segment.get("data", {}) or {}
+                    if seg_type == "forward":
+                        forward_id = str(seg_data.get("id") or "").strip()
+                        if forward_id and forward_id not in merged_forward_ids:
+                            merged_forward_ids.append(forward_id)
+                    elif seg_type == "json":
+                        inner_data = seg_data.get("data")
+                        if inner_data:
+                            raw_json = json.dumps(inner_data, ensure_ascii=False) if isinstance(inner_data, dict) else str(inner_data)
+                            is_forward_card, forward_id_from_json = parse_forward_card_info_from_json_segment_data(raw_json)
+                            if is_forward_card and forward_id_from_json and forward_id_from_json not in merged_forward_ids:
+                                merged_forward_ids.append(forward_id_from_json)
+                    elif seg_type == "image":
+                        label = "表情包" if _segment_is_emoji_image(seg_data) else "图片"
+                        text = f"{sender_name} 发送的{label}"
+                        if text not in merged_image_parts:
+                            merged_image_parts.append(text)
+
+            if merged_forward_ids and not result.forward_id:
+                result.forward_id = merged_forward_ids[0]
+
+            if merged_image_parts:
+                _append_context_block(
+                    req,
+                    merged_image_parts[:3],
+                    block_title="消息内容补充",
+                    log_title="合并消息图片上下文注入完成",
+                )
+
+            if bool(get_cfg("json_parse_enable", True)) and merged_raw_chain:
+                merged_json_news_texts, merged_json_infos = extract_json_infos_from_chain(merged_raw_chain)
+                merged_json_news_texts = list(dict.fromkeys(merged_json_news_texts))
+                merged_json_infos = list(dict.fromkeys(merged_json_infos))
+                if merged_json_infos or merged_json_news_texts:
+                    sender_text = "、".join(merged_sender_names[:3]) if merged_sender_names else (event.get_sender_name() or "未知用户")
+                    parts: list[str] = []
+                    if merged_json_infos:
+                        parts.append(f"{sender_text} 发送的分享卡片信息：{'；'.join(merged_json_infos[:2])}。")
+                    if merged_json_news_texts:
+                        parts.append(f"分享卡片正文摘录：{'；'.join(merged_json_news_texts[:5])}。")
+                    _append_prompt_context(req, parts)
+                    result.injected_json = True
+
+            if bool(get_cfg("file_parse_enable", True)) and merged_raw_chain:
+                try:
+                    file_text_inject_len = max(0, int(get_cfg("inject_file_text_length", 0) or 0))
+                except (TypeError, ValueError):
+                    file_text_inject_len = 0
+                try:
+                    file_inject_max_size_mb = max(0, int(get_cfg("inject_file_max_size_mb", 20) or 0))
+                except (TypeError, ValueError):
+                    file_inject_max_size_mb = 20
+                if file_text_inject_len > 0:
+                    if not hasattr(req, "_cleanup_paths"):
+                        req._cleanup_paths = []
+                    merged_file_infos = await extract_file_infos_from_chain(
+                        event=event,
+                        chain=merged_raw_chain,
+                        max_chars=file_text_inject_len,
+                        max_file_size_mb=file_inject_max_size_mb,
+                        cleanup_paths=req._cleanup_paths,
+                    )
+                    merged_file_infos = list(dict.fromkeys(merged_file_infos))
+                    if merged_file_infos:
+                        _append_prompt_context(
+                            req,
+                            ["合并消息中的文件内容摘要：" + "；".join(f"{n}: {t}" for n, t in merged_file_infos[:2]) + "。"],
+                        )
+                        result.injected_file = True
+
+            if bool(get_cfg("url_parse_enable", True)) and merged_raw_chain:
+                try:
+                    timeout_sec = max(2, int(get_cfg("inject_url_timeout_sec", 8) or 8))
+                except (TypeError, ValueError):
+                    timeout_sec = 8
+                try:
+                    max_download_kb = max(32, int(get_cfg("inject_url_max_download_kb", 512) or 512))
+                except (TypeError, ValueError):
+                    max_download_kb = 512
+                block_private_network = bool(get_cfg("inject_url_block_private_network", True))
+                blocked_domains_raw = get_cfg("inject_url_blocked_domains", [])
+                blocked_domains = (
+                    [str(x or "").strip() for x in blocked_domains_raw if str(x or "").strip()]
+                    if isinstance(blocked_domains_raw, list)
+                    else []
+                )
+                try:
+                    cache_ttl_sec = max(0, int(get_cfg("inject_url_cache_ttl_sec", 600) or 600))
+                except (TypeError, ValueError):
+                    cache_ttl_sec = 600
+                merged_url_result = await extract_url_infos_from_chain(
+                    event=event,
+                    chain=merged_raw_chain,
+                    timeout_sec=timeout_sec,
+                    max_download_kb=max_download_kb,
+                    block_private_network=block_private_network,
+                    blocked_domains=blocked_domains,
+                    cache_ttl_sec=cache_ttl_sec,
+                )
+                if merged_url_result.injected and merged_url_result.details:
+                    _append_prompt_context(
+                        req,
+                        ["合并消息中的链接解析信息：" + "；".join(str(x).strip() for x in merged_url_result.details[:2] if str(x).strip()) + "。"],
+                    )
+                    result.injected_url = True
     return result

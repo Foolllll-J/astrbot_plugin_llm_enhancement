@@ -38,7 +38,6 @@ INJECTABLE_MEMBER_FIELDS: Dict[str, str] = {
     "role": "群身份",
     "title": "群头衔",
     "area": "地区",
-    "shut_up_timestamp": "禁言时间戳",
     "qage": "Q龄",
 }
 INJECTABLE_PERCEPTION_FIELDS: Dict[str, str] = {
@@ -545,7 +544,7 @@ async def inject_perception_context_info(
     req.prompt = (user_question + context_prompt) if user_question else context_prompt.strip()
     logger.debug(
         "[LLMEnhancement] 环境感知注入完成："
-        f"payload={json.dumps(display_payload, ensure_ascii=False, separators=(',', ':'))}"
+        f"injected={context_prompt.strip()}"
     )
     return True
 
@@ -571,7 +570,6 @@ def _normalize_member_injection_fields(raw_fields: Any) -> List[str]:
         "群头衔": "title",
         "头衔": "title",
         "地区": "area",
-        "禁言时间戳": "shut_up_timestamp",
         "q龄": "qage",
     }
 
@@ -593,13 +591,24 @@ def _is_meaningful_member_value(field: str, value: Any) -> bool:
         return False
     if isinstance(value, str):
         return bool(value.strip())
-    if field == "shut_up_timestamp":
-        number = _safe_int(value)
-        return bool(number is not None and number > 0)
     if field in {"join_time", "last_sent_time", "age"}:
         number = _safe_int(value)
         return bool(number is not None and number > 0)
     return True
+
+
+def _format_member_injection_value(field: str, value: Any) -> Any:
+    if field not in {"join_time", "last_sent_time"}:
+        return value
+
+    number = _safe_int(value)
+    if number is None or number <= 0:
+        return value
+
+    try:
+        return datetime.fromtimestamp(number).strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return value
 
 
 async def inject_sender_group_member_info(
@@ -674,7 +683,7 @@ async def _inject_group_member_info(
         logger.debug(
             "[LLMEnhancement] 群成员信息注入跳过："
             f"subject={subject_label}, "
-            f"group={target_group_id}, uid={target_user_id}, reason=not_found"
+            f"group_id={target_group_id}, user_id={target_user_id}, reason=not_found"
         )
         return False
 
@@ -686,7 +695,7 @@ async def _inject_group_member_info(
                 value = str(value)
             if not _is_meaningful_member_value(field, value):
                 continue
-            payload[field] = value
+            payload[field] = _format_member_injection_value(field, value)
 
     if not payload:
         return False
@@ -697,9 +706,7 @@ async def _inject_group_member_info(
     req.prompt = (user_question + context_prompt) if user_question else context_prompt.strip()
     logger.debug(
         "[LLMEnhancement] 群成员信息注入完成："
-        f"subject={subject_label}, "
-        f"group={target_group_id}, uid={target_user_id}, no_cache={bool(no_cache)}, "
-        f"fields={list(payload.keys())}, payload={json.dumps(payload, ensure_ascii=False)}"
+        f"injected={context_prompt.strip()}"
     )
     return True
 

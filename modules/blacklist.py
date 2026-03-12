@@ -36,6 +36,9 @@ BLACKLIST_WORDING_HINT = (
     "向用户转述时请使用“拉黑/解除拉黑”表述，"
     "不要使用“解封/解禁”表述。"
 )
+BOT_ADMIN_BLOCK_MESSAGE = (
+    "这个人是管理员，我不能把他拉黑。"
+)
 
 
 def _parse_iso_datetime(iso_text: Optional[str]) -> Optional[datetime]:
@@ -319,6 +322,9 @@ class BlacklistManager:
     def max_blacklist_duration(self) -> int:
         return self._cfg_int("max_blacklist_duration", 86400, min_value=0)
 
+    def allow_blacklist_bot_admin(self) -> bool:
+        return bool(self._get_cfg("allow_blacklist_bot_admin", False))
+
     def blacklist_intercept_level(self) -> str:
         raw = self._cfg_str("blacklist_intercept_level", "llm_only").lower()
         if raw in {"llm_only", "command_and_llm", "all_messages"}:
@@ -328,6 +334,33 @@ class BlacklistManager:
     def tool_write_require_admin(self, tool_id: str) -> bool:
         selected = self._get_cfg("tool_admin_required_tools", [])
         return is_tool_admin_required(tool_id, selected)
+
+    def _get_bot_admin_ids(self) -> set[str]:
+        try:
+            from astrbot.core import astrbot_config
+
+            raw_admin_ids = astrbot_config.get("admins_id", [])
+        except Exception:
+            return set()
+
+        if not isinstance(raw_admin_ids, (list, tuple, set)):
+            return set()
+
+        admin_ids: set[str] = set()
+        for admin_id in raw_admin_ids:
+            text = str(admin_id or "").strip()
+            if text:
+                admin_ids.add(text)
+        return admin_ids
+
+    def _is_target_bot_admin(self, event: AstrMessageEvent, target_user_id: str) -> bool:
+        target_id = str(target_user_id or "").strip()
+        if not target_id:
+            return False
+        sender_id = str(event.get_sender_id() or "").strip()
+        if target_id == sender_id and bool(event.is_admin()):
+            return True
+        return target_id in self._get_bot_admin_ids()
 
     async def initialize(self) -> None:
         self._data_dir.mkdir(parents=True, exist_ok=True)
@@ -657,6 +690,9 @@ class BlacklistManager:
         if not target_id:
             return "请提供用户 ID 或 @目标用户。"
 
+        if (not self.allow_blacklist_bot_admin()) and self._is_target_bot_admin(event, target_id):
+            return BOT_ADMIN_BLOCK_MESSAGE
+
         duration_sec, err = self._parse_duration_seconds(duration)
         if err:
             return err
@@ -743,6 +779,12 @@ class BlacklistManager:
                     "success": False,
                     "message": permission_error,
                 },
+                ensure_ascii=False,
+            )
+
+        if (not self.allow_blacklist_bot_admin()) and self._is_target_bot_admin(event, target_user_id):
+            return json.dumps(
+                {"success": False, "message": BOT_ADMIN_BLOCK_MESSAGE},
                 ensure_ascii=False,
             )
 

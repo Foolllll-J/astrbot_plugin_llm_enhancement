@@ -1,4 +1,7 @@
+import asyncio
+import copy
 import time
+from dataclasses import dataclass
 from typing import Any, Callable, Dict, Optional
 
 import astrbot.api.message_components as Comp
@@ -14,6 +17,48 @@ try:
 except ImportError:
     IS_AIOCQHTTP = False
 
+try:
+    from astrbot.core.utils.active_event_registry import active_event_registry
+except Exception:
+    active_event_registry = None
+
+try:
+    from astrbot.core.pipeline.process_stage import follow_up as follow_up_stage
+except Exception:
+    follow_up_stage = None
+
+
+@dataclass(frozen=True)
+class MergeRuntimeConfig:
+    delay_sec: float
+    dynamic_mode: bool
+    followup_require_wake: bool
+    max_count: int
+    allow_multi_user: bool
+
+
+def load_merge_runtime_config(get_cfg: Callable[[str, Any], Any]) -> MergeRuntimeConfig:
+    """Load merge settings from top-level `merge` object only."""
+    raw_merge_obj = get_cfg("merge", {})
+    merge_obj = raw_merge_obj if isinstance(raw_merge_obj, dict) else {}
+
+    delay_sec = max(0.0, float(merge_obj.get("merge_delay", 0.0)))
+    raw_dynamic_mode = str(
+        merge_obj.get("merge_dynamic_mode", "hard") or "hard"
+    ).strip().lower()
+    dynamic_mode = raw_dynamic_mode == "dynamic"
+    followup_require_wake = bool(merge_obj.get("merge_followup_require_wake", False))
+    max_count = max(1, int(merge_obj.get("merge_max_count", 3)))
+    allow_multi_user = bool(merge_obj.get("merge_multi_user", False))
+
+    return MergeRuntimeConfig(
+        delay_sec=delay_sec,
+        dynamic_mode=dynamic_mode,
+        followup_require_wake=followup_require_wake,
+        max_count=max_count,
+        allow_multi_user=allow_multi_user,
+    )
+
 
 def get_event_msg_id(event: AstrMessageEvent) -> Optional[str]:
     if hasattr(event, "message_obj") and hasattr(event.message_obj, "message_id"):
@@ -24,11 +69,11 @@ def get_event_msg_id(event: AstrMessageEvent) -> Optional[str]:
 
 
 def is_merge_component(seg: Any) -> bool:
-    if isinstance(seg, (Comp.Forward, Comp.Reply, Comp.Video, Comp.File, Comp.Json)):
+    if isinstance(seg, (Comp.Image, Comp.Forward, Comp.Reply, Comp.Video, Comp.File, Comp.Json)):
         return True
     if isinstance(seg, dict):
         seg_type = str(seg.get("type") or "").lower()
-        return seg_type in {"forward", "reply", "video", "file", "json"}
+        return seg_type in {"image", "forward", "reply", "video", "file", "json"}
     return False
 
 
@@ -322,6 +367,7 @@ def prepare_initial_merge_snapshots(
     merge_delay: float,
     merged_window_tolerance: float,
     merged_skip_ttl: float,
+    merge_max_count: int,
     add_pending_msg_id: Callable[[str], None],
 ) -> tuple[list[Dict[str, Any]], Optional[str]]:
     """预选本次合并窗口内的消息快照，并更新 member 的已并入索引。"""
@@ -375,6 +421,8 @@ def prepare_initial_merge_snapshots(
         seen_msg_ids.add(key)
         deduped_snapshots.append(item)
     preselected_snapshots = deduped_snapshots
+    if len(preselected_snapshots) > merge_max_count:
+        preselected_snapshots = preselected_snapshots[-merge_max_count:]
 
     for item in preselected_snapshots:
         msg_id = str(item.get("msg_id") or "")
@@ -501,6 +549,7 @@ def prepare_dynamic_merge_batch(
     uid: str,
     allow_multi_user: bool,
     merge_max_count: int,
+    merge_delay: float,
     merged_skip_ttl: float,
 ) -> tuple[list[Dict[str, Any]], list[str], int, int, Optional[str]]:
     upsert_dynamic_unresolved_snapshot(member, current_snapshot)
@@ -511,9 +560,17 @@ def prepare_dynamic_merge_batch(
     group_state.dynamic_owner_uid = member.uid
 
     selected_snapshots: list[Dict[str, Any]] = []
+    current_ts = float(current_snapshot.get("ts", time.time()) or time.time())
+    current_key = ensure_snapshot_merge_key(current_snapshot)
     for item in member.dynamic_unresolved_msgs:
         item_uid = str(item.get("uid") or "")
         if not allow_multi_user and item_uid and item_uid != uid:
+            continue
+        ts = float(item.get("ts", current_ts) or current_ts)
+        if merge_delay > 0:
+            if (current_ts - ts) > merge_delay:
+                continue
+        elif ensure_snapshot_merge_key(item) != current_key:
             continue
         text = str(item.get("text") or "")
         components = item.get("components", []) or []
@@ -570,6 +627,142 @@ async def mark_dynamic_soft_recompute(
         return inflight_seq
 
 
+def request_dynamic_recompute_stop(
+    event: AstrMessageEvent,
+    *,
+    inflight_seq: int,
+    owner_uid: str,
+) -> int:
+    """Stop active events for this UMO (hard stop), excluding current event."""
+    if active_event_registry is None:
+        return 0
+    try:
+        stop_fn = getattr(active_event_registry, "stop_all", None)
+        if callable(stop_fn):
+            stopped_count = int(
+                stop_fn(
+                    event.unified_msg_origin,
+                    exclude=event,
+                )
+                or 0
+            )
+            stop_mode = "hard_stop_all"
+        else:
+            stopped_count = int(
+                active_event_registry.request_agent_stop_all(
+                    event.unified_msg_origin,
+                    exclude=event,
+                )
+                or 0
+            )
+            stop_mode = "request_agent_stop_all"
+        if stopped_count > 0:
+            logger.info(
+                "[LLMEnhancement] 动态软重算已停止进行中的任务："
+                f"umo={event.unified_msg_origin}, owner_uid={owner_uid}, inflight_seq={inflight_seq}, "
+                f"stopped_count={stopped_count}, mode={stop_mode}"
+            )
+        else:
+            logger.debug(
+                "[LLMEnhancement] 动态软重算未找到可停止的进行中任务："
+                f"umo={event.unified_msg_origin}, owner_uid={owner_uid}, inflight_seq={inflight_seq}, mode={stop_mode}"
+            )
+        return stopped_count
+    except Exception as e:
+        logger.warning(
+            "[LLMEnhancement] 动态软重算请求停止任务失败："
+            f"umo={event.unified_msg_origin}, owner_uid={owner_uid}, inflight_seq={inflight_seq}, error={e}"
+        )
+        return 0
+
+
+def _has_active_follow_up_runner(umo: str) -> bool:
+    if follow_up_stage is None:
+        return False
+    try:
+        runners = getattr(follow_up_stage, "_ACTIVE_AGENT_RUNNERS", None)
+        if isinstance(runners, dict):
+            return runners.get(umo) is not None
+    except Exception:
+        return False
+    return False
+
+
+def schedule_dynamic_recompute_requeue(
+    event: AstrMessageEvent,
+    *,
+    event_queue: Any,
+    owner_uid: str,
+    inflight_seq: int,
+    delay_sec: float = 0.35,
+    max_attempts: int = 2,
+) -> bool:
+    """Requeue current message event as a fresh event after stop request."""
+    try:
+        attempt = int(event.get_extra("_llme_dynamic_requeue_attempt") or 0)
+    except Exception:
+        attempt = 0
+    if attempt >= max_attempts:
+        logger.warning(
+            "[LLMEnhancement] 动态软重算重排已达上限，放弃再次入队："
+            f"umo={event.unified_msg_origin}, owner_uid={owner_uid}, inflight_seq={inflight_seq}, "
+            f"attempt={attempt}, max_attempts={max_attempts}"
+        )
+        return False
+
+    if event_queue is None or not hasattr(event_queue, "put_nowait"):
+        logger.warning(
+            "[LLMEnhancement] 动态软重算重排入队失败：事件队列不可用，"
+            f"umo={event.unified_msg_origin}, owner_uid={owner_uid}, inflight_seq={inflight_seq}"
+        )
+        return False
+
+    try:
+        replay_event = copy.copy(event)
+        # copy.copy(event) 会共享 _result / _extras 等运行态；若原事件随后 stop_event，
+        # 重排事件会继承已停止状态，导致框架跳过默认 LLM 请求。
+        replay_event._result = None
+        replay_event._extras = dict(event.get_extra(None) or {})
+        replay_event._has_send_oper = False
+        replay_event.call_llm = False
+        replay_event.is_wake = False
+        replay_event.is_at_or_wake_command = False
+        replay_event.set_extra("_llme_dynamic_requeue_attempt", attempt + 1)
+        replay_event.set_extra("_llme_dynamic_requeued", True)
+        replay_event.set_extra("_llme_dynamic_followup", True)
+        replay_event.set_extra("_llme_dynamic_state_uid", str(owner_uid))
+
+        async def _enqueue_later() -> None:
+            await asyncio.sleep(max(0.0, float(delay_sec)))
+            wait_start = time.time()
+            waited_sec = 0.0
+            while _has_active_follow_up_runner(event.unified_msg_origin):
+                waited_sec = time.time() - wait_start
+                if waited_sec >= 2.0:
+                    logger.warning(
+                        "[LLMEnhancement] 动态软重算重排等待 active runner 退出超时，继续强制入队："
+                        f"umo={event.unified_msg_origin}, owner_uid={owner_uid}, inflight_seq={inflight_seq}, "
+                        f"attempt={attempt + 1}, waited_sec={waited_sec:.2f}"
+                    )
+                    break
+                await asyncio.sleep(0.05)
+            event_queue.put_nowait(replay_event)
+            logger.info(
+                "[LLMEnhancement] 动态软重算消息已重排入队："
+                f"umo={event.unified_msg_origin}, owner_uid={owner_uid}, inflight_seq={inflight_seq}, "
+                f"attempt={attempt + 1}, delay_sec={delay_sec:.2f}, waited_active_runner={waited_sec:.2f}"
+            )
+
+        asyncio.create_task(_enqueue_later())
+        return True
+    except Exception as e:
+        logger.warning(
+            "[LLMEnhancement] 动态软重算重排入队失败："
+            f"umo={event.unified_msg_origin}, owner_uid={owner_uid}, inflight_seq={inflight_seq}, error={e}"
+        )
+        return False
+
+
 def drop_dynamic_batch_from_unresolved(member: MemberState, batch_keys: list[str]) -> int:
     key_set = {str(k) for k in batch_keys if str(k or "").strip()}
     if not key_set:
@@ -595,7 +788,7 @@ async def execute_dynamic_merge(
     merge_max_count: int,
     is_recent_recalled: Optional[Callable[[str], bool]] = None,
 ) -> dict[str, Any]:
-    ttl_base = merge_delay if merge_delay > 0 else 10.0
+    ttl_base = max(merge_delay, 10.0)
     cache_keep_sec = max(ttl_base * 6, 60.0)
     merged_skip_ttl = max(ttl_base * 6, 120.0)
     current_snapshot = build_event_snapshot(event, gid, uid)
@@ -625,6 +818,7 @@ async def execute_dynamic_merge(
                 uid=uid,
                 allow_multi_user=allow_multi_user,
                 merge_max_count=merge_max_count,
+                merge_delay=merge_delay,
                 merged_skip_ttl=merged_skip_ttl,
             )
 
@@ -698,6 +892,10 @@ async def execute_dynamic_merge(
 
     event.set_extra("_llme_dynamic_request_seq", request_seq)
     event.set_extra("_llme_dynamic_batch_keys", selected_keys)
+    event.set_extra(
+        "_llme_dynamic_batch_msg_ids",
+        [str(item.get("msg_id") or "").strip() for item in selected_snapshots if str(item.get("msg_id") or "").strip()],
+    )
 
     if not selected_snapshots:
         member.cancel_merge = True

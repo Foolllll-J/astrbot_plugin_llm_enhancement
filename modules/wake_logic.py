@@ -110,8 +110,9 @@ def match_mention_wake_rule(rule: str, text: str) -> bool:
     return bool(compiled.search(text))
 
 
-def detect_wake_media_components(message_chain: Any) -> tuple[bool, bool, bool, bool, str]:
+def detect_wake_media_components(message_chain: Any) -> tuple[bool, bool, bool, bool, bool, str]:
     """识别消息链中的视频/文件/转发/JSON 组件，并返回文件名。"""
+    has_image_component = False
     has_video_component = False
     has_file_component = False
     has_forward_component = False
@@ -119,7 +120,9 @@ def detect_wake_media_components(message_chain: Any) -> tuple[bool, bool, bool, 
     file_name = ""
     try:
         for seg in (message_chain or []):
-            if isinstance(seg, Comp.Video):
+            if isinstance(seg, Comp.Image):
+                has_image_component = True
+            elif isinstance(seg, Comp.Video):
                 has_video_component = True
             elif isinstance(seg, Comp.File):
                 has_file_component = True
@@ -131,7 +134,9 @@ def detect_wake_media_components(message_chain: Any) -> tuple[bool, bool, bool, 
             elif isinstance(seg, dict):
                 seg_type = seg.get("type")
                 data = seg.get("data") or {}
-                if seg_type == "video":
+                if seg_type == "image":
+                    has_image_component = True
+                elif seg_type == "video":
                     has_video_component = True
                 elif seg_type == "file":
                     has_file_component = True
@@ -142,8 +147,9 @@ def detect_wake_media_components(message_chain: Any) -> tuple[bool, bool, bool, 
                 elif seg_type == "json":
                     has_json_component = True
     except Exception:
-        return False, False, False, False, ""
+        return False, False, False, False, False, ""
     return (
+        has_image_component,
         has_video_component,
         has_file_component,
         has_forward_component,
@@ -152,11 +158,35 @@ def detect_wake_media_components(message_chain: Any) -> tuple[bool, bool, bool, 
     )
 
 
+def build_media_trigger_message(
+    sender_name: str,
+    has_image_component: bool,
+    has_video_component: bool,
+    has_file_component: bool,
+    has_forward_component: bool,
+    has_json_component: bool,
+    file_name: str,
+) -> tuple[str, Optional[str]]:
+    if has_image_component:
+        return f"{sender_name}发送了一张图片", "图片消息唤醒"
+    if has_video_component:
+        return f"{sender_name}发送了一个视频", "视频消息唤醒"
+    if has_file_component:
+        suffix = f"（{file_name}）" if file_name else ""
+        return f"{sender_name}发送了一个文件{suffix}", "文件消息唤醒"
+    if has_forward_component:
+        return f"{sender_name}发送了一条转发消息", "转发消息唤醒"
+    if has_json_component:
+        return f"{sender_name}发送了一条分享卡片", "JSON卡片唤醒"
+    return "", None
+
+
 def normalize_wake_trigger_message(
     wake: bool,
     msg: str,
     gid: Optional[str],
     sender_name: str,
+    has_image_component: bool,
     has_video_component: bool,
     has_file_component: bool,
     has_forward_component: bool,
@@ -652,6 +682,27 @@ async def apply_post_wake_judge_gate(
     return True, detail
 
 
+def _wake_extend_consumed_for_ref(group_state: GroupState, ref_ts: float) -> bool:
+    if ref_ts <= 0:
+        return False
+    try:
+        consumed_ref_ts = float(getattr(group_state, "wake_extend_consumed_ref_ts", 0.0) or 0.0)
+    except Exception:
+        consumed_ref_ts = 0.0
+    return consumed_ref_ts >= ref_ts
+
+
+def _mark_wake_extend_consumed(group_state: GroupState, ref_ts: float) -> None:
+    if ref_ts <= 0:
+        return
+    try:
+        consumed_ref_ts = float(getattr(group_state, "wake_extend_consumed_ref_ts", 0.0) or 0.0)
+    except Exception:
+        consumed_ref_ts = 0.0
+    if ref_ts > consumed_ref_ts:
+        group_state.wake_extend_consumed_ref_ts = ref_ts
+
+
 
 
 async def evaluate_wake_extend(
@@ -700,9 +751,12 @@ async def evaluate_wake_extend(
         in_window = False
     if not in_window:
         return False, None
+    if _wake_extend_consumed_for_ref(group_state, ref_ts):
+        return False, None
 
     threshold = float(get_cfg("wake_extend_similarity", 0.1) or 0.0)
     if threshold <= 0:
+        _mark_wake_extend_consumed(group_state, ref_ts)
         return True, "唤醒延长(阈值0)"
 
     history_msgs = await get_history_msg(event, 5)
@@ -720,6 +774,7 @@ async def evaluate_wake_extend(
             find_provider=find_provider,
         )
         if llm_decision is True:
+            _mark_wake_extend_consumed(group_state, ref_ts)
             return True, "唤醒延长(模型判定T)"
         if llm_decision is False:
             return False, None
@@ -730,6 +785,7 @@ async def evaluate_wake_extend(
             f"阈值={threshold:.4f}, 历史参考={len(history_msgs)}条"
         )
         if simi >= threshold:
+            _mark_wake_extend_consumed(group_state, ref_ts)
             return True, f"唤醒延长(相关性{simi:.2f})"
         return False, None
 
@@ -739,5 +795,6 @@ async def evaluate_wake_extend(
         f"阈值={threshold:.4f}, 历史参考={len(history_msgs)}条"
     )
     if simi >= threshold:
+        _mark_wake_extend_consumed(group_state, ref_ts)
         return True, f"唤醒延长(相关性{simi:.2f})"
     return False, None

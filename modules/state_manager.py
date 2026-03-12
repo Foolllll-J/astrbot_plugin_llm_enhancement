@@ -20,6 +20,7 @@ class MemberState(BaseModel):
     dynamic_request_seq: int = 0                            # 动态合并请求序号
     dynamic_inflight_seq: int = 0                           # 当前进行中的动态请求序号
     dynamic_discard_before_seq: int = 0                     # 小于等于该序号的响应将被丢弃
+    dynamic_discarded_response_cache: dict[str, Any] = Field(default_factory=dict)  # 动态合并被丢弃响应缓存
 
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
@@ -32,6 +33,7 @@ class GroupState(BaseModel):
     pending_msg_index: dict[str, str] = Field(default_factory=dict) # 撤回快速索引：message_id -> uid
     last_response_uid: Optional[str] = None                # 最近一次触发响应的用户
     last_response_ts: float = 0.0                          # 最近一次响应时间（时间戳）
+    wake_extend_consumed_ref_ts: float = 0.0               # 已消费一次性唤醒延长期所对应的响应时间戳
     dynamic_owner_uid: Optional[str] = None                # 动态合并当前会话所有者（用于多人合并）
 
 

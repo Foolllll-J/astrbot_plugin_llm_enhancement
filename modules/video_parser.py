@@ -28,7 +28,6 @@ try:
 except ImportError:
     IS_AIOCQHTTP = False
 
-# 统一缓存策略：与 forward_parser 中的转发缓存保持一致
 VIDEO_SUMMARY_CACHE_TTL_SEC = 3600
 VIDEO_SUMMARY_CACHE_MAX_SIZE = 100
 
@@ -1044,11 +1043,35 @@ def _extract_videos_from_raw_event(event: AstrMessageEvent) -> List[str]:
     """从 raw_message 结构兜底提取视频源。"""
     try:
         raw = getattr(getattr(event, "message_obj", None), "raw_message", None)
-        if not raw and hasattr(event, "event"):
-            raw = event.event
-        if not isinstance(raw, dict):
+        raw_data = ob_data(raw)
+        if not raw_data and hasattr(raw, "get"):
+            try:
+                message = raw.get("message")
+                if isinstance(message, list):
+                    raw_data = {"message": message}
+            except Exception:
+                raw_data = {}
+        if not raw_data and hasattr(raw, "message"):
+            message = getattr(raw, "message", None)
+            if isinstance(message, list):
+                raw_data = {"message": message}
+        if not raw_data and hasattr(event, "event"):
+            event_raw = getattr(event, "event", None)
+            raw_data = ob_data(event_raw)
+            if not raw_data and hasattr(event_raw, "get"):
+                try:
+                    message = event_raw.get("message")
+                    if isinstance(message, list):
+                        raw_data = {"message": message}
+                except Exception:
+                    raw_data = {}
+            if not raw_data and hasattr(event_raw, "message"):
+                message = getattr(event_raw, "message", None)
+                if isinstance(message, list):
+                    raw_data = {"message": message}
+        if not isinstance(raw_data, dict):
             return []
-        chain = raw.get("message")
+        chain = raw_data.get("message")
         if not isinstance(chain, list) or not chain:
             return []
         return extract_videos_from_chain(chain)
@@ -1069,6 +1092,33 @@ async def _probe_duration_helper(get_cfg, media_path: str) -> float:
         return 0
 
 
+async def _extract_videos_via_get_msg(event: AstrMessageEvent, msg_ids: List[str]) -> List[str]:
+    if not IS_AIOCQHTTP or not isinstance(event, AiocqhttpMessageEvent):
+        return []
+    if not msg_ids:
+        return []
+    try:
+        client = event.bot
+    except Exception:
+        return []
+
+    videos: List[str] = []
+    for msg_id in msg_ids:
+        try:
+            original_msg = await client.api.call_action("get_msg", message_id=msg_id)
+            if original_msg and "message" in original_msg:
+                extracted = extract_videos_from_chain(original_msg["message"])
+                if extracted:
+                    videos.extend(extracted)
+        except Exception:
+            continue
+    deduped: List[str] = []
+    for item in videos:
+        if item and item not in deduped:
+            deduped.append(item)
+    return deduped
+
+
 async def detect_media_scenario(
     req: ProviderRequest,
     get_cfg,
@@ -1077,10 +1127,11 @@ async def detect_media_scenario(
     """检测当前媒体场景并返回上下文。"""
     ctx = MediaContext()
     image_urls: Any = getattr(req, "image_urls", None)
+    allow_gif_from_image_urls = bool(get_cfg("gif_parse_enable", False))
 
     if video_sources and len(video_sources) > 0:
         ctx.media_path = video_sources[0]
-    elif image_urls and isinstance(image_urls, list) and len(image_urls) > 0:
+    elif allow_gif_from_image_urls and image_urls and isinstance(image_urls, list) and len(image_urls) > 0:
         ctx.media_path = image_urls[0]
     else:
         ctx.scenario = MediaScenario.NONE
@@ -1108,6 +1159,10 @@ async def detect_media_scenario(
 
     ctx.media_path = first_path
     if is_gif_file(first_path):
+        if not bool(get_cfg("gif_parse_enable", False)):
+            logger.debug("[VideoFrameProcessor] GIF 解析已关闭，保留框架原生图片处理链: %s", first_path)
+            ctx.scenario = MediaScenario.NONE
+            return ctx
         ctx.duration = await _probe_duration_helper(get_cfg, first_path)
         if ctx.duration <= 0:
             ctx.scenario = MediaScenario.NONE
@@ -1151,10 +1206,34 @@ async def process_media_content(
     if not get_cfg("video_parse_enable", True):
         return False
 
+    dynamic_batch_msg_ids = event.get_extra("_llme_dynamic_batch_msg_ids", default=[]) or []
+    dynamic_batch_msg_ids = [str(mid).strip() for mid in dynamic_batch_msg_ids if str(mid).strip()]
     video_sources = extract_videos_from_chain(all_components)
-    raw_video_sources = _extract_videos_from_raw_event(event)
+    raw_video_sources: List[str] = []
+    if not dynamic_batch_msg_ids:
+        raw_video_sources = _extract_videos_from_raw_event(event)
     if raw_video_sources:
         video_sources = raw_video_sources + [src for src in video_sources if src not in raw_video_sources]
+
+    if dynamic_batch_msg_ids:
+        fetched_video_sources = await _extract_videos_via_get_msg(event, dynamic_batch_msg_ids)
+        if fetched_video_sources:
+            video_sources = fetched_video_sources + [src for src in video_sources if src not in fetched_video_sources]
+            logger.debug(
+                "[LLMEnhancement] 媒体解析 get_msg 兜底命中："
+                f"batch_msg_ids={dynamic_batch_msg_ids}, fetched_video_sources={fetched_video_sources}"
+            )
+    elif not raw_video_sources:
+        current_msg_id = getattr(getattr(event, "message_obj", None), "message_id", None)
+        current_msg_id = str(current_msg_id).strip() if current_msg_id is not None else ""
+        if current_msg_id:
+            fetched_video_sources = await _extract_videos_via_get_msg(event, [current_msg_id])
+            if fetched_video_sources:
+                video_sources = fetched_video_sources + [src for src in video_sources if src not in fetched_video_sources]
+                logger.debug(
+                    "[LLMEnhancement] 媒体解析 get_msg 兜底命中："
+                    f"msg_id={current_msg_id}, fetched_video_sources={fetched_video_sources}"
+                )
 
     if not video_sources and reply_seg and IS_AIOCQHTTP and isinstance(event, AiocqhttpMessageEvent):
         try:

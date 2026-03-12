@@ -455,8 +455,6 @@ async def process_reference_context(
             for seg in chain_for_json
         ):
             logger.debug("[LLMEnhancement] 检测到JSON组件，但未提取到可注入信息。")
-    else:
-        logger.debug("[LLMEnhancement] JSON注入关闭: json_parse_enable=false")
 
     if (not dynamic_batch_msg_ids) and bool(get_cfg("file_parse_enable", True)):
         try:
@@ -467,8 +465,6 @@ async def process_reference_context(
             file_inject_max_size_mb = max(0, int(get_cfg("inject_file_max_size_mb", 20) or 0))
         except (TypeError, ValueError):
             file_inject_max_size_mb = 20
-        if file_text_inject_len <= 0:
-            logger.debug("[LLMEnhancement] 文件文本注入关闭: inject_file_text_length<=0")
         if file_text_inject_len > 0:
             chain_for_file = _build_chain(event, all_components)
             if chain_for_file:
@@ -544,8 +540,6 @@ async def process_reference_context(
                     ],
                 )
                 result.injected_url = True
-    else:
-        logger.debug("[LLMEnhancement] URL 注入关闭: url_parse_enable=false")
 
     if dynamic_batch_msg_ids:
         original_msgs = await _fetch_messages_by_ids(event, dynamic_batch_msg_ids)

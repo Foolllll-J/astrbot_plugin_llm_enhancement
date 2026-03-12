@@ -31,8 +31,6 @@ except ImportError:
 VIDEO_SUMMARY_CACHE_TTL_SEC = 3600
 VIDEO_SUMMARY_CACHE_MAX_SIZE = 100
 
-# ==================== 媒体处理场景枚举 ====================
-
 class MediaScenario(Enum):
     """媒体处理场景"""
     NONE = "none"                          # 无媒体
@@ -1119,6 +1117,39 @@ async def _extract_videos_via_get_msg(event: AstrMessageEvent, msg_ids: List[str
     return deduped
 
 
+async def _extract_video_sources_with_msg_ids_via_get_msg(
+    event: AstrMessageEvent,
+    msg_ids: List[str],
+) -> List[Tuple[str, str]]:
+    if not IS_AIOCQHTTP or not isinstance(event, AiocqhttpMessageEvent):
+        return []
+    if not msg_ids:
+        return []
+    try:
+        client = event.bot
+    except Exception:
+        return []
+
+    pairs: List[Tuple[str, str]] = []
+    seen: set[Tuple[str, str]] = set()
+    for msg_id in msg_ids:
+        normalized_msg_id = str(msg_id).strip()
+        if not normalized_msg_id:
+            continue
+        try:
+            original_msg = await client.api.call_action("get_msg", message_id=normalized_msg_id)
+            if original_msg and "message" in original_msg:
+                extracted = extract_videos_from_chain(original_msg["message"])
+                for source in extracted:
+                    key = (normalized_msg_id, source)
+                    if source and key not in seen:
+                        seen.add(key)
+                        pairs.append(key)
+        except Exception:
+            continue
+    return pairs
+
+
 async def detect_media_scenario(
     req: ProviderRequest,
     get_cfg,
@@ -1209,6 +1240,7 @@ async def process_media_content(
     dynamic_batch_msg_ids = event.get_extra("_llme_dynamic_batch_msg_ids", default=[]) or []
     dynamic_batch_msg_ids = [str(mid).strip() for mid in dynamic_batch_msg_ids if str(mid).strip()]
     video_sources = extract_videos_from_chain(all_components)
+    video_source_msg_id: Optional[str] = None
     raw_video_sources: List[str] = []
     if not dynamic_batch_msg_ids:
         raw_video_sources = _extract_videos_from_raw_event(event)
@@ -1216,23 +1248,27 @@ async def process_media_content(
         video_sources = raw_video_sources + [src for src in video_sources if src not in raw_video_sources]
 
     if dynamic_batch_msg_ids:
-        fetched_video_sources = await _extract_videos_via_get_msg(event, dynamic_batch_msg_ids)
-        if fetched_video_sources:
+        fetched_video_pairs = await _extract_video_sources_with_msg_ids_via_get_msg(event, dynamic_batch_msg_ids)
+        if fetched_video_pairs:
+            fetched_video_sources = [src for _msg_id, src in fetched_video_pairs]
+            video_source_msg_id = fetched_video_pairs[0][0]
             video_sources = fetched_video_sources + [src for src in video_sources if src not in fetched_video_sources]
             logger.debug(
                 "[LLMEnhancement] 媒体解析 get_msg 兜底命中："
-                f"batch_msg_ids={dynamic_batch_msg_ids}, fetched_video_sources={fetched_video_sources}"
+                f"batch_msg_ids={dynamic_batch_msg_ids}, source_msg_id={video_source_msg_id}, fetched_video_sources={fetched_video_sources}"
             )
     elif not raw_video_sources:
         current_msg_id = getattr(getattr(event, "message_obj", None), "message_id", None)
         current_msg_id = str(current_msg_id).strip() if current_msg_id is not None else ""
         if current_msg_id:
-            fetched_video_sources = await _extract_videos_via_get_msg(event, [current_msg_id])
-            if fetched_video_sources:
+            fetched_video_pairs = await _extract_video_sources_with_msg_ids_via_get_msg(event, [current_msg_id])
+            if fetched_video_pairs:
+                fetched_video_sources = [src for _msg_id, src in fetched_video_pairs]
+                video_source_msg_id = fetched_video_pairs[0][0]
                 video_sources = fetched_video_sources + [src for src in video_sources if src not in fetched_video_sources]
                 logger.debug(
                     "[LLMEnhancement] 媒体解析 get_msg 兜底命中："
-                    f"msg_id={current_msg_id}, fetched_video_sources={fetched_video_sources}"
+                    f"msg_id={current_msg_id}, source_msg_id={video_source_msg_id}, fetched_video_sources={fetched_video_sources}"
                 )
 
     if not video_sources and reply_seg and IS_AIOCQHTTP and isinstance(event, AiocqhttpMessageEvent):
@@ -1260,7 +1296,7 @@ async def process_media_content(
     if media_ctx.scenario == MediaScenario.VIDEO:
         quoted_sender = getattr(req, "_quoted_sender", None) if reply_seg else None
         current_msg_id = getattr(getattr(event, "message_obj", None), "message_id", None)
-        msg_id = str(reply_seg.id) if reply_seg else str(current_msg_id)
+        msg_id = str(reply_seg.id) if reply_seg else str(video_source_msg_id or current_msg_id)
         return await processor.process_long_video(
             req,
             media_ctx.media_path,
@@ -1271,7 +1307,7 @@ async def process_media_content(
     elif media_ctx.scenario == MediaScenario.GIF_ANIMATED:
         quoted_sender = getattr(req, "_quoted_sender", None) if reply_seg else None
         current_msg_id = getattr(getattr(event, "message_obj", None), "message_id", None)
-        msg_id = str(reply_seg.id) if reply_seg else str(current_msg_id)
+        msg_id = str(reply_seg.id) if reply_seg else str(video_source_msg_id or current_msg_id)
         return await processor.process_gif(
             req,
             media_ctx.media_path,

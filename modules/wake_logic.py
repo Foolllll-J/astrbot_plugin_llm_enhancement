@@ -201,6 +201,8 @@ def normalize_wake_trigger_message(
         return msg, None
     if gid:
         return f"{sender_name}@了你", "空@唤醒"
+    if has_image_component:
+        return f"{sender_name}发送了一张图片", "图片消息唤醒"
     if has_video_component:
         return f"{sender_name}发送了一个视频", "视频消息唤醒"
     if has_file_component:

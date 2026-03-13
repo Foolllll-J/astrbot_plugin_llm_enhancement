@@ -1077,13 +1077,13 @@ class LLMEnhancement(Star):
         yield event.plain_result(result)
 
     @filter.llm_tool(name="get_user_avatar")
-    async def get_user_avatar(self, event: AstrMessageEvent, user_id: str) -> Any:
+    async def get_user_avatar(self, event: AstrMessageEvent, user_id: str = "") -> Any:
         """
         获取指定 QQ 用户的头像并将其作为图片附件注入到当前对话中。
         当你需要识别、描述某个人头像特征，或者用户明确要求“看看某人的头像”时使用。
 
         Args:
-            user_id (str): 目标用户的 QQ 号。必须是纯数字字符串。
+            user_id (str, optional): 目标用户的 QQ 号。若目标就是当前对话者，可不提供；留空时默认使用当前消息发送者的 ID。
         """
         return await process_user_avatar(event=event, user_id=user_id)
 
@@ -1256,9 +1256,9 @@ class LLMEnhancement(Star):
     async def set_group_ban(
         self,
         event: AstrMessageEvent,
-        user_id: str,
-        duration: int,
-        user_name: str,
+        user_id: str = "",
+        duration: int = 0,
+        user_name: str = "",
         group_id: str = None,
     ) -> str:
         """
@@ -1266,7 +1266,7 @@ class LLMEnhancement(Star):
         支持在群聊中直接使用，或在私聊中指定 group_id 使用，由你根据请求者身份与上下文判断是否应执行。
         
         Args:
-            user_id (str): 目标用户的 QQ 号。必须是纯数字字符串。
+            user_id (str, optional): 目标用户的 QQ 号。若操作对象就是当前对话者，可不提供；留空时默认使用当前消息发送者的 ID。
             duration (int): 禁言时长（秒）。0 为解禁；60-600 为警告级；3600-86400 为惩罚级；最大为 2592000 (30天)。请根据违规严重程度灵活选择。
             user_name (str): 目标用户的昵称或称呼，用于回复确认。
             group_id (str, optional): 目标 QQ 群号。在私聊使用时必填，在群聊使用时可选（默认当前群）。
@@ -1285,7 +1285,7 @@ class LLMEnhancement(Star):
     async def kick_group_member(
         self,
         event: AstrMessageEvent,
-        user_id: str,
+        user_id: str = "",
         group_id: str = None,
         reject_add_request: bool = False,
         confirm_token: str = "",
@@ -1294,7 +1294,7 @@ class LLMEnhancement(Star):
         将指定成员踢出群聊。
 
         Args:
-            user_id (str): 目标用户 ID。
+            user_id (str, optional): 目标用户 ID。若操作对象就是当前对话者，可不提供；留空时默认使用当前消息发送者的 ID。
             group_id (str, optional): 目标群号。在私聊使用时必填，在群聊使用时可选（默认当前群）。
             reject_add_request (bool, optional): 是否拒绝该用户再次加群请求。
             confirm_token (str, optional): 二次确认令牌。首次调用可能返回 token，第二次原参数不变并携带 token 才执行。
@@ -1342,8 +1342,8 @@ class LLMEnhancement(Star):
     async def set_group_admin(
         self,
         event: AstrMessageEvent,
-        user_id: str,
-        enable: bool,
+        user_id: str = "",
+        enable: bool = True,
         group_id: str = None,
         confirm_token: str = "",
     ) -> str:
@@ -1351,7 +1351,7 @@ class LLMEnhancement(Star):
         设置或取消群管理员。
 
         Args:
-            user_id (str): 目标用户 ID。
+            user_id (str, optional): 目标用户 ID。若操作对象就是当前对话者，可不提供；留空时默认使用当前消息发送者的 ID。
             group_id (str, optional): 目标群号。在私聊使用时必填，在群聊使用时可选（默认当前群）。
             enable (bool): True 设为管理员，False 取消管理员。
             confirm_token (str, optional): 二次确认令牌。首次调用可能返回 token，第二次原参数不变并携带 token 才执行。
@@ -1369,12 +1369,12 @@ class LLMEnhancement(Star):
         )
 
     @filter.llm_tool(name="set_group_card")
-    async def set_group_card(self, event: AstrMessageEvent, user_id: str, card: str, group_id: str = None) -> str:
+    async def set_group_card(self, event: AstrMessageEvent, user_id: str = "", card: str = "", group_id: str = None) -> str:
         """
         设置群成员名片即群昵称。
 
         Args:
-            user_id (str): 目标用户 ID。
+            user_id (str, optional): 目标用户 ID。若操作对象就是当前对话者，可不提供；留空时默认使用当前消息发送者的 ID。
             card (str): 新的群名片文本。
             group_id (str, optional): 目标群号。在私聊使用时必填，在群聊使用时可选（默认当前群）。
         """
@@ -1391,15 +1391,15 @@ class LLMEnhancement(Star):
     async def set_group_special_title(
         self,
         event: AstrMessageEvent,
-        user_id: str,
-        special_title: str,
+        user_id: str = "",
+        special_title: str = "",
         group_id: str = None,
     ) -> str:
         """
         设置群成员专属头衔。
 
         Args:
-            user_id (str): 目标用户 ID。
+            user_id (str, optional): 目标用户 ID。若操作对象就是当前对话者，可不提供；留空时默认使用当前消息发送者的 ID。
             special_title (str): 头衔内容。
             group_id (str, optional): 目标群号。在私聊使用时必填，在群聊使用时可选（默认当前群）。
         """
@@ -1641,14 +1641,14 @@ class LLMEnhancement(Star):
         return await self.blacklist.tool_list_blacklist(event=event, page=page, page_size=page_size)
 
     @filter.llm_tool(name="get_blacklist_status")
-    async def get_blacklist_status(self, event: AstrMessageEvent, user_id: str = "") -> str:
+    async def get_blacklist_status(self, event: AstrMessageEvent, user_id: str) -> str:
         """
         查询用户是否在黑名单中，即是否被拉黑。
         若返回 expire_time，表示黑名单失效时间，失效后会自动移出黑名单，可重新与其进行对话。
         这是黑名单语义，不是封禁语义。
 
         Args:
-            user_id (str, optional): 目标用户 ID，默认当前发送者。
+            user_id (str): 目标用户 ID。
         """
         return await self.blacklist.tool_get_blacklist_status(event=event, user_id=user_id)
 

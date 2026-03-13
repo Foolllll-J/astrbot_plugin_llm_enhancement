@@ -909,9 +909,9 @@ async def process_user_avatar(event: AstrMessageEvent, user_id: str) -> Any:
         if not IS_AIOCQHTTP or not isinstance(event, AiocqhttpMessageEvent):
             return _json_error(f"此功能仅支持 QQ 平台 (aiocqhttp)，当前平台为 {event.get_platform_name()}")
 
-        target_user_id = str(user_id or "").strip()
+        target_user_id = str(user_id or "").strip() or str(event.get_sender_id() or "").strip()
         if not target_user_id:
-            return _json_error("user_id 参数无效，请提供目标 QQ 号。")
+            return _json_error("无法确定目标 QQ 号。")
 
         avatar_url = f"https://q1.qlogo.cn/g?b=qq&nk={target_user_id}&s=640"
 
@@ -2198,9 +2198,9 @@ async def set_group_ban_logic(
         if env_error:
             return env_error
 
-        target_user_id = str(user_id or "").strip()
+        target_user_id = str(user_id or "").strip() or str(event.get_sender_id() or "").strip()
         if not target_user_id:
-            return _json_error("请提供要禁言/解除禁言的目标用户 ID。")
+            return _json_error("无法确定要禁言/解除禁言的目标用户 ID。")
 
         disabled_resp = _check_write_tool_access(
             event,
@@ -2266,9 +2266,9 @@ async def kick_group_member_logic(
         target_group_id, env_error = _ensure_group_write_context(event, group_id=group_id)
         if env_error:
             return env_error
-        target_user_id = str(user_id or "").strip()
+        target_user_id = str(user_id or "").strip() or str(event.get_sender_id() or "").strip()
         if not target_user_id:
-            return _json_error("请提供要踢出的用户 ID。")
+            return _json_error("无法确定要踢出的目标用户 ID。")
 
         disabled_resp = _check_write_tool_access(
             event,
@@ -2387,9 +2387,9 @@ async def set_group_admin_logic(
         target_group_id, env_error = _ensure_group_write_context(event, group_id=group_id)
         if env_error:
             return env_error
-        target_user_id = str(user_id or "").strip()
+        target_user_id = str(user_id or "").strip() or str(event.get_sender_id() or "").strip()
         if not target_user_id:
-            return _json_error("请提供目标用户 ID。")
+            return _json_error("无法确定目标用户 ID。")
 
         disabled_resp = _check_write_tool_access(
             event,
@@ -2449,9 +2449,9 @@ async def set_group_card_logic(
         target_group_id, env_error = _ensure_group_write_context(event, group_id=group_id)
         if env_error:
             return env_error
-        target_user_id = str(user_id or "").strip()
+        target_user_id = str(user_id or "").strip() or str(event.get_sender_id() or "").strip()
         if not target_user_id:
-            return _json_error("请提供目标用户 ID。")
+            return _json_error("无法确定目标用户 ID。")
 
         disabled_resp = _check_write_tool_access(
             event,
@@ -2493,9 +2493,9 @@ async def set_group_special_title_logic(
         target_group_id, env_error = _ensure_group_write_context(event, group_id=group_id)
         if env_error:
             return env_error
-        target_user_id = str(user_id or "").strip()
+        target_user_id = str(user_id or "").strip() or str(event.get_sender_id() or "").strip()
         if not target_user_id:
-            return _json_error("请提供目标用户 ID。")
+            return _json_error("无法确定目标用户 ID。")
         title_text = str(special_title or "").strip()
         if not title_text:
             return _json_error("请提供头衔文本(special_title)。")

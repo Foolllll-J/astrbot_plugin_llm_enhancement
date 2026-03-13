@@ -967,10 +967,20 @@ class BlacklistManager:
             ensure_ascii=False,
         )
 
-    async def tool_get_blacklist_status(self, event: AstrMessageEvent, user_id: str = "") -> str:
+    async def tool_get_blacklist_status(self, event: AstrMessageEvent, user_id: str) -> str:
         await self._cleanup_expired_on_query()
 
-        target_id = str(user_id or event.get_sender_id())
+        target_id = str(user_id or "").strip()
+        if not target_id:
+            return json.dumps(
+                {
+                    "is_blacklisted": False,
+                    "user_id": "",
+                    "message": "请提供要查询的目标用户 ID。",
+                    "wording_hint": BLACKLIST_WORDING_HINT,
+                },
+                ensure_ascii=False,
+            )
         user_info = await self._db.get_user_info(target_id)
         if user_info:
             uid, user_name, ban_time, expire_time, reason = user_info

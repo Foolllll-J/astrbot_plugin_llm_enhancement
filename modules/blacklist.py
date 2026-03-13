@@ -757,13 +757,13 @@ class BlacklistManager:
     ) -> str:
         await self._cleanup_expired_on_query()
 
-        target_user_id = str(user_id or "").strip()
+        sender_id = str(event.get_sender_id() or "")
+        target_user_id = str(user_id or "").strip() or sender_id
         if not target_user_id:
             return json.dumps(
-                {"success": False, "message": "请提供要拉黑的目标用户 ID。"},
+                {"success": False, "message": "无法确定要拉黑的目标用户 ID。"},
                 ensure_ascii=False,
             )
-        sender_id = str(event.get_sender_id() or "")
         is_self_defense = target_user_id == sender_id
 
         permission_error = validate_write_permission(

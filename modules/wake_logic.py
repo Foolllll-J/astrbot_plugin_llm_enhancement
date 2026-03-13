@@ -788,7 +788,7 @@ async def evaluate_wake_extend(
         )
         if simi >= threshold:
             _mark_wake_extend_consumed(group_state, ref_ts)
-            return True, f"唤醒延长(相关性{simi:.2f})"
+            return True, f"唤醒延长(相关性{simi:.2f}>={threshold:.2f})"
         return False, None
 
     simi = await similarity_fn(gid, msg, history_msgs)
@@ -798,5 +798,5 @@ async def evaluate_wake_extend(
     )
     if simi >= threshold:
         _mark_wake_extend_consumed(group_state, ref_ts)
-        return True, f"唤醒延长(相关性{simi:.2f})"
+        return True, f"唤醒延长(相关性{simi:.2f}>={threshold:.2f})"
     return False, None

@@ -592,7 +592,7 @@ class LLMEnhancement(Star):
                     simi = await self.similarity.similarity(gid, msg, bmsgs)
                     if simi >= relevant_wake:
                         wake = True
-                        reason = f"话题相关性{simi:.2f}>={relevant_wake}"
+                        reason = f"话题相关性{simi:.2f}>={relevant_wake:.2f}"
 
         # 答疑唤醒 (仅群聊)
         if gid and not wake:
@@ -601,7 +601,7 @@ class LLMEnhancement(Star):
                 ask_score = await self.sent.ask(msg)
                 if ask_score >= ask_wake:
                     wake = True
-                    reason = "答疑唤醒"
+                    reason = f"答疑唤醒{ask_score:.2f}>={ask_wake:.2f}"
 
         # 无聊唤醒 (仅群聊)
         if gid and not wake:
@@ -610,15 +610,16 @@ class LLMEnhancement(Star):
                 bored_score = await self.sent.bored(msg)
                 if bored_score >= bored_wake:
                     wake = True
-                    reason = "无聊唤醒"
+                    reason = f"无聊唤醒{bored_score:.2f}>={bored_wake:.2f}"
 
         # 概率唤醒 (仅群聊)
         if gid and not wake:
             prob_wake = self._get_cfg("prob_wake")
             if prob_wake:  
-                if random.random() < prob_wake:
+                prob_roll = random.random()
+                if prob_roll < prob_wake:
                     wake = True
-                    reason = "概率唤醒"
+                    reason = f"概率唤醒{prob_roll:.4f}<{prob_wake:.4f}"
 
         wake, wake_judge_detail = await apply_post_wake_judge_gate(
             event=event,
@@ -646,9 +647,16 @@ class LLMEnhancement(Star):
             )
         if direct_wake and (not wake):
             if wake_judge_detail.startswith("model:F"):
-                logger.info("[LLMEnhancement] 唤醒判定结果=F，已跳过本次回复。")
-            event.is_at_or_wake_command = False
+                logger.debug(
+                    "[LLMEnhancement] 唤醒判定结果=F，已标记阻止本次 LLM 请求，但保留其他插件继续处理。"
+                    f"group={gid or 'private'}, uid={uid}, reason={reason}, detail={wake_judge_detail}"
+                )
+            event.set_extra("_llme_block_llm_request", True)
+            event.set_extra("_llme_block_llm_reason", wake_judge_detail)
             return
+
+        event.set_extra("_llme_block_llm_request", False)
+        event.set_extra("_llme_block_llm_reason", "")
 
         if dynamic_merge_mode and (not force_dynamic_followup) and (not command_trigger_event):
             target_uid = select_dynamic_owner_uid(
@@ -1595,7 +1603,7 @@ class LLMEnhancement(Star):
         这是黑名单语义，不是禁言/解禁语义；请避免使用“解封/解禁”等措辞。
 
         Args:
-            user_id (str, optional): 目标用户 ID。为空时会直接拒绝执行。
+            user_id (str, optional): 目标用户 ID。若拉黑对象就是当前对话者，可不提供；留空时会默认使用当前消息发送者的 ID。
             user_name (str, optional): 目标用户昵称（可选）。可用于黑名单记录展示。
             duration (int, optional): 拉黑时长（秒）。0 表示按 max_blacklist_duration 处理（其值为 0 时表示永久）；60-600 适合轻度冷却/短时不回应；600-3600 适合明确隔离；86400 及以上用于高风险持续骚扰场景。
             reason (str, optional): 拉黑原因，用于记录与审计。
@@ -1653,6 +1661,15 @@ class LLMEnhancement(Star):
         gid: str = event.get_group_id()
         uid: str = event.get_sender_id()
         if not uid:
+            return
+
+        if bool(event.get_extra("_llme_block_llm_request", default=False)):
+            block_reason = str(event.get_extra("_llme_block_llm_reason", default="") or "")
+            logger.info(
+                "[LLMEnhancement] on_llm_request 拦截：当前准备发起 LLM 请求前，命中“阻止请求”标记。"
+                f"group={gid or 'private'}, uid={uid}, detail={block_reason or 'unknown'}"
+            )
+            event.stop_event()
             return
 
         # 任意拦截等级都会拦截 LLM 请求。

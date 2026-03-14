@@ -2185,7 +2185,6 @@ async def set_group_ban_logic(
     event: AstrMessageEvent,
     user_id: str,
     duration: int,
-    user_name: str,
     group_id: str = None,
     admin_required_tools: Any = None,
     enabled_dangerous_tools: Any = None,
@@ -2236,19 +2235,18 @@ async def set_group_ban_logic(
 
         await _call_action(event, "set_group_ban", **params)
         
-        logger.info(f"调用方 {sender_id} 通过工具禁言了用户 {target_user_id} ({user_name})，时长 {duration} 秒。")
+        logger.info(f"调用方 {sender_id} 通过工具禁言了用户 {target_user_id}，时长 {duration} 秒。")
 
         return _json_success(
-            f"用户 {user_name} ({target_user_id}) 已被禁言 {duration} 秒。",
+            f"用户 {target_user_id} 已被禁言 {duration} 秒。",
             user_id=target_user_id,
-            user_name=user_name,
             duration=duration,
             timestamp=int(time.time()),
         )
 
     except Exception as e:
         logger.error(f"禁言用户 {user_id} 失败: {e}")
-        return _json_error(f"操作失败：无法禁言用户 {user_name}", error=str(e))
+        return _json_error(f"操作失败：无法禁言用户 {user_id}", error=str(e))
 
 
 async def kick_group_member_logic(

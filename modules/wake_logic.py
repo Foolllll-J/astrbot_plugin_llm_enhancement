@@ -38,6 +38,36 @@ _WAKE_JUDGE_PROMPT_DEFAULT = """你是群聊“唤醒判定器”。请判断机
 
 [输出格式]
 只能输出一个大写字母：T 或 F。"""
+_WAKE_EXTEND_JUDGE_PROMPT_DEFAULT = """请判断当前消息是否与上文足够相关，是否需要继续响应。
+
+[当前时间]
+{time}
+
+[用户ID]
+{user_id}
+
+[用户名]
+{user_name}
+
+[群组ID]
+{group_id}
+
+[相关性阈值参考]
+{threshold}
+
+[上文]
+{history}
+
+[当前消息]
+{message}
+
+[判定规则]
+1) 如果当前消息是对上文的自然追问、补充、纠正、承接或继续讨论，输出 T。
+2) 如果当前消息与上文明显无关、话题跳转过大，或不需要机器人继续响应，输出 F。
+3) 不确定时优先结合上文连续性判断；只有在明显无关时才输出 F。
+
+[输出格式]
+只能输出一个大写字母：T 或 F。"""
 
 
 def _parse_regex_flags(flags_text: str) -> int:
@@ -471,6 +501,7 @@ async def wake_extend_llm_decision(
     history_msgs: List[str],
     threshold: float,
     provider_id: str,
+    prompt_template: str,
     find_provider: Callable[[str], Any],
 ) -> Optional[bool]:
     """使用配置的 Provider 做唤醒延长判定。返回 True/False，失败返回 None。"""
@@ -479,16 +510,27 @@ async def wake_extend_llm_decision(
         logger.warning(f"[LLMEnhancement] 未找到唤醒延长判定 Provider: {provider_id}")
         return None
 
+    sender_id = str(event.get_sender_id() or "")
+    sender_name = str(event.get_sender_name() or sender_id or "unknown")
+    group_id = str(event.get_group_id() or "") or "private"
+    now_text = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     history_text = "\n".join([f"{idx + 1}. {h}" for idx, h in enumerate(history_msgs[-5:])]) or "<empty>"
-    prompt = (
-        "请判断当前消息是否与上文足够相关，是否需要继续响应。\n"
-        f"相关性阈值参考: {threshold:.2f}（0~1，越高越严格）\n"
-        "你只能输出一个大写字母：T 或 F。\n"
-        "T=需要响应，F=不需要响应。\n\n"
-        f"[上文]\n{history_text}\n\n"
-        f"[当前消息]\n{msg}"
-    )
+    placeholders: Dict[str, str] = {
+        "time": now_text,
+        "user_id": sender_id,
+        "user_name": sender_name,
+        "group_id": group_id,
+        "threshold": f"{threshold:.2f}",
+        "history": history_text,
+        "message": str(msg or ""),
+    }
+    prompt = _render_prompt_template(prompt_template, placeholders)
     system_prompt = "你是唤醒判定器。只输出一个大写字母：T 或 F。禁止输出其他内容。"
+    logger.debug(
+        "[LLMEnhancement] 唤醒延长模型请求："
+        f"provider_id={provider_id}, group={group_id}, user_id={sender_id}, "
+        f"system_prompt={system_prompt!r}, prompt={prompt!r}"
+    )
 
     try:
         resp = await provider.text_chat(
@@ -575,6 +617,13 @@ def _get_wake_judge_prompt_template(get_cfg: Callable[[str, Any], Any]) -> str:
         return template
     return _WAKE_JUDGE_PROMPT_DEFAULT
 
+
+def _get_wake_extend_judge_prompt_template(get_cfg: Callable[[str, Any], Any]) -> str:
+    template = str(get_cfg("wake_extend_judge_prompt", "") or "").strip()
+    if template:
+        return template
+    return _WAKE_EXTEND_JUDGE_PROMPT_DEFAULT
+
 def _render_prompt_template(template: str, values: Dict[str, str]) -> str:
     def repl(match: re.Match[str]) -> str:
         key = match.group(1)
@@ -625,7 +674,7 @@ async def evaluate_post_wake_judge(
         return True, "skip:disabled"
 
     prompt_template = _get_wake_judge_prompt_template(get_cfg)
-    history_count = 5
+    history_count = 6
     history_msgs = await get_history_msg(event, history_count)
     llm_decision, detail = await wake_judge_llm_decision(
         event=event,
@@ -761,18 +810,20 @@ async def evaluate_wake_extend(
         _mark_wake_extend_consumed(group_state, ref_ts)
         return True, "唤醒延长(阈值0)"
 
-    history_msgs = await get_history_msg(event, 5)
+    history_msgs = await get_history_msg(event, 6)
     if not history_msgs:
         return False, None
 
     provider_id = str(get_cfg("wake_extend_provider_id", "") or "").strip()
     if provider_id:
+        prompt_template = _get_wake_extend_judge_prompt_template(get_cfg)
         llm_decision = await wake_extend_llm_decision(
             event=event,
             msg=msg,
             history_msgs=history_msgs,
             threshold=threshold,
             provider_id=provider_id,
+            prompt_template=prompt_template,
             find_provider=find_provider,
         )
         if llm_decision is True:

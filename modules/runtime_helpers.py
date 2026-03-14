@@ -131,6 +131,146 @@ class BuiltinCommandMatcher:
         return any(candidate in self._cache for candidate in candidates)
 
 
+class EffectiveDialogHistory:
+    def __init__(self, max_turns: int = 3):
+        self._max_turns = max(1, int(max_turns))
+        self._turns_by_session: dict[str, list[dict[str, Any]]] = {}
+
+    @staticmethod
+    def normalize_text(text: Any) -> str:
+        normalized = " ".join(str(text or "").replace("\u200b", " ").split())
+        return normalized.strip()
+
+    def outline_components(self, components: list[Any]) -> str:
+        parts: list[str] = []
+        for comp in components or []:
+            seg_type = ""
+            if isinstance(comp, dict):
+                seg_type = str(comp.get("type") or "").strip().lower()
+                data = comp.get("data") or {}
+                if seg_type == "text":
+                    text = self.normalize_text((data or {}).get("text"))
+                    if text:
+                        parts.append(text)
+                    continue
+                if seg_type == "image":
+                    parts.append("[图片]")
+                elif seg_type == "video":
+                    parts.append("[视频]")
+                elif seg_type == "file":
+                    name = self.normalize_text((data or {}).get("name"))
+                    parts.append(f"[文件:{name}]" if name else "[文件]")
+                elif seg_type == "forward":
+                    parts.append("[合并转发]")
+                elif seg_type == "json":
+                    parts.append("[JSON]")
+                elif seg_type == "record":
+                    parts.append("[语音]")
+                continue
+
+            if isinstance(comp, Comp.Plain):
+                text = self.normalize_text(getattr(comp, "text", ""))
+                if text:
+                    parts.append(text)
+            elif isinstance(comp, Comp.Image):
+                parts.append("[图片]")
+            elif isinstance(comp, Comp.Video):
+                parts.append("[视频]")
+            elif isinstance(comp, Comp.File):
+                name = self.normalize_text(getattr(comp, "name", ""))
+                parts.append(f"[文件:{name}]" if name else "[文件]")
+            elif isinstance(comp, Comp.Forward):
+                parts.append("[合并转发]")
+            elif isinstance(comp, Comp.Json):
+                parts.append("[JSON]")
+            elif isinstance(comp, Comp.Record):
+                parts.append("[语音]")
+        return self.normalize_text(" ".join(parts))
+
+    def build_user_text(self, msg: str, components: list[Any]) -> str:
+        text = self.normalize_text(msg)
+        if text:
+            return text
+        return self.outline_components(components)
+
+    def extract_assistant_text(self, event: AstrMessageEvent) -> str:
+        result = event.get_result()
+        chain = list(getattr(result, "chain", None) or [])
+        if not chain:
+            return ""
+
+        parts: list[str] = []
+        for comp in chain:
+            if isinstance(comp, (Comp.Reply, Comp.At, Comp.AtAll)):
+                continue
+            if isinstance(comp, Comp.Plain):
+                text = self.normalize_text(getattr(comp, "text", ""))
+                if text:
+                    parts.append(text)
+            else:
+                comp_type = str(getattr(comp, "type", "") or comp.__class__.__name__).strip()
+                if comp_type:
+                    parts.append(f"[{comp_type}]")
+        return self.normalize_text(" ".join(parts))
+
+    def extract_assistant_text_from_response(self, resp: LLMResponse) -> str:
+        if resp.result_chain and getattr(resp.result_chain, "chain", None):
+            parts: list[str] = []
+            for comp in list(resp.result_chain.chain or []):
+                if isinstance(comp, Comp.Plain):
+                    text = self.normalize_text(getattr(comp, "text", ""))
+                    if text:
+                        parts.append(text)
+                else:
+                    comp_type = str(getattr(comp, "type", "") or comp.__class__.__name__).strip()
+                    if comp_type:
+                        parts.append(f"[{comp_type}]")
+            normalized = self.normalize_text(" ".join(parts))
+            if normalized:
+                return normalized
+        return self.normalize_text(getattr(resp, "completion_text", ""))
+
+    async def get_history_messages(
+        self,
+        event: AstrMessageEvent,
+        count: int,
+    ) -> list[str]:
+        turns = self._turns_by_session.get(event.unified_msg_origin, [])
+        if not turns:
+            return []
+
+        contexts: list[str] = []
+        for turn in turns:
+            user_text = self.normalize_text(turn.get("user"))
+            assistant_text = self.normalize_text(turn.get("assistant"))
+            if user_text:
+                contexts.append(f"user: {user_text}")
+            if assistant_text:
+                contexts.append(f"assistant: {assistant_text}")
+        return contexts[-count:] if count else contexts
+
+    def append_turn(
+        self,
+        umo: str,
+        user_text: str,
+        assistant_text: str,
+    ) -> None:
+        user_text = self.normalize_text(user_text)
+        assistant_text = self.normalize_text(assistant_text)
+        if (not umo) or (not user_text) or (not assistant_text):
+            return
+
+        turns = self._turns_by_session.setdefault(umo, [])
+        turns.append(
+            {
+                "user": user_text,
+                "assistant": assistant_text,
+                "ts": time.time(),
+            }
+        )
+        self._turns_by_session[umo] = turns[-self._max_turns:]
+
+
 def resolve_provider(context: Any, provider_id: str):
     """Find provider by configured id or name among available providers."""
     return find_provider(context, provider_id)

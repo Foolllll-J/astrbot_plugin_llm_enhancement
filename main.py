@@ -49,6 +49,7 @@ from .modules.qq_utils import (
 from .modules.blacklist import BlacklistManager
 from .modules.runtime_helpers import (
     BuiltinCommandMatcher,
+    EffectiveDialogHistory,
     cleanup_paths_later,
     resolve_provider,
     get_stt_provider,
@@ -133,6 +134,7 @@ class LLMEnhancement(Star):
         self.config = config
         self.cfg = {}
         self._recent_recalled_msg: dict[str, float] = {}
+        self._effective_dialog_history = EffectiveDialogHistory(max_turns=3)
         self._builtin_cmd_matcher = BuiltinCommandMatcher(cache_ttl_sec=60.0)
         self._refresh_config()
         self.sent = Sentiment()
@@ -570,13 +572,7 @@ class LLMEnhancement(Star):
                 group_state=g,
                 member=member,
                 get_cfg=self._get_cfg,
-                get_history_msg=lambda ev, count: get_history_messages(
-                    self.context,
-                    ev,
-                    role=None,
-                    count=count,
-                    with_role_prefix=True,
-                ),
+                get_history_msg=self._effective_dialog_history.get_history_messages,
                 similarity_fn=self.similarity.similarity,
                 find_provider=lambda provider_id: resolve_provider(self.context, provider_id),
             )
@@ -621,42 +617,10 @@ class LLMEnhancement(Star):
                     wake = True
                     reason = f"概率唤醒{prob_roll:.4f}<{prob_wake:.4f}"
 
-        wake, wake_judge_detail = await apply_post_wake_judge_gate(
-            event=event,
-            msg=msg,
-            gid=gid,
-            wake=wake,
-            wake_reason=reason,
-            command_trigger_event=command_trigger_event,
-            direct_wake=direct_wake,
-            force_dynamic_followup=force_dynamic_followup,
-            get_cfg=self._get_cfg,
-            get_history_msg=lambda ev, count: get_history_messages(
-                self.context,
-                ev,
-                role=None,
-                count=count,
-                with_role_prefix=True,
-            ),
-            find_provider=lambda provider_id: resolve_provider(self.context, provider_id),
-        )
-        if wake_judge_detail.startswith("model:") or wake_judge_detail.startswith("fallback_allow:"):
-            logger.debug(
-                "[LLMEnhancement] 唤醒判定："
-                f"group={gid or 'private'}, uid={uid}, reason={reason}, detail={wake_judge_detail}, wake={wake}"
-            )
-        if direct_wake and (not wake):
-            if wake_judge_detail.startswith("model:F"):
-                logger.debug(
-                    "[LLMEnhancement] 唤醒判定结果=F，已标记阻止本次 LLM 请求，但保留其他插件继续处理。"
-                    f"group={gid or 'private'}, uid={uid}, reason={reason}, detail={wake_judge_detail}"
-                )
-            event.set_extra("_llme_block_llm_request", True)
-            event.set_extra("_llme_block_llm_reason", wake_judge_detail)
-            return
-
-        event.set_extra("_llme_block_llm_request", False)
-        event.set_extra("_llme_block_llm_reason", "")
+        event.set_extra("_llme_direct_wake", direct_wake)
+        event.set_extra("_llme_wake_reason", reason)
+        event.set_extra("_llme_command_trigger_event", command_trigger_event)
+        event.set_extra("_llme_force_dynamic_followup", force_dynamic_followup)
 
         if dynamic_merge_mode and (not force_dynamic_followup) and (not command_trigger_event):
             target_uid = select_dynamic_owner_uid(
@@ -1258,7 +1222,6 @@ class LLMEnhancement(Star):
         event: AstrMessageEvent,
         user_id: str = "",
         duration: int = 0,
-        user_name: str = "",
         group_id: str = None,
     ) -> str:
         """
@@ -1268,14 +1231,12 @@ class LLMEnhancement(Star):
         Args:
             user_id (str, optional): 目标用户的 QQ 号。若操作对象就是当前对话者，可不提供；留空时默认使用当前消息发送者的 ID。
             duration (int): 禁言时长（秒）。0 为解禁；60-600 为警告级；3600-86400 为惩罚级；最大为 2592000 (30天)。请根据违规严重程度灵活选择。
-            user_name (str): 目标用户的昵称或称呼，用于回复确认。
             group_id (str, optional): 目标 QQ 群号。在私聊使用时必填，在群聊使用时可选（默认当前群）。
         """
         return await set_group_ban_logic(
             event,
             user_id,
             duration,
-            user_name,
             group_id,
             admin_required_tools=self._get_cfg("tool_admin_required_tools", []),
             enabled_dangerous_tools=self._get_cfg("enabled_dangerous_tools", []),
@@ -1663,15 +1624,6 @@ class LLMEnhancement(Star):
         if not uid:
             return
 
-        if bool(event.get_extra("_llme_block_llm_request", default=False)):
-            block_reason = str(event.get_extra("_llme_block_llm_reason", default="") or "")
-            logger.info(
-                "[LLMEnhancement] on_llm_request 拦截：当前准备发起 LLM 请求前，命中“阻止请求”标记。"
-                f"group={gid or 'private'}, uid={uid}, detail={block_reason or 'unknown'}"
-            )
-            event.stop_event()
-            return
-
         # 任意拦截等级都会拦截 LLM 请求。
         if await self.blacklist.intercept_llm_request(event):
             return
@@ -1766,8 +1718,42 @@ class LLMEnhancement(Star):
                 event.stop_event()
                 return
 
+            direct_wake = bool(event.get_extra("_llme_direct_wake", default=False))
+            wake_reason = str(event.get_extra("_llme_wake_reason", default="") or "")
+            command_trigger_event = bool(event.get_extra("_llme_command_trigger_event", default=False))
+            force_dynamic_followup = bool(event.get_extra("_llme_force_dynamic_followup", default=False))
+            wake, wake_judge_detail = await apply_post_wake_judge_gate(
+                event=event,
+                msg=event.message_str,
+                gid=gid,
+                wake=bool(event.is_at_or_wake_command),
+                wake_reason=wake_reason,
+                command_trigger_event=command_trigger_event,
+                direct_wake=direct_wake,
+                force_dynamic_followup=force_dynamic_followup,
+                get_cfg=self._get_cfg,
+                get_history_msg=self._effective_dialog_history.get_history_messages,
+                find_provider=lambda provider_id: resolve_provider(self.context, provider_id),
+            )
+            if wake_judge_detail.startswith("model:") or wake_judge_detail.startswith("fallback_allow:"):
+                logger.debug(
+                    "[LLMEnhancement] on_llm_request 唤醒判定："
+                    f"group={gid or 'private'}, uid={uid}, reason={wake_reason}, detail={wake_judge_detail}, wake={wake}"
+                )
+            if direct_wake and (not wake):
+                logger.info(
+                    "[LLMEnhancement] on_llm_request 拦截：显式唤醒判定未通过，已取消本次 LLM 请求。"
+                    f"group={gid or 'private'}, uid={uid}, reason={wake_reason}, detail={wake_judge_detail}"
+                )
+                event.stop_event()
+                return
+
             # ==================== 2. 防护机制（使用合并后的文本） ====================
             msg = event.message_str
+            event.set_extra(
+                "_llme_effective_user_text",
+                self._effective_dialog_history.build_user_text(msg, all_components),
+            )
             now = time.time()
 
             if gid:
@@ -1973,11 +1959,16 @@ class LLMEnhancement(Star):
                 member.cancel_merge = False
                 clear_pending_msg_ids(g, member)
                 event.set_extra("_llme_pending_last_response_update", False)
+                event.set_extra("_llme_effective_assistant_text_candidate", "")
                 event.stop_event()
                 return
 
             event.set_extra("_llme_pending_last_response_update", True)
             event.set_extra("_llme_discard_cache_clear_after_sent", False)
+            event.set_extra(
+                "_llme_effective_assistant_text_candidate",
+                self._effective_dialog_history.extract_assistant_text_from_response(resp),
+            )
             # 清理待处理消息 ID
             clear_pending_msg_ids(g, member)
             member.cancel_merge = False
@@ -2058,6 +2049,8 @@ class LLMEnhancement(Star):
             )
             event.set_extra("_llme_pending_last_response_update", False)
             event.set_extra("_llme_discard_cache_clear_after_sent", False)
+            event.set_extra("_llme_effective_user_text", "")
+            event.set_extra("_llme_effective_assistant_text_candidate", "")
             return
 
         gid: str = event.get_group_id()
@@ -2073,16 +2066,34 @@ class LLMEnhancement(Star):
         g.last_response_uid = state_uid
         g.last_response_ts = resp_ts
 
-        if should_clear_discard_cache:
-            async with member.lock:
+        cleared_recent_wake_count = 0
+        async with member.lock:
+            cleared_recent_wake_count = len(member.recent_wake_msgs)
+            member.recent_wake_msgs = []
+            if should_clear_discard_cache:
                 clear_discarded_response_cache(member)
+
+        user_text = str(event.get_extra("_llme_effective_user_text", default="") or "")
+        assistant_text = ""
+        if not bool(event.get_extra("_llme_discard_cache_used", default=False)):
+            assistant_text = str(event.get_extra("_llme_effective_assistant_text_candidate", default="") or "")
+        if not assistant_text:
+            assistant_text = self._effective_dialog_history.extract_assistant_text(event)
+        if user_text and assistant_text:
+            self._effective_dialog_history.append_turn(
+                event.unified_msg_origin,
+                user_text=user_text,
+                assistant_text=assistant_text,
+            )
 
         event.set_extra("_llme_pending_last_response_update", False)
         event.set_extra("_llme_discard_cache_clear_after_sent", False)
+        event.set_extra("_llme_effective_user_text", "")
+        event.set_extra("_llme_effective_assistant_text_candidate", "")
         logger.debug(
             "[LLMEnhancement] 已更新唤醒延长锚点："
             f"uid={uid}, state_uid={state_uid}, group={gid or 'private'}, ts={resp_ts:.3f}, "
-            f"clear_discard_cache={should_clear_discard_cache}"
+            f"clear_discard_cache={should_clear_discard_cache}, cleared_recent_wake_count={cleared_recent_wake_count}"
         )
 
     async def terminate(self):

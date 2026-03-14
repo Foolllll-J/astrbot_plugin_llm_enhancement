@@ -47,6 +47,16 @@
                 "default": "",
                 "hint": "留空时不启用模型判定。配置后会让该模型仅输出 T/F，用于判断是否继续响应。"
             },
+            "wake_extend_judge_prompt": {
+                "description": "唤醒延长判定提示词",
+                "type": "text",
+                "obvious_hint": true,
+                "editor_mode": true,
+                "editor_language": "markdown",
+                "editor_theme": "vs-dark",
+                "default": "请判断当前消息是否与上文足够相关，是否需要继续响应。\n\n[当前时间]\n{time}\n\n[用户ID]\n{user_id}\n\n[用户名]\n{user_name}\n\n[群组ID]\n{group_id}\n\n[相关性阈值参考]\n{threshold}\n\n[上文]\n{history}\n\n[当前消息]\n{message}\n\n[判定规则]\n1) 如果当前消息是对上文的自然追问、补充、纠正、承接或继续讨论，输出 T。\n2) 如果当前消息与上文明显无关、话题跳转过大，或不需要机器人继续响应，输出 F。\n3) 不确定时优先结合上文连续性判断；只有在明显无关时才输出 F。\n\n[输出格式]\n只能输出一个大写字母：T 或 F。",
+                "hint": "支持占位符：{time}、{user_id}、{user_name}、{group_id}、{threshold}、{history}、{message}。仅在配置了 wake_extend_provider_id 时生效。"
+            },
             "wake_judge_provider_id": {
                 "description": "唤醒判定 Provider ID",
                 "type": "string",
@@ -55,7 +65,7 @@
                 "hint": "仅用于普通 @ / 唤醒前缀请求的唤醒判定。留空表示不启用该判定。"
             },
             "wake_judge_prompt": {
-                "description": "唤醒判定提示词模板",
+                "description": "唤醒判定提示词",
                 "type": "text",
                 "obvious_hint": true,
                 "editor_mode": true,

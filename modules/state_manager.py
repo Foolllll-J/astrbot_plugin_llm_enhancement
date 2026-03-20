@@ -15,6 +15,8 @@ class MemberState(BaseModel):
     cancel_merge: bool = False                             # 是否取消当前的合并流程
     trigger_msg_id: Optional[str] = None                   # 触发当前流程的首条消息ID
     recent_wake_msgs: list[dict[str, Any]] = Field(default_factory=list) # 唤醒阶段预采样消息
+    last_wake_ts: float = 0.0                              # 最近一次唤醒时间（时间戳）
+    merge_start_ts: float = 0.0                            # 最近一次合并开始时间（时间戳）
     merged_msg_ids: dict[str, float] = Field(default_factory=dict)        # 已并入其他请求的消息ID过期表
     dynamic_unresolved_msgs: list[dict[str, Any]] = Field(default_factory=list)  # 动态合并待确认消息
     dynamic_request_seq: int = 0                            # 动态合并请求序号

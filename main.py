@@ -492,6 +492,8 @@ class LLMEnhancement(Star):
                 incoming_uid=uid,
                 allow_multi_user=allow_multi_user,
             )
+            if target_uid and (not allow_multi_user) and str(target_uid) != str(uid):
+                target_uid = None
             if not target_uid:
                 async with member.lock:
                     prejoin_candidate = has_recent_wake_in_window(
@@ -543,13 +545,8 @@ class LLMEnhancement(Star):
                     elif prejoin_candidate and str(target_uid) == str(uid):
                         async with target_member.lock:
                             upsert_dynamic_unresolved_snapshot(target_member, dynamic_snap)
-                        wake = True
-                        reason = "动态合并跟进(预请求窗口)"
-                        force_dynamic_followup = True
-                        dynamic_state_uid = str(target_uid)
-                        event.set_extra("_llme_dynamic_state_uid", dynamic_state_uid)
                         logger.debug(
-                            "[LLMEnhancement] 动态合并在预请求窗口捕获到新消息："
+                            "[LLMEnhancement] 动态合并预请求窗口缓存消息（未启动合并）："
                             f"group={gid or 'private'}, owner_uid={target_uid}, incoming_uid={uid}, "
                             f"msg_id={str(dynamic_snap.get('msg_id') or 'unknown')}, window={prejoin_window:.2f}s"
                         )
@@ -629,6 +626,8 @@ class LLMEnhancement(Star):
                 incoming_uid=uid,
                 allow_multi_user=allow_multi_user,
             )
+            if target_uid and (not allow_multi_user) and str(target_uid) != str(uid):
+                target_uid = None
             if target_uid:
                 target_member = g.members.get(target_uid)
                 if target_member and wake:
@@ -685,21 +684,17 @@ class LLMEnhancement(Star):
             event.is_at_or_wake_command = True
             log_prefix = f"群({gid})" if gid else "私聊"
             logger.debug(f"{log_prefix}用户({uid}) {reason}: {msg[:50]}")
+            async with member.lock:
+                member.last_wake_ts = now
             keep_sec = max(max(merge_cfg.delay_sec, 10.0) * 6, 60.0)
-            if command_trigger_event:
-                logger.debug(
-                    "[LLMEnhancement] 命令触发消息跳过合并缓存入池："
-                    f"group={gid or 'private'}, uid={uid}, msg={msg[:50]}"
-                )
-            else:
-                snap = {}
-                async with member.lock:
-                    prune_member_msg_cache(member, keep_sec=keep_sec)
-                    snap = build_event_snapshot(event, gid, uid)
-                    ensure_snapshot_merge_key(snap)
-                    upsert_recent_wake_snapshot(member, snap)
-                    if dynamic_merge_mode and dynamic_state_uid is None:
-                        upsert_dynamic_unresolved_snapshot(member, snap)
+            snap = {}
+            async with member.lock:
+                prune_member_msg_cache(member, keep_sec=keep_sec)
+                snap = build_event_snapshot(event, gid, uid)
+                ensure_snapshot_merge_key(snap)
+                upsert_recent_wake_snapshot(member, snap)
+                if dynamic_merge_mode and dynamic_state_uid is None:
+                    upsert_dynamic_unresolved_snapshot(member, snap)
 
     # ==================== 消息合并处理 ====================
 
@@ -876,6 +871,7 @@ class LLMEnhancement(Star):
         finally:
             async with member.lock:
                 member.in_merging = False # 合并结束
+                member.merge_start_ts = 0.0
             
         # 无论是否超时，如果已取消，直接返回
         if member.cancel_merge:
@@ -1658,6 +1654,16 @@ class LLMEnhancement(Star):
         cache_keep_sec = max(max(merge_cfg.delay_sec, 10.0) * 6, 60.0)
         async with merge_member.lock:
             prune_member_msg_cache(merge_member, keep_sec=cache_keep_sec)
+            if merge_delay > 0:
+                raw_message = (
+                    event.message_obj.raw_message
+                    if (event.message_obj and hasattr(event.message_obj, "raw_message"))
+                    else {}
+                )
+                if not raw_message and hasattr(event, "event"):
+                    raw_message = event.event
+                msg_ts = float(_raw_get(raw_message, "time", 0) or 0.0)
+                merge_member.merge_start_ts = msg_ts if msg_ts > 0 else now
             if (
                 dynamic_merge_mode
                 and current_msg_id
@@ -2080,10 +2086,13 @@ class LLMEnhancement(Star):
         if not assistant_text:
             assistant_text = self._effective_dialog_history.extract_assistant_text(event)
         if user_text and assistant_text:
+            assistant_name = "bot"
             self._effective_dialog_history.append_turn(
                 event.unified_msg_origin,
                 user_text=user_text,
                 assistant_text=assistant_text,
+                user_name=event.get_sender_name(),
+                assistant_name=assistant_name,
             )
 
         event.set_extra("_llme_pending_last_response_update", False)

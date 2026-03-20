@@ -277,6 +277,8 @@ def has_recent_wake_in_window(
         ts = float(item.get("ts", 0.0) or 0.0)
         if ts > latest_ts:
             latest_ts = ts
+    if member.last_wake_ts > latest_ts:
+        latest_ts = member.last_wake_ts
     if latest_ts <= 0:
         return False
     return (now_ts - latest_ts) <= window_sec
@@ -322,6 +324,11 @@ def prune_member_msg_cache(member: MemberState, keep_sec: float) -> None:
     now_ts = time.time()
     member.recent_wake_msgs = [
         item for item in member.recent_wake_msgs
+        if now_ts - float(item.get("ts", 0.0)) <= keep_sec
+    ]
+    member.dynamic_unresolved_msgs = [
+        item
+        for item in member.dynamic_unresolved_msgs
         if now_ts - float(item.get("ts", 0.0)) <= keep_sec
     ]
     expired_ids = [mid for mid, exp_ts in member.merged_msg_ids.items() if exp_ts <= now_ts]
@@ -376,6 +383,7 @@ def prepare_initial_merge_snapshots(
     if current_msg_id:
         upsert_recent_wake_snapshot(member, current_snapshot)
 
+    merge_start_ts = float(getattr(member, "merge_start_ts", 0.0) or 0.0)
     current_ts = float(current_snapshot.get("ts", time.time()))
     if current_msg_id:
         for item in member.recent_wake_msgs:
@@ -386,7 +394,10 @@ def prepare_initial_merge_snapshots(
     nearby_ts_list = [
         float(item.get("ts", current_ts))
         for item in member.recent_wake_msgs
-        if abs(float(item.get("ts", current_ts)) - current_ts) <= merge_delay
+        if (
+            (merge_start_ts <= 0.0 or float(item.get("ts", current_ts)) >= merge_start_ts)
+            and abs(float(item.get("ts", current_ts)) - current_ts) <= merge_delay
+        )
     ]
     window_start_ts = min(nearby_ts_list) if nearby_ts_list else current_ts
     window_end_ts = window_start_ts + merge_delay + merged_window_tolerance
@@ -399,6 +410,8 @@ def prepare_initial_merge_snapshots(
         if msg_id in member.merged_msg_ids and msg_id != current_msg_id:
             continue
         ts = float(item.get("ts", 0.0))
+        if merge_start_ts > 0.0 and ts < merge_start_ts:
+            continue
         if ts < window_start_ts:
             continue
         if ts > window_end_ts:
@@ -557,7 +570,16 @@ def prepare_dynamic_merge_batch(
     member.dynamic_request_seq += 1
     request_seq = member.dynamic_request_seq
     member.dynamic_inflight_seq = request_seq
-    group_state.dynamic_owner_uid = member.uid
+    if not group_state.dynamic_owner_uid:
+        group_state.dynamic_owner_uid = member.uid
+
+    merge_start_ts = float(getattr(member, "merge_start_ts", 0.0) or 0.0)
+    if merge_start_ts > 0.0:
+        member.dynamic_unresolved_msgs = [
+            item
+            for item in member.dynamic_unresolved_msgs
+            if float(item.get("ts", time.time())) >= merge_start_ts
+        ]
 
     selected_snapshots: list[Dict[str, Any]] = []
     current_ts = float(current_snapshot.get("ts", time.time()) or time.time())
@@ -567,6 +589,8 @@ def prepare_dynamic_merge_batch(
         if not allow_multi_user and item_uid and item_uid != uid:
             continue
         ts = float(item.get("ts", current_ts) or current_ts)
+        if merge_start_ts > 0.0 and ts < merge_start_ts:
+            continue
         if merge_delay > 0:
             if (current_ts - ts) > merge_delay:
                 continue
@@ -855,6 +879,7 @@ async def execute_dynamic_merge(
     finally:
         async with member.lock:
             member.in_merging = False
+            member.merge_start_ts = 0.0
 
     # 动态模式兜底校验：与硬等待一致，最终用 get_msg 过滤不可用/已撤回消息。
     if selected_snapshots:

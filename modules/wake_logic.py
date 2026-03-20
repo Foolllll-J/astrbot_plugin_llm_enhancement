@@ -1,10 +1,12 @@
 import re
+import random
 from datetime import datetime
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent
 import astrbot.api.message_components as Comp
+from astrbot.core import astrbot_config, db_helper, sp
 
 from .state_manager import GroupState, MemberState
 
@@ -522,15 +524,12 @@ async def wake_extend_llm_decision(
         "group_id": group_id,
         "threshold": f"{threshold:.2f}",
         "history": history_text,
-        "message": str(msg or ""),
+        "message": f"{sender_name}: {str(msg or '')}".strip(": "),
     }
+    await _ensure_persona_placeholder(event, placeholders, prompt_template)
+    placeholders.update(_build_prompt_extra_placeholders(event))
     prompt = _render_prompt_template(prompt_template, placeholders)
     system_prompt = "你是唤醒判定器。只输出一个大写字母：T 或 F。禁止输出其他内容。"
-    logger.debug(
-        "[LLMEnhancement] 唤醒延长模型请求："
-        f"provider_id={provider_id}, group={group_id}, user_id={sender_id}, "
-        f"system_prompt={system_prompt!r}, prompt={prompt!r}"
-    )
 
     try:
         resp = await provider.text_chat(
@@ -579,8 +578,10 @@ async def wake_judge_llm_decision(
         "user_name": sender_name,
         "group_id": group_id,
         "history": history_text,
-        "message": str(msg or ""),
+        "message": f"{sender_name}: {str(msg or '')}".strip(": "),
     }
+    await _ensure_persona_placeholder(event, placeholders, prompt_template)
+    placeholders.update(_build_prompt_extra_placeholders(event))
     prompt = _render_prompt_template(prompt_template, placeholders)
     system_prompt = (
         "你是唤醒判定器。"
@@ -632,6 +633,62 @@ def _render_prompt_template(template: str, values: Dict[str, str]) -> str:
         return match.group(0)
 
     return re.sub(r"\{([a-zA-Z_][a-zA-Z0-9_]*)\}", repl, template)
+
+
+def _build_prompt_extra_placeholders(event: AstrMessageEvent) -> Dict[str, str]:
+    rand_value = f"{random.random():.6f}"
+    return {
+        "random": rand_value,
+    }
+
+
+async def _ensure_persona_placeholder(
+    event: AstrMessageEvent,
+    placeholders: Dict[str, str],
+    prompt_template: str,
+    max_len: int = 800,
+) -> None:
+    if "{persona}" not in prompt_template:
+        return
+
+    umo = event.unified_msg_origin
+    persona_text = ""
+    persona_id = ""
+    try:
+        session_cfg = await sp.get_async(
+            scope="umo",
+            scope_id=str(umo),
+            key="session_service_config",
+            default={},
+        )
+        force_persona_id = (
+            (session_cfg or {}).get("persona_id") if isinstance(session_cfg, dict) else None
+        )
+
+        conv_id = await sp.session_get(umo, "sel_conv_id", None)
+        conv = await db_helper.get_conversation_by_id(conv_id) if conv_id else None
+        conv_persona_id = getattr(conv, "persona_id", None) if conv else None
+
+        persona_id = force_persona_id or conv_persona_id
+        if not persona_id or persona_id == "[%None]":
+            persona_id = astrbot_config.get("provider_settings", {}).get(
+                "default_personality",
+                "",
+            )
+
+        if persona_id:
+            persona = await db_helper.get_persona_by_id(persona_id)
+            if persona and getattr(persona, "system_prompt", None):
+                persona_text = str(persona.system_prompt or "").strip()
+            else:
+                persona_text = ""
+    except Exception as e:
+        logger.info(f"[LLMEnhancement] 解析 persona 占位符失败: {e}")
+
+    if len(persona_text) > max_len:
+        persona_text = persona_text[:max_len].rstrip() + "...(truncated)"
+
+    placeholders["persona"] = persona_text
 
 
 
@@ -710,6 +767,8 @@ async def apply_post_wake_judge_gate(
     """
     if not gid or not wake:
         return wake, "skip:not_woken"
+    if str(wake_reason or "").strip().startswith("唤醒延长"):
+        return True, "skip:wake_extend"
     if not should_apply_post_wake_gate(
         wake_reason=wake_reason,
         command_trigger_event=command_trigger_event,

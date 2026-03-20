@@ -243,10 +243,18 @@ class EffectiveDialogHistory:
         for turn in turns:
             user_text = self.normalize_text(turn.get("user"))
             assistant_text = self.normalize_text(turn.get("assistant"))
+            user_name = self.normalize_text(turn.get("user_name"))
+            assistant_name = self.normalize_text(turn.get("assistant_name"))
             if user_text:
-                contexts.append(f"user: {user_text}")
+                if user_name:
+                    contexts.append(f"{user_name}: {user_text}")
+                else:
+                    contexts.append(f"user: {user_text}")
             if assistant_text:
-                contexts.append(f"assistant: {assistant_text}")
+                if assistant_name:
+                    contexts.append(f"{assistant_name}: {assistant_text}")
+                else:
+                    contexts.append(f"assistant: {assistant_text}")
         return contexts[-count:] if count else contexts
 
     def append_turn(
@@ -254,17 +262,23 @@ class EffectiveDialogHistory:
         umo: str,
         user_text: str,
         assistant_text: str,
+        user_name: str = "",
+        assistant_name: str = "",
     ) -> None:
         user_text = self.normalize_text(user_text)
         assistant_text = self.normalize_text(assistant_text)
         if (not umo) or (not user_text) or (not assistant_text):
             return
 
+        user_name = self.normalize_text(user_name)
+        assistant_name = self.normalize_text(assistant_name)
         turns = self._turns_by_session.setdefault(umo, [])
         turns.append(
             {
                 "user": user_text,
                 "assistant": assistant_text,
+                "user_name": user_name,
+                "assistant_name": assistant_name,
                 "ts": time.time(),
             }
         )

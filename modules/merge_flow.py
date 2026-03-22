@@ -60,6 +60,21 @@ def load_merge_runtime_config(get_cfg: Callable[[str, Any], Any]) -> MergeRuntim
     )
 
 
+def normalize_event_ts(raw_ts: Any, fallback_ts: float) -> float:
+    """归一化事件时间戳，兼容秒/毫秒并避免异常未来时间影响合并窗口。"""
+    try:
+        ts = float(raw_ts or 0.0)
+    except Exception:
+        return float(fallback_ts)
+    if ts <= 0:
+        return float(fallback_ts)
+    if ts > 1e12:
+        ts = ts / 1000.0
+    if ts > (float(fallback_ts) + 86400.0):
+        return float(fallback_ts)
+    return ts
+
+
 def get_event_msg_id(event: AstrMessageEvent) -> Optional[str]:
     if hasattr(event, "message_obj") and hasattr(event.message_obj, "message_id"):
         raw_msg_id = getattr(event.message_obj, "message_id", None)
@@ -598,9 +613,14 @@ def prepare_dynamic_merge_batch(
             continue
         text = str(item.get("text") or "")
         components = item.get("components", []) or []
-        if not text and not components:
+        # 允许当前触发快照兜底进入，避免动态合并在部分平台上因空文本快照被全量过滤后误取消请求。
+        if not text and not components and ensure_snapshot_merge_key(item) != current_key:
             continue
         selected_snapshots.append(item)
+
+    if not selected_snapshots:
+        # 兜底：至少保留当前触发快照，避免动态合并把整批请求误判为空而取消。
+        selected_snapshots = [current_snapshot]
 
     if len(selected_snapshots) > merge_max_count:
         selected_snapshots = selected_snapshots[-merge_max_count:]

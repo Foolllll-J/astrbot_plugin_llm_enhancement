@@ -1,5 +1,6 @@
 import json
 import random
+from datetime import datetime
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
@@ -209,6 +210,116 @@ async def inject_current_message_image_context(
     return True
 
 
+def _format_forward_time(value: Any) -> str:
+    if value is None:
+        return ""
+    if hasattr(value, "strftime"):
+        try:
+            return value.strftime("%Y-%m-%d %H:%M:%S")
+        except Exception:
+            return str(value)
+    try:
+        ts = int(value)
+        if ts > 0:
+            return datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        pass
+    return ""
+
+
+def _extract_telegram_forward_origin_meta(event: AstrMessageEvent) -> dict[str, str]:
+    """提取 Telegram 转发来源元信息（最小且稳定）。"""
+    raw = getattr(getattr(event, "message_obj", None), "raw_message", None)
+    msg = getattr(raw, "message", None)
+    if msg is None:
+        return {}
+
+    meta: dict[str, str] = {}
+
+    # 优先使用 Telegram 新字段 forward_origin.sender_user
+    origin = getattr(msg, "forward_origin", None)
+    if origin is not None:
+        origin_type = str(getattr(origin, "type", "") or "").strip().lower()
+        type_map = {
+            "user": "用户",
+            "chat": "聊天",
+            "channel": "频道",
+            "hidden_user": "匿名用户",
+        }
+        if origin_type:
+            meta["source_type"] = type_map.get(origin_type, origin_type)
+        forward_time = _format_forward_time(getattr(origin, "date", None))
+        if forward_time:
+            meta["source_time"] = forward_time
+
+        sender_user = getattr(origin, "sender_user", None)
+        if sender_user is not None:
+            username = str(getattr(sender_user, "username", "") or "").strip()
+            first_name = str(getattr(sender_user, "first_name", "") or "").strip()
+            if username or first_name:
+                meta["source_name"] = username or first_name
+            is_bot = getattr(sender_user, "is_bot", None)
+            if isinstance(is_bot, bool):
+                meta["source_is_bot"] = "是" if is_bot else "否"
+            return meta
+
+    api_kwargs = getattr(msg, "api_kwargs", None)
+    if isinstance(api_kwargs, dict):
+        # 兼容日志中常见旧形态 forward_from
+        source_time = _format_forward_time(api_kwargs.get("forward_date"))
+        if source_time and ("source_time" not in meta):
+            meta["source_time"] = source_time
+
+        ff = api_kwargs.get("forward_from")
+        if isinstance(ff, dict):
+            username = str(ff.get("username") or "").strip()
+            first_name = str(ff.get("first_name") or "").strip()
+            if username or first_name:
+                meta["source_name"] = username or first_name
+            is_bot = ff.get("is_bot")
+            if isinstance(is_bot, bool):
+                meta["source_is_bot"] = "是" if is_bot else "否"
+            if "source_type" not in meta:
+                meta["source_type"] = "用户"
+
+    return meta
+
+
+async def inject_current_message_forward_origin_context(
+    event: AstrMessageEvent,
+    req: ProviderRequest,
+) -> bool:
+    """默认注入 Telegram 转发来源信息。"""
+    meta = _extract_telegram_forward_origin_meta(event)
+    if not meta:
+        return False
+
+    details: list[str] = ["当前消息为转发消息"]
+    source_type = str(meta.get("source_type") or "").strip()
+    source_name = str(meta.get("source_name") or "").strip()
+    source_time = str(meta.get("source_time") or "").strip()
+    source_is_bot = str(meta.get("source_is_bot") or "").strip()
+    if source_type:
+        details.append(f"来源类型为{source_type}")
+    if source_name:
+        details.append(f"来源为{source_name}")
+    if source_time:
+        details.append(f"原始发送时间为{source_time}")
+    if source_is_bot:
+        details.append(f"来源是否机器人：{source_is_bot}")
+
+    if len(details) <= 1:
+        return False
+
+    _append_context_block(
+        req,
+        details,
+        block_title="消息来源补充",
+        log_title="转发来源注入完成",
+    )
+    return True
+
+
 async def parse_reply_context(
     event: AstrMessageEvent,
     req: ProviderRequest,
@@ -400,10 +511,12 @@ async def process_reference_context(
 ) -> ReferenceContextResult:
     """处理引用、JSON、文件上下文注入，不处理转发聊天记录正文。"""
     result = ReferenceContextResult()
-    if not (IS_AIOCQHTTP and isinstance(event, AiocqhttpMessageEvent)):
-        return result
+    is_aiocqhttp_event = IS_AIOCQHTTP and isinstance(event, AiocqhttpMessageEvent)
     dynamic_batch_msg_ids = event.get_extra("_llme_dynamic_batch_msg_ids", default=[]) or []
     dynamic_batch_msg_ids = [str(mid).strip() for mid in dynamic_batch_msg_ids if str(mid).strip()]
+    if not is_aiocqhttp_event:
+        # 非 QQ 平台不支持按 message_id 回拉历史消息，关闭该分支。
+        dynamic_batch_msg_ids = []
 
     for seg in all_components:
         if isinstance(seg, Comp.Forward) and not result.forward_id:
@@ -412,7 +525,7 @@ async def process_reference_context(
         if isinstance(seg, Comp.Reply):
             result.reply_seg = seg
 
-    if event.is_at_or_wake_command and (not result.forward_id) and result.reply_seg:
+    if is_aiocqhttp_event and event.is_at_or_wake_command and (not result.forward_id) and result.reply_seg:
         parsed_reply = await parse_reply_context(
             event=event,
             req=req,

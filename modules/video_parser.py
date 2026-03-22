@@ -1077,6 +1077,68 @@ def _extract_videos_from_raw_event(event: AstrMessageEvent) -> List[str]:
         return []
 
 
+def _normalize_video_source_for_event(event: AstrMessageEvent, source: str) -> str:
+    """按平台归一化视频来源路径，优先返回可下载 URL。"""
+    src = str(source or "").strip()
+    if not src:
+        return ""
+    if src.startswith(("http://", "https://", "file://")) or os.path.isabs(src):
+        return src
+
+    # Telegram 常见 file_path 为相对远程路径，需拼接 base_file_url。
+    try:
+        bot = getattr(event, "bot", None)
+        base_file_url = getattr(bot, "base_file_url", None) if bot else None
+        if isinstance(base_file_url, str) and base_file_url.strip():
+            return f"{base_file_url.rstrip('/')}/{src.lstrip('/')}"
+    except Exception:
+        pass
+    return src
+
+
+async def _extract_videos_from_telegram_update(event: AstrMessageEvent) -> List[str]:
+    """从 Telegram Update 对象兜底提取视频源。"""
+    try:
+        raw = getattr(getattr(event, "message_obj", None), "raw_message", None)
+        update_message = getattr(raw, "message", None)
+        if update_message is None:
+            return []
+
+        sources: List[str] = []
+        video_obj = getattr(update_message, "video", None)
+        if video_obj is not None:
+            try:
+                file_obj = await video_obj.get_file()
+                file_path = str(getattr(file_obj, "file_path", "") or "").strip()
+                if file_path:
+                    sources.append(file_path)
+            except Exception:
+                pass
+
+        doc_obj = getattr(update_message, "document", None)
+        if doc_obj is not None:
+            mime_type = str(getattr(doc_obj, "mime_type", "") or "").lower()
+            file_name = str(getattr(doc_obj, "file_name", "") or "").lower()
+            if mime_type.startswith("video/") or file_name.endswith(
+                (".mp4", ".mov", ".avi", ".mkv", ".webm", ".flv", ".wmv", ".m4v", ".gif")
+            ):
+                try:
+                    file_obj = await doc_obj.get_file()
+                    file_path = str(getattr(file_obj, "file_path", "") or "").strip()
+                    if file_path:
+                        sources.append(file_path)
+                except Exception:
+                    pass
+
+        deduped: List[str] = []
+        for src in sources:
+            if src and src not in deduped:
+                deduped.append(src)
+        return deduped
+    except Exception:
+        return []
+
+
 async def _probe_duration_helper(get_cfg, media_path: str) -> float:
     try:
         duration = await asyncio.to_thread(
@@ -1244,6 +1306,8 @@ async def process_media_content(
     raw_video_sources: List[str] = []
     if not dynamic_batch_msg_ids:
         raw_video_sources = _extract_videos_from_raw_event(event)
+        if not raw_video_sources:
+            raw_video_sources = await _extract_videos_from_telegram_update(event)
     if raw_video_sources:
         video_sources = raw_video_sources + [src for src in video_sources if src not in raw_video_sources]
 
@@ -1271,14 +1335,27 @@ async def process_media_content(
                     f"msg_id={current_msg_id}, source_msg_id={video_source_msg_id}, fetched_video_sources={fetched_video_sources}"
                 )
 
-    if not video_sources and reply_seg and IS_AIOCQHTTP and isinstance(event, AiocqhttpMessageEvent):
-        try:
-            client = event.bot
-            original_msg = await client.api.call_action("get_msg", message_id=reply_seg.id)
-            if original_msg and "message" in original_msg:
-                video_sources = extract_videos_from_chain(original_msg["message"])
-        except Exception:
-            pass
+    if not video_sources and reply_seg:
+        if IS_AIOCQHTTP and isinstance(event, AiocqhttpMessageEvent):
+            try:
+                client = event.bot
+                original_msg = await client.api.call_action("get_msg", message_id=reply_seg.id)
+                if original_msg and "message" in original_msg:
+                    video_sources = extract_videos_from_chain(original_msg["message"])
+            except Exception:
+                pass
+        else:
+            reply_chain = getattr(reply_seg, "chain", None)
+            if isinstance(reply_chain, list) and reply_chain:
+                video_sources = extract_videos_from_chain(reply_chain)
+
+    if video_sources:
+        normalized_sources: List[str] = []
+        for src in video_sources:
+            normalized = _normalize_video_source_for_event(event, src)
+            if normalized and normalized not in normalized_sources:
+                normalized_sources.append(normalized)
+        video_sources = normalized_sources
 
     media_ctx = await detect_media_scenario(req, get_cfg, video_sources)
     req._cleanup_paths.extend(media_ctx.cleanup_paths)
@@ -1316,4 +1393,3 @@ async def process_media_content(
         )
 
     return False
-

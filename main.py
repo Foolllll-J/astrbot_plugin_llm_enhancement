@@ -12,7 +12,11 @@ from .modules.sentiment import Sentiment
 from .modules.similarity import Similarity
 from .modules.state_manager import StateManager, GroupState, MemberState
 from .modules.forward_parser import process_forward_record_content
-from .modules.reference_parser import process_reference_context, inject_current_message_image_context
+from .modules.reference_parser import (
+    process_reference_context,
+    inject_current_message_image_context,
+    inject_current_message_forward_origin_context,
+)
 from .modules.video_parser import (
     download_video_to_temp,
     process_media_content,
@@ -75,6 +79,7 @@ from .modules.wake_logic import (
 )
 from .modules.merge_flow import (
     load_merge_runtime_config,
+    normalize_event_ts,
     get_event_msg_id,
     extract_merge_components,
     build_message_buffer_from_snapshots,
@@ -1662,8 +1667,10 @@ class LLMEnhancement(Star):
                 )
                 if not raw_message and hasattr(event, "event"):
                     raw_message = event.event
-                msg_ts = float(_raw_get(raw_message, "time", 0) or 0.0)
-                merge_member.merge_start_ts = msg_ts if msg_ts > 0 else now
+                raw_msg_ts = _raw_get(raw_message, "time", None)
+                if raw_msg_ts in (None, ""):
+                    raw_msg_ts = _raw_get(raw_message, "date", None)
+                merge_member.merge_start_ts = normalize_event_ts(raw_msg_ts, now)
             if (
                 dynamic_merge_mode
                 and current_msg_id
@@ -1838,6 +1845,10 @@ class LLMEnhancement(Star):
                     event=event,
                     req=req,
                 )
+            await inject_current_message_forward_origin_context(
+                event=event,
+                req=req,
+            )
              
             # ==================== 3. 引用/JSON/文件上下文注入（不含转发聊天记录解析） ====================
             ref_result = await process_reference_context(

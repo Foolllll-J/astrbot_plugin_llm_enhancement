@@ -76,6 +76,8 @@ from .modules.wake_logic import (
     prepare_empty_mention_context,
     evaluate_mention_wake,
     contains_forbidden_wake_word,
+    extract_recent_bot_text,
+    should_block_relevant_wake_by_substring,
 )
 from .modules.merge_flow import (
     load_merge_runtime_config,
@@ -589,8 +591,12 @@ class LLMEnhancement(Star):
                 if bmsgs := await get_history_messages(self.context, event, count=relevant_ctx_count):
                     simi = await self.similarity.similarity(gid, msg, bmsgs)
                     if simi >= relevant_wake:
-                        wake = True
-                        reason = f"话题相关性{simi:.2f}>={relevant_wake:.2f}"
+                        recent_bot_msg = extract_recent_bot_text(bmsgs)
+                        if should_block_relevant_wake_by_substring(msg, recent_bot_msg):
+                            wake = False
+                        else:
+                            wake = True
+                            reason = f"话题相关性{simi:.2f}>={relevant_wake:.2f}"
 
         # 答疑唤醒 (仅群聊)
         if gid and not wake:

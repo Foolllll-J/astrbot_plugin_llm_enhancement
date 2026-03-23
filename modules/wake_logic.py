@@ -12,6 +12,7 @@ from .state_manager import GroupState, MemberState
 
 _MENTION_WAKE_REGEX_CACHE: dict[str, re.Pattern[str]] = {}
 _MENTION_WAKE_REGEX_INVALID: set[str] = set()
+_ACTIVE_WAKE_JUDGE_TYPES = {"mention", "relevant", "ask", "bored", "prob"}
 _WAKE_JUDGE_PROMPT_DEFAULT = """你是群聊“唤醒判定器”。请判断机器人是否应该响应这条显式唤醒请求。
 
 [当前时间]
@@ -480,6 +481,62 @@ def contains_forbidden_wake_word(message_text: str, forbidden_words: Any) -> Opt
     return None
 
 
+def normalize_wake_text(text: str) -> str:
+    """用于唤醒判定的最小归一化：去首尾、压缩空白。"""
+    s = str(text or "").strip()
+    if not s:
+        return ""
+    return re.sub(r"\s+", " ", s)
+
+
+def extract_recent_bot_text(bot_msgs: List[str]) -> str:
+    """提取最近一条可用 bot 文本。"""
+    if not bot_msgs:
+        return ""
+    for msg in reversed(bot_msgs):
+        normalized = normalize_wake_text(str(msg or ""))
+        if normalized:
+            return normalized
+    return ""
+
+
+def should_block_relevant_wake_by_substring(user_msg: str, recent_bot_msg: str) -> bool:
+    """
+    relevant_wake 后置拦截：
+    当前用户消息是最近 bot 消息的完整子串时，阻止唤醒。
+    """
+    user_norm = normalize_wake_text(user_msg)
+    bot_norm = normalize_wake_text(recent_bot_msg)
+    if not user_norm or not bot_norm:
+        return False
+    return user_norm in bot_norm
+
+
+def _parse_active_wake_judge_types(raw_types: Any) -> set[str]:
+    if isinstance(raw_types, (list, tuple, set)):
+        candidates = [str(v or "").strip().lower() for v in raw_types]
+    elif isinstance(raw_types, str):
+        candidates = [s.strip().lower() for s in raw_types.split(",")]
+    else:
+        candidates = []
+    return {item for item in candidates if item in _ACTIVE_WAKE_JUDGE_TYPES}
+
+
+def _wake_reason_to_active_type(wake_reason: str) -> Optional[str]:
+    reason = str(wake_reason or "")
+    if reason.startswith("提及唤醒"):
+        return "mention"
+    if reason.startswith("话题相关性"):
+        return "relevant"
+    if reason.startswith("答疑唤醒"):
+        return "ask"
+    if reason.startswith("无聊唤醒"):
+        return "bored"
+    if reason.startswith("概率唤醒"):
+        return "prob"
+    return None
+
+
 def _extract_provider_text(response: Any) -> str:
     """尽可能从 Provider 响应中提取文本。"""
     try:
@@ -696,18 +753,27 @@ def should_apply_post_wake_gate(
     wake_reason: str,
     command_trigger_event: bool,
     direct_wake: bool,
+    get_cfg: Callable[[str, Any], Any],
     force_dynamic_followup: bool = False,
 ) -> bool:
     """
     是否执行“唤醒判定”流程。
     仅作用于普通显式唤醒（@ / 唤醒前缀），不影响插件主动处理的特殊唤醒场景。
     """
-    if command_trigger_event or (not direct_wake) or force_dynamic_followup:
+    if command_trigger_event or force_dynamic_followup:
         return False
 
     reason = str(wake_reason or "")
-    # 仅普通文本显式唤醒（@ / 唤醒前缀）走唤醒判定
-    return reason == "at_or_cmd"
+    # 普通文本显式唤醒（@ / 唤醒前缀）始终走唤醒判定
+    if direct_wake and reason == "at_or_cmd":
+        return True
+
+    # 主动唤醒类型按配置决定是否走唤醒判定
+    active_type = _wake_reason_to_active_type(reason)
+    if not active_type:
+        return False
+    enabled_types = _parse_active_wake_judge_types(get_cfg("active_wake_judge_types", []))
+    return active_type in enabled_types
 
 
 def is_post_wake_gate_enabled(
@@ -773,6 +839,7 @@ async def apply_post_wake_judge_gate(
         wake_reason=wake_reason,
         command_trigger_event=command_trigger_event,
         direct_wake=direct_wake,
+        get_cfg=get_cfg,
         force_dynamic_followup=force_dynamic_followup,
     ):
         return wake, "skip:not_applicable"

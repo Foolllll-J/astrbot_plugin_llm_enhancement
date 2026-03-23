@@ -74,6 +74,26 @@
                 "default": "你是群聊“唤醒判定器”。请判断机器人是否应该响应这条显式唤醒请求。\n\n[当前时间]\n{time}\n\n[用户ID]\n{user_id}\n\n[用户名]\n{user_name}\n\n[群组ID]\n{group_id}\n\n[最近上下文]\n{history}\n\n[当前消息]\n{message}\n\n[判定规则]\n1) 用户明确表示“别回复/不用回/闭嘴/停下”等，输出 F。\n2) 当前消息仅为收尾确认（如“嗯/好/知道了/收到/晚安/拜拜/谢谢”）且没有新问题或新任务，输出 F。\n3) 含有新的问题、任务、追问，或明确要求继续，输出 T。\n4) 不确定时优先输出 T，避免漏回关键请求。\n\n[输出格式]\n只能输出一个大写字母：T 或 F。",
                 "hint": "支持占位符：{time}、{user_id}、{user_name}、{group_id}、{history}、{message}、{persona}、{random}。"
             },
+            "active_wake_judge_types": {
+                "description": "主动唤醒判定类型",
+                "hint": "选择后，这些主动唤醒类型会在触发后再经过一次唤醒判定。留空表示不对主动唤醒额外判定。",
+                "type": "list",
+                "options": [
+                    "mention",
+                    "relevant",
+                    "ask",
+                    "bored",
+                    "prob"
+                ],
+                "labels": [
+                    "提及唤醒",
+                    "相关性唤醒",
+                    "答疑唤醒",
+                    "无聊唤醒",
+                    "兜底概率唤醒"
+                ],
+                "default": []
+            },
             "mention_wake": {
                 "description": "提及唤醒规则",
                 "hint": "支持普通文本包含、re:pattern 与 /pattern/flags（flags: i,m,s,x,a,u,L）。不填时关闭提及检测。",

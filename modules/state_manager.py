@@ -37,6 +37,9 @@ class GroupState(BaseModel):
     last_response_ts: float = 0.0                          # 最近一次响应时间（时间戳）
     wake_extend_consumed_ref_ts: float = 0.0               # 已消费一次性唤醒延长期所对应的响应时间戳
     dynamic_owner_uid: Optional[str] = None                # 动态合并当前会话所有者（用于多人合并）
+    context_messages: list[dict[str, Any]] = Field(default_factory=list) # 轻量上下文缓存（环形裁剪）
+    last_user_interaction: dict[str, float] = Field(default_factory=dict) # 每个用户最近互动时间戳
+    context_bot_last_replied_to_uid: str = ""              # Bot 最近一次回复目标用户ID
 
 
 class StateManager:

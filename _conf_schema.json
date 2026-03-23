@@ -74,6 +74,13 @@
                 "default": "你是群聊“唤醒判定器”。请判断机器人是否应该响应这条显式唤醒请求。\n\n[当前时间]\n{time}\n\n[用户ID]\n{user_id}\n\n[用户名]\n{user_name}\n\n[群组ID]\n{group_id}\n\n[最近上下文]\n{history}\n\n[当前消息]\n{message}\n\n[判定规则]\n1) 用户明确表示“别回复/不用回/闭嘴/停下”等，输出 F。\n2) 当前消息仅为收尾确认（如“嗯/好/知道了/收到/晚安/拜拜/谢谢”）且没有新问题或新任务，输出 F。\n3) 含有新的问题、任务、追问，或明确要求继续，输出 T。\n4) 不确定时优先输出 T，避免漏回关键请求。\n\n[输出格式]\n只能输出一个大写字母：T 或 F。",
                 "hint": "支持占位符：{time}、{user_id}、{user_name}、{group_id}、{history}、{message}、{persona}、{random}。"
             },
+            "wake_judge_context_count": {
+                "description": "唤醒判定上下文条数",
+                "hint": "唤醒判定与唤醒延长共用的上下文条数。默认 10，且不会超过“上下文记录上限”。",
+                "type": "int",
+                "default": 10,
+                "minimum": 1
+            },
             "active_wake_judge_types": {
                 "description": "主动唤醒判定类型",
                 "hint": "选择后，这些主动唤醒类型会在触发后再经过一次唤醒判定。留空表示不对主动唤醒额外判定。",
@@ -202,6 +209,76 @@
                 "hint": "开启后，合并窗口期间若有其他群成员发送消息，也会被一并收集。",
                 "type": "bool",
                 "default": false
+            }
+        }
+    },
+    "context_injection": {
+        "type": "object",
+        "description": "上下文注入",
+        "hint": "用于记录并注入轻量对话上下文，为后续读空气与主动唤醒优化提供基础数据。",
+        "items": {
+            "context_injection_mode": {
+                "description": "上下文注入模式",
+                "hint": "控制轻量上下文记录与注入策略。",
+                "type": "string",
+                "options": [
+                    "off",
+                    "before_active_only",
+                    "before_all_wake"
+                ],
+                "labels": [
+                    "不启用",
+                    "仅主动唤醒前",
+                    "所有唤醒前"
+                ],
+                "default": "off"
+            },
+            "context_injection_max_messages": {
+                "description": "上下文记录上限",
+                "hint": "每个会话最多保留的上下文消息条数（环形缓存）。建议 6~50。",
+                "type": "int",
+                "default": 12
+            },
+            "context_injection_format": {
+                "description": "上下文注入格式",
+                "hint": "精简：仅注入时间+发送者+文本（含引用摘要）；详细：注入完整结构字段（含 msg_id、uid、@信息、reply 信息）。",
+                "type": "string",
+                "options": [
+                    "simple",
+                    "detailed"
+                ],
+                "labels": [
+                    "精简",
+                    "详细"
+                ],
+                "default": "simple"
+            },
+            "context_injection_non_text_parse_options": {
+                "description": "非文本消息解析选项",
+                "hint": "控制上下文记录阶段对非文本消息的处理方式。未勾选时使用占位符。聊天记录仅抽取文本，不做媒体解析。",
+                "type": "list",
+                "options": [
+                    "image",
+                    "forward",
+                    "url",
+                    "file",
+                    "json"
+                ],
+                "labels": [
+                    "图片",
+                    "聊天记录",
+                    "URL",
+                    "文件",
+                    "JSON"
+                ],
+                "default": []
+            },
+            "context_injection_image_caption_provider_id": {
+                "description": "上下文图像转述 Provider ID",
+                "type": "string",
+                "_special": "select_provider",
+                "default": "",
+                "hint": "留空时自动选择具备图片能力的 Provider。"
             }
         }
     },

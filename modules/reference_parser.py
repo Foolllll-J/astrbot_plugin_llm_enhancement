@@ -557,7 +557,7 @@ async def process_reference_context(
             sender_name = event.get_sender_name() or "未知用户"
             parts: list[str] = []
             if direct_json_infos:
-                parts.append(f"{sender_name} 发送的分享卡片信息：{'；'.join(direct_json_infos[:2])}。")
+                parts.append(f"{sender_name} 发送的分享卡片信息：{'；'.join(direct_json_infos)}。")
             if direct_json_news_texts:
                 parts.append(f"分享卡片正文摘录：{'；'.join(direct_json_news_texts[:5])}。")
             _append_prompt_context(req, parts)
@@ -598,7 +598,7 @@ async def process_reference_context(
                         req,
                         [
                             f"{sender_name} 发送的文件内容摘要："
-                            + "；".join(f"{n}: {t}" for n, t in direct_file_infos[:2])
+                            + "；".join(f"{n}: {t}" for n, t in direct_file_infos)
                             + "。"
                         ],
                     )
@@ -714,7 +714,7 @@ async def process_reference_context(
                     sender_text = "、".join(merged_sender_names[:3]) if merged_sender_names else (event.get_sender_name() or "未知用户")
                     parts: list[str] = []
                     if merged_json_infos:
-                        parts.append(f"{sender_text} 发送的分享卡片信息：{'；'.join(merged_json_infos[:2])}。")
+                        parts.append(f"{sender_text} 发送的分享卡片信息：{'；'.join(merged_json_infos)}。")
                     if merged_json_news_texts:
                         parts.append(f"分享卡片正文摘录：{'；'.join(merged_json_news_texts[:5])}。")
                     _append_prompt_context(req, parts)
@@ -743,7 +743,7 @@ async def process_reference_context(
                     if merged_file_infos:
                         _append_prompt_context(
                             req,
-                            ["合并消息中的文件内容摘要：" + "；".join(f"{n}: {t}" for n, t in merged_file_infos[:2]) + "。"],
+                            ["合并消息中的文件内容摘要：" + "；".join(f"{n}: {t}" for n, t in merged_file_infos) + "。"],
                         )
                         result.injected_file = True
 

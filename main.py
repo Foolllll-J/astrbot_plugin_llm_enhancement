@@ -13,6 +13,7 @@ from .modules.similarity import Similarity
 from .modules.state_manager import StateManager, GroupState, MemberState
 from .modules.forward_parser import process_forward_record_content
 from .modules.reference_parser import (
+    ReferenceContextResult,
     process_reference_context,
     inject_current_message_image_context,
     inject_current_message_forward_origin_context,
@@ -111,6 +112,26 @@ from .modules.merge_flow import (
     remove_pending_msg_id,
     clear_pending_msg_ids,
 )
+from .modules.dialogue_context import (
+    is_context_injection_enabled,
+    get_context_injection_max_messages,
+    get_context_non_text_parse_options,
+    get_wake_history_messages,
+    get_image_component_label,
+    extract_raw_image_datas_from_event,
+    compute_active_wake_adjustment,
+    extract_addressing_signals,
+    try_build_reply_preview,
+    try_get_image_caption,
+    build_text_context_enrichment,
+    build_non_text_context_text,
+    build_context_text,
+    append_group_context_message,
+    find_context_entry_by_msg_id,
+    can_reuse_reply_context_entry,
+    inject_context_into_request,
+    inject_cached_reply_context,
+)
 try:
     from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import AiocqhttpMessageEvent
     IS_AIOCQHTTP = True
@@ -167,6 +188,7 @@ class LLMEnhancement(Star):
         # 2. 平铺对象配置
         for section in [
             "intelligent_wake",
+            "context_injection",
             "parse_switches",
             "video_injection",
             "forward_parsing",
@@ -360,8 +382,24 @@ class LLMEnhancement(Star):
         gid: str = event.get_group_id() # 私聊下为 None
         uid: str = event.get_sender_id()
         msg: str = event.message_str.strip() if event.message_str else ""
+        context_injection_enabled = bool(gid) and is_context_injection_enabled(self._get_cfg)
+        context_injection_max_messages = (
+            get_context_injection_max_messages(self._get_cfg)
+            if context_injection_enabled
+            else 0
+        )
         
         g = StateManager.get_group(gid or f"private_{uid}")
+        async def _get_wake_context_messages(_event, count: int) -> list[str]:
+            msgs = get_wake_history_messages(
+                group_state=g,
+                get_cfg=self._get_cfg,
+                count=count,
+            )
+            if msgs:
+                return msgs
+            # 兜底：当上下文注入关闭或暂无记录时，回退到旧的有效对话历史。
+            return await self._effective_dialog_history.get_history_messages(_event, count)
         command_trigger_event = self._is_command_trigger_event(event)
 
         # 1. 全局屏蔽检查
@@ -418,6 +456,141 @@ class LLMEnhancement(Star):
             has_json_component,
             file_name,
         ) = detect_wake_media_components(message_chain)
+        at_targets, at_bot, at_all, reply_to_id, reply_msg_id = extract_addressing_signals(
+            message_chain,
+            bot_id=bid,
+        )
+        raw_image_datas = extract_raw_image_datas_from_event(event)
+        active_wake_factor = 1.0
+        active_wake_reasons: list[str] = []
+        relevant_wake_factor = 1.0
+        relevant_wake_reasons: list[str] = []
+        if gid:
+            active_wake_factor, active_wake_reasons = compute_active_wake_adjustment(
+                group_state=g,
+                current_uid=uid,
+                bot_id=bid,
+                at_targets=at_targets,
+                at_all=at_all,
+                reply_to_id=reply_to_id,
+                include_state_bias=False,
+            )
+            relevant_wake_factor, relevant_wake_reasons = compute_active_wake_adjustment(
+                group_state=g,
+                current_uid=uid,
+                bot_id=bid,
+                at_targets=at_targets,
+                at_all=at_all,
+                reply_to_id=reply_to_id,
+                include_state_bias=True,
+            )
+            if active_wake_factor < 0.999:
+                logger.debug(
+                    "[LLMEnhancement] 主动唤醒降权命中："
+                    f"group={gid}, uid={uid}, factor={active_wake_factor:.3f}, reasons={','.join(active_wake_reasons)}"
+                )
+            if relevant_wake_factor < active_wake_factor:
+                logger.debug(
+                    "[LLMEnhancement] 相关性附加状态降权命中："
+                    f"group={gid}, uid={uid}, factor={relevant_wake_factor:.3f}, reasons={','.join(relevant_wake_reasons)}"
+                )
+
+        if context_injection_enabled:
+            reply_preview = await try_build_reply_preview(event, reply_msg_id)
+            parse_options = get_context_non_text_parse_options(self._get_cfg)
+            current_msg_id = get_event_msg_id(event) or ""
+            context_text = ""
+            if msg:
+                text_enrichment = await build_text_context_enrichment(
+                    event=event,
+                    get_cfg=self._get_cfg,
+                    message_chain=message_chain,
+                    parse_options=parse_options,
+                )
+                if "image" in parse_options and has_image_component:
+                    image_caption = await try_get_image_caption(
+                        event=event,
+                        message_chain=message_chain,
+                        get_cfg=self._get_cfg,
+                        provider_by_id_resolver=lambda provider_id: resolve_provider(self.context, provider_id),
+                        default_provider_resolver=lambda: get_vision_provider(self.context, self._get_cfg, event=event),
+                    )
+                    if image_caption:
+                        image_label = get_image_component_label(message_chain, raw_image_datas=raw_image_datas)
+                        text_enrichment = (
+                            f"{text_enrichment} | {image_label}转述: {image_caption}"
+                            if text_enrichment
+                            else f"{image_label}转述: {image_caption}"
+                        )
+                if text_enrichment:
+                    context_text = f"{msg} | {text_enrichment}"
+            if (not context_text) and (not msg):
+                context_text = await build_non_text_context_text(
+                    event=event,
+                    get_cfg=self._get_cfg,
+                    message_chain=message_chain,
+                    sender_name=event.get_sender_name(),
+                    msg_id=current_msg_id,
+                    parse_options=parse_options,
+                    raw_image_datas=raw_image_datas,
+                    provider_by_id_resolver=lambda provider_id: resolve_provider(self.context, provider_id),
+                    default_provider_resolver=lambda: get_vision_provider(self.context, self._get_cfg, event=event),
+                )
+            if not context_text:
+                image_caption = ""
+                image_label = "图片"
+                if (not msg) and ("image" in parse_options):
+                    # 非文本场景下，若勾选了图片解析，再尝试图片转述并参与回退构建。
+                    image_caption = await try_get_image_caption(
+                        event=event,
+                        message_chain=message_chain,
+                        get_cfg=self._get_cfg,
+                        provider_by_id_resolver=lambda provider_id: resolve_provider(self.context, provider_id),
+                        default_provider_resolver=lambda: get_vision_provider(self.context, self._get_cfg, event=event),
+                    )
+                    image_label = get_image_component_label(message_chain, raw_image_datas=raw_image_datas)
+                context_text = build_context_text(
+                    msg,
+                    event.get_sender_name(),
+                    image_caption=image_caption,
+                    has_image_component=has_image_component,
+                    has_video_component=has_video_component,
+                    has_file_component=has_file_component,
+                    has_forward_component=has_forward_component,
+                    has_json_component=has_json_component,
+                    file_name=file_name,
+                    image_label=image_label,
+                )
+            parse_features: list[str] = []
+            if "聊天记录抽取:" in context_text:
+                parse_features.append("forward")
+            if "URL解析:" in context_text:
+                parse_features.append("url")
+            if "JSON解析:" in context_text:
+                parse_features.append("json")
+            if "文件摘要:" in context_text:
+                parse_features.append("file")
+            if ("图片转述:" in context_text) or ("表情包转述:" in context_text):
+                parse_features.append("image")
+            append_group_context_message(
+                g,
+                uid=uid,
+                sender_name=event.get_sender_name(),
+                message_text=context_text,
+                max_messages=context_injection_max_messages,
+                msg_id=current_msg_id,
+                is_bot=False,
+                source="incoming",
+                at_targets=at_targets,
+                at_bot=at_bot,
+                at_all=at_all,
+                reply_to_id=reply_to_id,
+                reply_msg_id=reply_msg_id,
+                reply_preview=reply_preview,
+                parse_features=parse_features,
+                now_ts=now,
+                get_cfg=self._get_cfg,
+            )
 
         normalized_msg, normalized_reason = normalize_wake_trigger_message(
             wake=wake,
@@ -576,7 +749,7 @@ class LLMEnhancement(Star):
                 group_state=g,
                 member=member,
                 get_cfg=self._get_cfg,
-                get_history_msg=self._effective_dialog_history.get_history_messages,
+                get_history_msg=_get_wake_context_messages,
                 similarity_fn=self.similarity.similarity,
                 find_provider=lambda provider_id: resolve_provider(self.context, provider_id),
             )
@@ -590,40 +763,62 @@ class LLMEnhancement(Star):
                 relevant_ctx_count = self.similarity.context_count_for_query(msg)
                 if bmsgs := await get_history_messages(self.context, event, count=relevant_ctx_count):
                     simi = await self.similarity.similarity(gid, msg, bmsgs)
-                    if simi >= relevant_wake:
+                    adjusted_simi = simi * relevant_wake_factor
+                    if adjusted_simi >= relevant_wake:
                         recent_bot_msg = extract_recent_bot_text(bmsgs)
                         if should_block_relevant_wake_by_substring(msg, recent_bot_msg):
                             wake = False
                         else:
                             wake = True
-                            reason = f"话题相关性{simi:.2f}>={relevant_wake:.2f}"
+                            reason = f"话题相关性{adjusted_simi:.2f}>={relevant_wake:.2f}"
+                    elif relevant_wake_factor < 0.999:
+                        logger.debug(
+                            "[LLMEnhancement] 相关性主动唤醒降权未达阈值："
+                            f"raw={simi:.3f}, adjusted={adjusted_simi:.3f}, th={float(relevant_wake):.3f}, "
+                            f"factor={relevant_wake_factor:.3f}, reasons={','.join(relevant_wake_reasons)}"
+                        )
 
         # 答疑唤醒 (仅群聊)
         if gid and not wake:
             ask_wake = self._get_cfg("ask_wake")
             if ask_wake:  
                 ask_score = await self.sent.ask(msg)
-                if ask_score >= ask_wake:
+                adjusted_ask_score = ask_score * active_wake_factor
+                if adjusted_ask_score >= ask_wake:
                     wake = True
-                    reason = f"答疑唤醒{ask_score:.2f}>={ask_wake:.2f}"
+                    reason = f"答疑唤醒{adjusted_ask_score:.2f}>={ask_wake:.2f}"
+                elif active_wake_factor < 0.999:
+                    logger.debug(
+                        "[LLMEnhancement] 答疑主动唤醒降权未达阈值："
+                        f"raw={ask_score:.3f}, adjusted={adjusted_ask_score:.3f}, th={float(ask_wake):.3f}, "
+                        f"factor={active_wake_factor:.3f}, reasons={','.join(active_wake_reasons)}"
+                    )
 
         # 无聊唤醒 (仅群聊)
         if gid and not wake:
             bored_wake = self._get_cfg("bored_wake")
             if bored_wake:
                 bored_score = await self.sent.bored(msg)
-                if bored_score >= bored_wake:
+                adjusted_bored_score = bored_score * active_wake_factor
+                if adjusted_bored_score >= bored_wake:
                     wake = True
-                    reason = f"无聊唤醒{bored_score:.2f}>={bored_wake:.2f}"
+                    reason = f"无聊唤醒{adjusted_bored_score:.2f}>={bored_wake:.2f}"
+                elif active_wake_factor < 0.999:
+                    logger.debug(
+                        "[LLMEnhancement] 无聊主动唤醒降权未达阈值："
+                        f"raw={bored_score:.3f}, adjusted={adjusted_bored_score:.3f}, th={float(bored_wake):.3f}, "
+                        f"factor={active_wake_factor:.3f}, reasons={','.join(active_wake_reasons)}"
+                    )
 
         # 概率唤醒 (仅群聊)
         if gid and not wake:
             prob_wake = self._get_cfg("prob_wake")
             if prob_wake:  
                 prob_roll = random.random()
-                if prob_roll < prob_wake:
+                adjusted_prob_wake = float(prob_wake) * active_wake_factor
+                if prob_roll < adjusted_prob_wake:
                     wake = True
-                    reason = f"概率唤醒{prob_roll:.4f}<{prob_wake:.4f}"
+                    reason = f"概率唤醒{prob_roll:.4f}<{adjusted_prob_wake:.4f}"
 
         event.set_extra("_llme_direct_wake", direct_wake)
         event.set_extra("_llme_wake_reason", reason)
@@ -1638,6 +1833,16 @@ class LLMEnhancement(Star):
         merge_cfg = load_merge_runtime_config(self._get_cfg)
         dynamic_merge_mode = bool(merge_cfg.dynamic_mode and merge_cfg.delay_sec > 0)
         g = StateManager.get_group(gid or f"private_{uid}")
+        async def _get_wake_context_messages(_event, count: int) -> list[str]:
+            msgs = get_wake_history_messages(
+                group_state=g,
+                get_cfg=self._get_cfg,
+                count=count,
+            )
+            if msgs:
+                return msgs
+            # 兜底：当上下文注入关闭或暂无记录时，回退到旧的有效对话历史。
+            return await self._effective_dialog_history.get_history_messages(_event, count)
         if uid not in g.members:
             g.members[uid] = MemberState(uid=uid)
         sender_member = g.members[uid]
@@ -1751,7 +1956,7 @@ class LLMEnhancement(Star):
                 direct_wake=direct_wake,
                 force_dynamic_followup=force_dynamic_followup,
                 get_cfg=self._get_cfg,
-                get_history_msg=self._effective_dialog_history.get_history_messages,
+                get_history_msg=_get_wake_context_messages,
                 find_provider=lambda provider_id: resolve_provider(self.context, provider_id),
             )
             if wake_judge_detail.startswith("model:") or wake_judge_detail.startswith("fallback_allow:"):
@@ -1831,6 +2036,19 @@ class LLMEnhancement(Star):
                     )
                 )
 
+            injected_context, inject_detail, _injected_block = inject_context_into_request(
+                req=req,
+                group_state=g,
+                get_cfg=self._get_cfg,
+                direct_wake=direct_wake,
+                wake_reason=wake_reason,
+            )
+            if injected_context:
+                logger.debug(
+                    "[LLMEnhancement][ContextInjection] 已注入上下文："
+                    f"group={gid or 'private'}, uid={uid}, reason={wake_reason}, detail={inject_detail}"
+                )
+
             injection_summary = {
                 "perception": perception_injected,
                 "member_info": sender_member_injected,
@@ -1845,6 +2063,41 @@ class LLMEnhancement(Star):
             # 注册清理路径容器
             req._cleanup_paths = []
 
+            # 引用并直接唤醒时，优先尝试按 message_id 复用本地上下文缓存，避免重复解析。
+            skip_reference_parse = False
+            if bool(event.is_at_or_wake_command):
+                _at_targets, _at_bot, _at_all, _reply_to_id, reply_msg_id = extract_addressing_signals(
+                    all_components,
+                    bot_id=event.get_self_id(),
+                )
+                cached_entry = find_context_entry_by_msg_id(
+                    group_state=g,
+                    msg_id=reply_msg_id,
+                    get_cfg=self._get_cfg,
+                )
+                allow_cache_reuse = can_reuse_reply_context_entry(
+                    entry=cached_entry,
+                    get_cfg=self._get_cfg,
+                )
+                if allow_cache_reuse:
+                    reused, reuse_detail, _reuse_block = inject_cached_reply_context(
+                        req=req,
+                        group_state=g,
+                        reply_msg_id=reply_msg_id,
+                        get_cfg=self._get_cfg,
+                    )
+                    if reused:
+                        skip_reference_parse = True
+                        logger.info(
+                            "[LLMEnhancement][ContextInjection] 引用缓存复用命中："
+                            f"group={gid or 'private'}, uid={uid}, detail={reuse_detail}"
+                        )
+                elif cached_entry is not None:
+                    logger.info(
+                        "[LLMEnhancement][ContextInjection] 引用缓存命中但未直接复用："
+                        f"group={gid or 'private'}, uid={uid}, reason=forward_media_parse_enabled"
+                    )
+
             dynamic_batch_msg_ids = event.get_extra("_llme_dynamic_batch_msg_ids", default=[]) or []
             if not dynamic_batch_msg_ids:
                 await inject_current_message_image_context(
@@ -1857,13 +2110,16 @@ class LLMEnhancement(Star):
             )
              
             # ==================== 3. 引用/JSON/文件上下文注入（不含转发聊天记录解析） ====================
-            ref_result = await process_reference_context(
-                event=event,
-                req=req,
-                all_components=all_components,
-                get_cfg=self._get_cfg,
-                download_media=download_video_to_temp,
-            )
+            if skip_reference_parse:
+                ref_result = ReferenceContextResult()
+            else:
+                ref_result = await process_reference_context(
+                    event=event,
+                    req=req,
+                    all_components=all_components,
+                    get_cfg=self._get_cfg,
+                    download_media=download_video_to_temp,
+                )
             injection_summary["json"] = bool(getattr(ref_result, "injected_json", False))
             injection_summary["file"] = bool(getattr(ref_result, "injected_file", False))
             injection_summary["url"] = bool(getattr(ref_result, "injected_url", False))
@@ -1927,6 +2183,12 @@ class LLMEnhancement(Star):
 
         target_id = gid or f"private_{uid}"
         g = StateManager.get_group(target_id)
+        context_injection_enabled = bool(gid) and is_context_injection_enabled(self._get_cfg)
+        context_injection_max_messages = (
+            get_context_injection_max_messages(self._get_cfg)
+            if context_injection_enabled
+            else 0
+        )
         state_uid = str(event.get_extra("_llme_dynamic_state_uid", default=uid) or uid).strip()
         member = g.members.get(state_uid)
 
@@ -2010,6 +2272,32 @@ class LLMEnhancement(Star):
             else:
                 # 正常可发送内容，发送成功后清理缓存。
                 event.set_extra("_llme_discard_cache_clear_after_sent", True)
+
+            if context_injection_enabled:
+                assistant_text = self._effective_dialog_history.extract_assistant_text_from_response(resp)
+                if not assistant_text:
+                    assistant_text = str(resp.completion_text or "").strip()
+                if assistant_text and str(resp.role or "").lower() != "err":
+                    append_group_context_message(
+                        g,
+                        uid=str(event.get_self_id() or "bot"),
+                        sender_name="Bot",
+                        message_text=assistant_text,
+                        max_messages=context_injection_max_messages,
+                        msg_id="",
+                        is_bot=True,
+                        source="assistant",
+                        at_targets=[],
+                        at_bot=False,
+                        at_all=False,
+                        reply_to_id=state_uid,
+                        reply_msg_id="",
+                        reply_preview="",
+                        now_ts=time.time(),
+                        get_cfg=self._get_cfg,
+                    )
+                    sender_name = event.get_sender_name()
+                    g.context_bot_last_replied_to_uid = state_uid
 
     @filter.on_decorating_result(priority=95)
     async def on_decorating_result(self, event: AstrMessageEvent):

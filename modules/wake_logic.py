@@ -587,7 +587,6 @@ async def wake_extend_llm_decision(
     placeholders.update(_build_prompt_extra_placeholders(event))
     prompt = _render_prompt_template(prompt_template, placeholders)
     system_prompt = "你是唤醒判定器。只输出一个大写字母：T 或 F。禁止输出其他内容。"
-
     try:
         resp = await provider.text_chat(
             prompt=prompt,
@@ -645,7 +644,6 @@ async def wake_judge_llm_decision(
         "严格只输出一个大写字母：T 或 F。"
         "不要输出解释、标点、换行或其他字符。"
     )
-
     try:
         resp = await provider.text_chat(
             prompt=prompt,
@@ -668,6 +666,16 @@ async def wake_judge_llm_decision(
 
 def _get_wake_judge_provider_id(get_cfg: Callable[[str, Any], Any]) -> str:
     return str(get_cfg("wake_judge_provider_id", "") or "").strip()
+
+
+def _get_wake_judge_context_count(get_cfg: Callable[[str, Any], Any]) -> int:
+    raw = get_cfg("wake_judge_context_count", 10)
+    try:
+        value = int(raw)
+    except Exception:
+        value = 10
+    return max(1, min(50, value))
+
 
 def _get_wake_judge_prompt_template(get_cfg: Callable[[str, Any], Any]) -> str:
     template = str(get_cfg("wake_judge_prompt", "") or "").strip()
@@ -797,7 +805,7 @@ async def evaluate_post_wake_judge(
         return True, "skip:disabled"
 
     prompt_template = _get_wake_judge_prompt_template(get_cfg)
-    history_count = 6
+    history_count = _get_wake_judge_context_count(get_cfg)
     history_msgs = await get_history_msg(event, history_count)
     llm_decision, detail = await wake_judge_llm_decision(
         event=event,
@@ -936,7 +944,8 @@ async def evaluate_wake_extend(
         _mark_wake_extend_consumed(group_state, ref_ts)
         return True, "唤醒延长(阈值0)"
 
-    history_msgs = await get_history_msg(event, 6)
+    history_count = _get_wake_judge_context_count(get_cfg)
+    history_msgs = await get_history_msg(event, history_count)
     if not history_msgs:
         return False, None
 

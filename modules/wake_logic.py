@@ -636,6 +636,7 @@ async def wake_judge_llm_decision(
     event: AstrMessageEvent,
     msg: str,
     history_msgs: List[str],
+    wake_reason: str,
     provider_id: str,
     prompt_template: str,
     find_provider: Callable[[str], Any],
@@ -663,6 +664,9 @@ async def wake_judge_llm_decision(
     await _ensure_persona_placeholder(event, placeholders, prompt_template)
     placeholders.update(_build_prompt_extra_placeholders(event))
     prompt = _render_prompt_template(prompt_template, placeholders)
+    trigger_note = _build_wake_trigger_note(wake_reason)
+    if trigger_note:
+        prompt = f"{trigger_note}\n\n{prompt}"
     system_prompt = (
         "你是唤醒判定器。"
         "严格只输出一个大写字母：T 或 F。"
@@ -722,6 +726,35 @@ def _render_prompt_template(template: str, values: Dict[str, str]) -> str:
         return match.group(0)
 
     return re.sub(r"\{([a-zA-Z_][a-zA-Z0-9_]*)\}", repl, template)
+
+
+def _build_wake_trigger_note(wake_reason: str) -> str:
+    """构造唤醒判定前置说明"""
+    reason = str(wake_reason or "").strip()
+    if not reason:
+        return ""
+
+    if reason == "at_or_cmd":
+        wake_type = "direct"
+        source_desc = "显式唤醒（@ 或唤醒前缀）"
+    else:
+        mapped = _wake_reason_to_active_type(reason)
+        wake_type = mapped or "other"
+        source_map = {
+            "mention": "提及触发",
+            "relevant": "相关性主动唤醒",
+            "ask": "答疑主动唤醒",
+            "bored": "无聊主动唤醒",
+            "prob": "概率主动唤醒",
+            "other": "其他触发",
+        }
+        source_desc = source_map.get(wake_type, "其他触发")
+
+    return (
+        "[触发说明]\n"
+        f"- 本次唤醒来源: {source_desc}\n"
+        f"- 原始触发原因: {reason}"
+    )
 
 
 def _build_prompt_extra_placeholders(event: AstrMessageEvent) -> Dict[str, str]:
@@ -819,6 +852,7 @@ async def evaluate_post_wake_judge(
     event: AstrMessageEvent,
     msg: str,
     gid: str,
+    wake_reason: str,
     get_cfg: Callable[[str, Any], Any],
     get_history_msg: Callable[[AstrMessageEvent, int], Awaitable[List[str]]],
     find_provider: Callable[[str], Any],
@@ -835,6 +869,7 @@ async def evaluate_post_wake_judge(
         event=event,
         msg=msg,
         history_msgs=history_msgs,
+        wake_reason=wake_reason,
         provider_id=provider_id,
         prompt_template=prompt_template,
         find_provider=find_provider,
@@ -882,6 +917,7 @@ async def apply_post_wake_judge_gate(
         event=event,
         msg=msg,
         gid=gid,
+        wake_reason=wake_reason,
         get_cfg=get_cfg,
         get_history_msg=get_history_msg,
         find_provider=find_provider,

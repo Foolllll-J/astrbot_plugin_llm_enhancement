@@ -670,7 +670,7 @@ class VideoFrameProcessor:
                     logger.warning("[VideoFrameProcessor] msg_id 为空，跳过缓存写入")
                 
                 self._inject_summary(req, summary, "视频转述", sender_name=sender_name)
-                logger.info(f"[VideoFrameProcessor] 视频总结成功并注入，来源: {sender_name or '当前消息'}")
+                logger.debug(f"[VideoFrameProcessor] 视频总结成功并注入，来源: {sender_name or '当前消息'}")
                 # 注册清理
                 for frame in frames:
                     req._cleanup_paths = req._cleanup_paths or []
@@ -753,7 +753,7 @@ class VideoFrameProcessor:
                 self._inject_summary(req, summary, "内容摘要", sender_name=sender_name)
                 # 只保留最后一帧
                 req.image_urls = [frames[-1]]
-                logger.info("[VideoFrameProcessor] GIF 总结成功")
+                logger.debug("[VideoFrameProcessor] GIF 总结成功")
             else:
                 logger.warning("[VideoFrameProcessor] GIF 总结为空，回退到首帧")
                 req.image_urls = [frames[0]]

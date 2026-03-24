@@ -701,7 +701,7 @@ def request_dynamic_recompute_stop(
             )
             stop_mode = "request_agent_stop_all"
         if stopped_count > 0:
-            logger.info(
+            logger.debug(
                 "[LLMEnhancement] 动态软重算已停止进行中的任务："
                 f"umo={event.unified_msg_origin}, owner_uid={owner_uid}, inflight_seq={inflight_seq}, "
                 f"stopped_count={stopped_count}, mode={stop_mode}"
@@ -791,7 +791,7 @@ def schedule_dynamic_recompute_requeue(
                     break
                 await asyncio.sleep(0.05)
             event_queue.put_nowait(replay_event)
-            logger.info(
+            logger.debug(
                 "[LLMEnhancement] 动态软重算消息已重排入队："
                 f"umo={event.unified_msg_origin}, owner_uid={owner_uid}, inflight_seq={inflight_seq}, "
                 f"attempt={attempt + 1}, delay_sec={delay_sec:.2f}, waited_active_runner={waited_sec:.2f}"

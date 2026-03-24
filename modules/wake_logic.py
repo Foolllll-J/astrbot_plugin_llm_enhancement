@@ -489,27 +489,51 @@ def normalize_wake_text(text: str) -> str:
     return re.sub(r"\s+", " ", s)
 
 
-def extract_recent_bot_text(bot_msgs: List[str]) -> str:
-    """提取最近一条可用 bot 文本。"""
-    if not bot_msgs:
-        return ""
-    for msg in reversed(bot_msgs):
-        normalized = normalize_wake_text(str(msg or ""))
-        if normalized:
-            return normalized
-    return ""
-
-
-def should_block_relevant_wake_by_substring(user_msg: str, recent_bot_msg: str) -> bool:
+def compute_relevant_context_substring_downweight(
+    user_msg: str,
+    history_msgs: List[str],
+    *,
+    min_user_len: int = 6,
+    single_hit_factor: float = 0.7,
+    floor_factor: float = 0.4,
+) -> tuple[float, int]:
     """
-    relevant_wake 后置拦截：
-    当前用户消息是最近 bot 消息的完整子串时，阻止唤醒。
+    relevant_wake 后置降权（上下文子串）：
+    若当前用户消息是相关性上下文中任一消息的完整子串，则按命中次数做额外降权。
+
+    返回 (factor, hit_count)：
+    - factor: 0~1 之间，1 表示未触发降权
+    - hit_count: 命中上下文条目数量
     """
     user_norm = normalize_wake_text(user_msg)
-    bot_norm = normalize_wake_text(recent_bot_msg)
-    if not user_norm or not bot_norm:
-        return False
-    return user_norm in bot_norm
+    if not user_norm:
+        return 1.0, 0
+    if len(user_norm) < max(1, int(min_user_len)):
+        return 1.0, 0
+
+    hit_count = 0
+    for item in list(history_msgs or []):
+        context_norm = normalize_wake_text(str(item or ""))
+        if (not context_norm) or (len(context_norm) < len(user_norm)):
+            continue
+        if user_norm in context_norm:
+            hit_count += 1
+    if hit_count <= 0:
+        return 1.0, 0
+
+    try:
+        base = float(single_hit_factor)
+    except Exception:
+        base = 0.7
+    try:
+        floor = float(floor_factor)
+    except Exception:
+        floor = 0.4
+    base = max(0.05, min(1.0, base))
+    floor = max(0.05, min(1.0, floor))
+
+    factor = max(floor, base**hit_count)
+    return factor, hit_count
 
 
 def _parse_active_wake_judge_types(raw_types: Any) -> set[str]:
@@ -599,7 +623,7 @@ async def wake_extend_llm_decision(
             logger.info("[LLMEnhancement] 唤醒延长模型判定结果: T")
             return True
         if text.startswith("F"):
-            logger.info("[LLMEnhancement] 唤醒延长模型判定结果: F")
+            logger.debug("[LLMEnhancement] 唤醒延长模型判定结果: F")
             return False
         logger.warning(f"[LLMEnhancement] 唤醒延长模型判定返回无效结果: {text[:20]}")
         return None
@@ -748,7 +772,7 @@ async def _ensure_persona_placeholder(
             else:
                 persona_text = ""
     except Exception as e:
-        logger.info(f"[LLMEnhancement] 解析 persona 占位符失败: {e}")
+        logger.debug(f"[LLMEnhancement] 解析 persona 占位符失败: {e}")
 
     if len(persona_text) > max_len:
         persona_text = persona_text[:max_len].rstrip() + "...(truncated)"

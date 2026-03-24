@@ -216,10 +216,10 @@ class Similarity:
         s = self._to_plain_text(user_msg)
         semantic_len = len(re.sub(r"\s+", "", s))
         if semantic_len <= 8:
-            return 3
+            return 4
         if semantic_len >= 25:
-            return 7
-        return 5
+            return 8
+        return 6
 
     async def similarity(
         self,

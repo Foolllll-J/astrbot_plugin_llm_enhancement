@@ -373,15 +373,15 @@ async def parse_reply_context(
             forward_prob = float(get_cfg("quote_self_forward_block_prob", 0) or 0)
 
             if enable_video_parse and has_video and video_prob > 0 and random.random() < video_prob:
-                logger.info(f"[LLMEnhancement] 引用 Bot 自己的视频，按概率拦截（{video_prob}）")
+                logger.debug(f"[LLMEnhancement] 引用 Bot 自己的视频，按概率拦截（{video_prob}）")
                 result.blocked = True
                 return result
             if enable_file_parse and has_file and file_prob > 0 and random.random() < file_prob:
-                logger.info(f"[LLMEnhancement] 引用 Bot 自己的文件，按概率拦截（{file_prob}）")
+                logger.debug(f"[LLMEnhancement] 引用 Bot 自己的文件，按概率拦截（{file_prob}）")
                 result.blocked = True
                 return result
             if enable_forward_parse and has_forward and forward_prob > 0 and random.random() < forward_prob:
-                logger.info(f"[LLMEnhancement] 引用 Bot 自己的转发，按概率拦截（{forward_prob}）")
+                logger.debug(f"[LLMEnhancement] 引用 Bot 自己的转发，按概率拦截（{forward_prob}）")
                 result.blocked = True
                 return result
 

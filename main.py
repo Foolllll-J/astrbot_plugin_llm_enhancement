@@ -59,7 +59,6 @@ from .modules.runtime_helpers import (
     resolve_provider,
     get_stt_provider,
     get_vision_provider,
-    get_history_messages,
     get_discarded_response_ttl_sec,
     clear_discarded_response_cache,
     store_discarded_response_cache,
@@ -77,8 +76,7 @@ from .modules.wake_logic import (
     prepare_empty_mention_context,
     evaluate_mention_wake,
     contains_forbidden_wake_word,
-    extract_recent_bot_text,
-    should_block_relevant_wake_by_substring,
+    compute_relevant_context_substring_downweight,
 )
 from .modules.merge_flow import (
     load_merge_runtime_config,
@@ -162,7 +160,7 @@ class LLMEnhancement(Star):
         self.config = config
         self.cfg = {}
         self._recent_recalled_msg: dict[str, float] = {}
-        self._effective_dialog_history = EffectiveDialogHistory(max_turns=3)
+        self._effective_dialog_history = EffectiveDialogHistory(max_turns=4)
         self._builtin_cmd_matcher = BuiltinCommandMatcher(cache_ttl_sec=60.0)
         self._refresh_config()
         self.sent = Sentiment()
@@ -703,7 +701,7 @@ class LLMEnhancement(Star):
                                 inflight_seq=inflight_seq,
                             )
                             if requeued:
-                                logger.info(
+                                logger.debug(
                                     "[LLMEnhancement] 动态软重算已中断旧流程并停止当前事件，等待重排消息触发新请求："
                                     f"group={gid or 'private'}, owner_uid={target_uid}, incoming_uid={uid}, "
                                     f"inflight_seq={inflight_seq}"
@@ -761,22 +759,19 @@ class LLMEnhancement(Star):
             relevant_wake = self._get_cfg("relevant_wake")
             if relevant_wake:
                 relevant_ctx_count = self.similarity.context_count_for_query(msg)
-                if bmsgs := await get_history_messages(self.context, event, count=relevant_ctx_count):
+                if bmsgs := await self._effective_dialog_history.get_history_messages(
+                    event,
+                    relevant_ctx_count,
+                ):
                     simi = await self.similarity.similarity(gid, msg, bmsgs)
-                    adjusted_simi = simi * relevant_wake_factor
+                    repeat_factor, _hit_count = compute_relevant_context_substring_downweight(
+                        msg,
+                        bmsgs,
+                    )
+                    adjusted_simi = simi * relevant_wake_factor * repeat_factor
                     if adjusted_simi >= relevant_wake:
-                        recent_bot_msg = extract_recent_bot_text(bmsgs)
-                        if should_block_relevant_wake_by_substring(msg, recent_bot_msg):
-                            wake = False
-                        else:
-                            wake = True
-                            reason = f"话题相关性{adjusted_simi:.2f}>={relevant_wake:.2f}"
-                    elif relevant_wake_factor < 0.999:
-                        logger.debug(
-                            "[LLMEnhancement] 相关性主动唤醒降权未达阈值："
-                            f"raw={simi:.3f}, adjusted={adjusted_simi:.3f}, th={float(relevant_wake):.3f}, "
-                            f"factor={relevant_wake_factor:.3f}, reasons={','.join(relevant_wake_reasons)}"
-                        )
+                        wake = True
+                        reason = f"话题相关性{adjusted_simi:.2f}>={relevant_wake:.2f}"
 
         # 答疑唤醒 (仅群聊)
         if gid and not wake:
@@ -787,12 +782,6 @@ class LLMEnhancement(Star):
                 if adjusted_ask_score >= ask_wake:
                     wake = True
                     reason = f"答疑唤醒{adjusted_ask_score:.2f}>={ask_wake:.2f}"
-                elif active_wake_factor < 0.999:
-                    logger.debug(
-                        "[LLMEnhancement] 答疑主动唤醒降权未达阈值："
-                        f"raw={ask_score:.3f}, adjusted={adjusted_ask_score:.3f}, th={float(ask_wake):.3f}, "
-                        f"factor={active_wake_factor:.3f}, reasons={','.join(active_wake_reasons)}"
-                    )
 
         # 无聊唤醒 (仅群聊)
         if gid and not wake:
@@ -803,12 +792,6 @@ class LLMEnhancement(Star):
                 if adjusted_bored_score >= bored_wake:
                     wake = True
                     reason = f"无聊唤醒{adjusted_bored_score:.2f}>={bored_wake:.2f}"
-                elif active_wake_factor < 0.999:
-                    logger.debug(
-                        "[LLMEnhancement] 无聊主动唤醒降权未达阈值："
-                        f"raw={bored_score:.3f}, adjusted={adjusted_bored_score:.3f}, th={float(bored_wake):.3f}, "
-                        f"factor={active_wake_factor:.3f}, reasons={','.join(active_wake_reasons)}"
-                    )
 
         # 概率唤醒 (仅群聊)
         if gid and not wake:
@@ -854,7 +837,7 @@ class LLMEnhancement(Star):
                                 inflight_seq=inflight_seq,
                             )
                             if requeued:
-                                logger.info(
+                                logger.debug(
                                     "[LLMEnhancement] 动态软重算已中断旧流程并停止当前事件，等待重排消息触发新请求："
                                     f"group={gid or 'private'}, owner_uid={target_uid}, incoming_uid={uid}, "
                                     f"inflight_seq={inflight_seq}"
@@ -1965,7 +1948,7 @@ class LLMEnhancement(Star):
                     f"group={gid or 'private'}, uid={uid}, reason={wake_reason}, detail={wake_judge_detail}, wake={wake}"
                 )
             if direct_wake and (not wake):
-                logger.info(
+                logger.debug(
                     "[LLMEnhancement] on_llm_request 拦截：显式唤醒判定未通过，已取消本次 LLM 请求。"
                     f"group={gid or 'private'}, uid={uid}, reason={wake_reason}, detail={wake_judge_detail}"
                 )
@@ -2088,12 +2071,12 @@ class LLMEnhancement(Star):
                     )
                     if reused:
                         skip_reference_parse = True
-                        logger.info(
+                        logger.debug(
                             "[LLMEnhancement][ContextInjection] 引用缓存复用命中："
                             f"group={gid or 'private'}, uid={uid}, detail={reuse_detail}"
                         )
                 elif cached_entry is not None:
-                    logger.info(
+                    logger.debug(
                         "[LLMEnhancement][ContextInjection] 引用缓存命中但未直接复用："
                         f"group={gid or 'private'}, uid={uid}, reason=forward_media_parse_enabled"
                     )

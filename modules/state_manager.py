@@ -16,13 +16,14 @@ class MemberState(BaseModel):
     trigger_msg_id: Optional[str] = None                   # 触发当前流程的首条消息ID
     recent_wake_msgs: list[dict[str, Any]] = Field(default_factory=list) # 唤醒阶段预采样消息
     last_wake_ts: float = 0.0                              # 最近一次唤醒时间（时间戳）
-    merge_start_ts: float = 0.0                            # 最近一次合并开始时间（时间戳）
+    merge_start_ts: float = 0.0                            # 合并会话起点时间（硬等待: 当前请求；动态: 当前会话）
     merged_msg_ids: dict[str, float] = Field(default_factory=dict)        # 已并入其他请求的消息ID过期表
     dynamic_unresolved_msgs: list[dict[str, Any]] = Field(default_factory=list)  # 动态合并待确认消息
     dynamic_request_seq: int = 0                            # 动态合并请求序号
     dynamic_inflight_seq: int = 0                           # 当前进行中的动态请求序号
     dynamic_discard_before_seq: int = 0                     # 小于等于该序号的响应将被丢弃
     dynamic_discarded_response_cache: dict[str, Any] = Field(default_factory=dict)  # 动态合并被丢弃响应缓存
+    dynamic_capture_count: int = 0                          # 动态会话已接收（去重后）消息数量
 
     model_config = ConfigDict(arbitrary_types_allowed=True)
 

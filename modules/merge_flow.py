@@ -37,6 +37,13 @@ class MergeRuntimeConfig:
     allow_multi_user: bool
 
 
+@dataclass(frozen=True)
+class DynamicSoftRecomputeDecision:
+    inflight_seq: int
+    accepted: bool
+    reason: str
+
+
 def load_merge_runtime_config(get_cfg: Callable[[str, Any], Any]) -> MergeRuntimeConfig:
     """Load merge settings from top-level `merge` object only."""
     raw_merge_obj = get_cfg("merge", {})
@@ -158,6 +165,33 @@ def apply_merged_message_to_request(
         merged_msg = "\n".join([f"[{name}]: {msg}" for _, name, msg in message_buffer])
     else:
         merged_msg = " ".join([msg for _, _, msg in message_buffer])
+
+    merged_anchor_msg_id = next(
+        (str(mid).strip() for mid, _name, _content in reversed(message_buffer) if str(mid or "").strip()),
+        "",
+    )
+    if merged_anchor_msg_id:
+        anchor_value: Any = (
+            int(merged_anchor_msg_id) if merged_anchor_msg_id.isdigit() else merged_anchor_msg_id
+        )
+        event.set_extra("_llme_merged_anchor_msg_id", merged_anchor_msg_id)
+        message_obj = getattr(event, "message_obj", None)
+        if message_obj is not None:
+            try:
+                setattr(message_obj, "message_id", anchor_value)
+            except Exception:
+                pass
+            raw_message = getattr(message_obj, "raw_message", None)
+            if isinstance(raw_message, dict):
+                raw_message["message_id"] = anchor_value
+        raw_event = getattr(event, "event", None)
+        if isinstance(raw_event, dict):
+            raw_event["message_id"] = anchor_value
+        elif raw_event is not None:
+            try:
+                setattr(raw_event, "message_id", anchor_value)
+            except Exception:
+                pass
 
     original_prompt = (getattr(req, "prompt", "") or "").strip()
     event.message_str = merged_msg
@@ -319,20 +353,46 @@ def upsert_dynamic_unresolved_snapshot(
     member: MemberState,
     snapshot: Dict[str, Any],
     max_keep: int = 50,
-) -> None:
+) -> bool:
     key = ensure_snapshot_merge_key(snapshot)
     for idx, item in enumerate(member.dynamic_unresolved_msgs):
         if ensure_snapshot_merge_key(item) == key:
             old_ts = float(item.get("ts", snapshot.get("ts", time.time())))
             snapshot["ts"] = min(old_ts, float(snapshot.get("ts", old_ts)))
             member.dynamic_unresolved_msgs[idx] = snapshot
+            inserted_new = False
             break
     else:
         member.dynamic_unresolved_msgs.append(snapshot)
+        inserted_new = True
 
     member.dynamic_unresolved_msgs.sort(key=lambda x: float(x.get("ts", 0.0)))
     if len(member.dynamic_unresolved_msgs) > max_keep:
         member.dynamic_unresolved_msgs = member.dynamic_unresolved_msgs[-max_keep:]
+    return inserted_new
+
+
+def reset_dynamic_capture_session(member: MemberState) -> None:
+    member.merge_start_ts = 0.0
+    member.dynamic_capture_count = 0
+
+
+def init_dynamic_capture_session(
+    member: MemberState,
+    selected_snapshots: list[Dict[str, Any]],
+) -> None:
+    reset_dynamic_capture_session(member)
+    now_ts = time.time()
+    if selected_snapshots:
+        member.merge_start_ts = min(
+            float(item.get("ts", now_ts) or now_ts)
+            for item in selected_snapshots
+        )
+        member.dynamic_capture_count = len(
+            {ensure_snapshot_merge_key(item) for item in selected_snapshots}
+        )
+    else:
+        member.merge_start_ts = now_ts
 
 
 def prune_member_msg_cache(member: MemberState, keep_sec: float) -> None:
@@ -580,6 +640,7 @@ def prepare_dynamic_merge_batch(
     merge_delay: float,
     merged_skip_ttl: float,
 ) -> tuple[list[Dict[str, Any]], list[str], int, int, Optional[str]]:
+    had_inflight = member.dynamic_inflight_seq > 0
     upsert_dynamic_unresolved_snapshot(member, current_snapshot)
 
     member.dynamic_request_seq += 1
@@ -638,6 +699,12 @@ def prepare_dynamic_merge_batch(
         str(selected_snapshots[0].get("msg_id") or "").strip() if selected_snapshots else None
     )
 
+    if not had_inflight:
+        init_dynamic_capture_session(
+            member=member,
+            selected_snapshots=selected_snapshots,
+        )
+
     unresolved_count = len(member.dynamic_unresolved_msgs)
     return selected_snapshots, selected_keys, request_seq, unresolved_count, trigger_msg_id
 
@@ -658,17 +725,66 @@ def select_dynamic_owner_uid(
 async def mark_dynamic_soft_recompute(
     target_member: MemberState,
     snapshot: Dict[str, Any],
-) -> int:
+    *,
+    merge_delay: float,
+    merge_max_count: int,
+) -> DynamicSoftRecomputeDecision:
     async with target_member.lock:
         inflight_seq = target_member.dynamic_inflight_seq
         if inflight_seq <= 0:
-            return 0
+            return DynamicSoftRecomputeDecision(
+                inflight_seq=0,
+                accepted=False,
+                reason="no_inflight",
+            )
+        now_ts = time.time()
+        if target_member.merge_start_ts <= 0.0:
+            if target_member.dynamic_unresolved_msgs:
+                target_member.merge_start_ts = min(
+                    float(item.get("ts", now_ts) or now_ts)
+                    for item in target_member.dynamic_unresolved_msgs
+                )
+            else:
+                target_member.merge_start_ts = now_ts
+        if target_member.dynamic_capture_count <= 0:
+            target_member.dynamic_capture_count = len(
+                {
+                    ensure_snapshot_merge_key(item)
+                    for item in target_member.dynamic_unresolved_msgs
+                }
+            )
+
+        if merge_delay > 0.0 and (
+            now_ts - float(target_member.merge_start_ts)
+        ) >= float(merge_delay):
+            return DynamicSoftRecomputeDecision(
+                inflight_seq=inflight_seq,
+                accepted=False,
+                reason="deadline_reached",
+            )
+        if merge_max_count > 0 and target_member.dynamic_capture_count >= merge_max_count:
+            return DynamicSoftRecomputeDecision(
+                inflight_seq=inflight_seq,
+                accepted=False,
+                reason="max_count_reached",
+            )
+        inserted_new = upsert_dynamic_unresolved_snapshot(target_member, snapshot)
+        if not inserted_new:
+            return DynamicSoftRecomputeDecision(
+                inflight_seq=inflight_seq,
+                accepted=False,
+                reason="duplicate_snapshot",
+            )
+        target_member.dynamic_capture_count += 1
         target_member.dynamic_discard_before_seq = max(
             target_member.dynamic_discard_before_seq,
             inflight_seq,
         )
-        upsert_dynamic_unresolved_snapshot(target_member, snapshot)
-        return inflight_seq
+        return DynamicSoftRecomputeDecision(
+            inflight_seq=inflight_seq,
+            accepted=True,
+            reason="accepted",
+        )
 
 
 def request_dynamic_recompute_stop(
@@ -773,6 +889,7 @@ def schedule_dynamic_recompute_requeue(
         replay_event.is_at_or_wake_command = False
         replay_event.set_extra("_llme_dynamic_requeue_attempt", attempt + 1)
         replay_event.set_extra("_llme_dynamic_requeued", True)
+        replay_event.set_extra("_llme_dynamic_requeue_from_seq", int(inflight_seq))
         replay_event.set_extra("_llme_dynamic_followup", True)
         replay_event.set_extra("_llme_dynamic_state_uid", str(owner_uid))
 
@@ -899,7 +1016,6 @@ async def execute_dynamic_merge(
     finally:
         async with member.lock:
             member.in_merging = False
-            member.merge_start_ts = 0.0
 
     # 动态模式兜底校验：与硬等待一致，最终用 get_msg 过滤不可用/已撤回消息。
     if selected_snapshots:

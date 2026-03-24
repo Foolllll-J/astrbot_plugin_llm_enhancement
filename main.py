@@ -103,6 +103,7 @@ from .modules.merge_flow import (
     request_dynamic_recompute_stop,
     schedule_dynamic_recompute_requeue,
     drop_dynamic_batch_from_unresolved,
+    reset_dynamic_capture_session,
     execute_dynamic_merge,
     member_contains_msg_id,
     remove_recalled_msg_from_member,
@@ -482,16 +483,6 @@ class LLMEnhancement(Star):
                 reply_to_id=reply_to_id,
                 include_state_bias=True,
             )
-            if active_wake_factor < 0.999:
-                logger.debug(
-                    "[LLMEnhancement] 主动唤醒降权命中："
-                    f"group={gid}, uid={uid}, factor={active_wake_factor:.3f}, reasons={','.join(active_wake_reasons)}"
-                )
-            if relevant_wake_factor < active_wake_factor:
-                logger.debug(
-                    "[LLMEnhancement] 相关性附加状态降权命中："
-                    f"group={gid}, uid={uid}, factor={relevant_wake_factor:.3f}, reasons={','.join(relevant_wake_reasons)}"
-                )
 
         if context_injection_enabled:
             reply_preview = await try_build_reply_preview(event, reply_msg_id)
@@ -649,6 +640,17 @@ class LLMEnhancement(Star):
             forced_state_uid = str(event.get_extra("_llme_dynamic_state_uid", default=uid) or uid).strip() or uid
             if forced_state_uid not in g.members:
                 g.members[forced_state_uid] = MemberState(uid=forced_state_uid)
+            requeue_from_seq = int(event.get_extra("_llme_dynamic_requeue_from_seq", default=0) or 0)
+            forced_member = g.members[forced_state_uid]
+            async with forced_member.lock:
+                current_req_seq = int(forced_member.dynamic_request_seq or 0)
+            if requeue_from_seq > 0 and current_req_seq > requeue_from_seq:
+                logger.debug(
+                    "[LLMEnhancement] 跳过过期动态重排事件："
+                    f"group={gid or 'private'}, sender_uid={uid}, state_uid={forced_state_uid}, "
+                    f"requeue_from_seq={requeue_from_seq}, current_req_seq={current_req_seq}"
+                )
+                return
             wake = True
             reason = "动态重排跟进"
             force_dynamic_followup = True
@@ -686,8 +688,21 @@ class LLMEnhancement(Star):
                 if target_member:
                     dynamic_snap = build_event_snapshot(event, gid, uid)
                     ensure_snapshot_merge_key(dynamic_snap)
-                    inflight_seq = await mark_dynamic_soft_recompute(target_member, dynamic_snap)
-                    if inflight_seq > 0:
+                    recompute_decision = await mark_dynamic_soft_recompute(
+                        target_member,
+                        dynamic_snap,
+                        merge_delay=merge_cfg.delay_sec,
+                        merge_max_count=merge_cfg.max_count,
+                    )
+                    if (not recompute_decision.accepted) and (
+                        recompute_decision.reason in {
+                            "deadline_reached",
+                            "max_count_reached",
+                        }
+                    ):
+                        return
+                    inflight_seq = int(recompute_decision.inflight_seq or 0)
+                    if recompute_decision.accepted and inflight_seq > 0:
                         stop_requested = request_dynamic_recompute_stop(
                             event,
                             inflight_seq=inflight_seq,
@@ -720,7 +735,11 @@ class LLMEnhancement(Star):
                             f"inflight_seq={inflight_seq}, msg_id={str(dynamic_snap.get('msg_id') or 'unknown')}, "
                             f"require_wake={followup_require_wake}, stop_requested={stop_requested}"
                         )
-                    elif prejoin_candidate and str(target_uid) == str(uid):
+                    elif (
+                        prejoin_candidate
+                        and str(target_uid) == str(uid)
+                        and str(recompute_decision.reason or "") == "no_inflight"
+                    ):
                         async with target_member.lock:
                             upsert_dynamic_unresolved_snapshot(target_member, dynamic_snap)
                         logger.debug(
@@ -822,8 +841,21 @@ class LLMEnhancement(Star):
                 if target_member and wake:
                     dynamic_snap = build_event_snapshot(event, gid, uid)
                     ensure_snapshot_merge_key(dynamic_snap)
-                    inflight_seq = await mark_dynamic_soft_recompute(target_member, dynamic_snap)
-                    if inflight_seq > 0:
+                    recompute_decision = await mark_dynamic_soft_recompute(
+                        target_member,
+                        dynamic_snap,
+                        merge_delay=merge_cfg.delay_sec,
+                        merge_max_count=merge_cfg.max_count,
+                    )
+                    if (not recompute_decision.accepted) and (
+                        recompute_decision.reason in {
+                            "deadline_reached",
+                            "max_count_reached",
+                        }
+                    ):
+                        return
+                    inflight_seq = int(recompute_decision.inflight_seq or 0)
+                    if recompute_decision.accepted and inflight_seq > 0:
                         stop_requested = request_dynamic_recompute_stop(
                             event,
                             inflight_seq=inflight_seq,
@@ -1049,7 +1081,8 @@ class LLMEnhancement(Star):
             controller.keep(timeout=min(wait_timeout_sec, remaining_sec), reset_timeout=True)
         
         try:
-            await collect_messages(event)
+            if len(message_buffer) < merge_max_count:
+                await collect_messages(event)
         except TimeoutError:
             logger.debug(
                 "[LLMEnhancement] collect_messages 等待超时："
@@ -1833,6 +1866,19 @@ class LLMEnhancement(Star):
         if state_uid not in g.members:
             g.members[state_uid] = MemberState(uid=state_uid)
         merge_member = g.members[state_uid]
+        requeue_from_seq = int(event.get_extra("_llme_dynamic_requeue_from_seq", default=0) or 0)
+        is_requeued_dynamic_followup = bool(event.get_extra("_llme_dynamic_requeued", default=False))
+        if dynamic_merge_mode and is_requeued_dynamic_followup and requeue_from_seq > 0:
+            async with merge_member.lock:
+                current_req_seq = int(merge_member.dynamic_request_seq or 0)
+            if current_req_seq > requeue_from_seq:
+                logger.debug(
+                    "[LLMEnhancement] 跳过过期动态重排请求："
+                    f"group={gid or 'private'}, sender_uid={uid}, state_uid={state_uid}, "
+                    f"requeue_from_seq={requeue_from_seq}, current_req_seq={current_req_seq}"
+                )
+                event.stop_event()
+                return
         if dynamic_merge_mode and state_uid != uid:
             logger.debug(
                 "[LLMEnhancement] 动态合并状态重定向："
@@ -1864,7 +1910,18 @@ class LLMEnhancement(Star):
                 raw_msg_ts = _raw_get(raw_message, "time", None)
                 if raw_msg_ts in (None, ""):
                     raw_msg_ts = _raw_get(raw_message, "date", None)
-                merge_member.merge_start_ts = normalize_event_ts(raw_msg_ts, now)
+                event_ts = normalize_event_ts(raw_msg_ts, now)
+                if dynamic_merge_mode:
+                    if merge_member.merge_start_ts <= 0.0:
+                        if merge_member.dynamic_unresolved_msgs:
+                            merge_member.merge_start_ts = min(
+                                float(item.get("ts", event_ts) or event_ts)
+                                for item in merge_member.dynamic_unresolved_msgs
+                            )
+                        else:
+                            merge_member.merge_start_ts = event_ts
+                else:
+                    merge_member.merge_start_ts = event_ts
             if (
                 dynamic_merge_mode
                 and current_msg_id
@@ -2146,6 +2203,7 @@ class LLMEnhancement(Star):
                         drop_dynamic_batch_from_unresolved(merge_member, dynamic_batch_keys)
                         if merge_member.dynamic_inflight_seq == dynamic_req_seq:
                             merge_member.dynamic_inflight_seq = 0
+                            reset_dynamic_capture_session(merge_member)
                         if g.dynamic_owner_uid == state_uid:
                             g.dynamic_owner_uid = None
                     clear_pending_msg_ids(g, merge_member)
@@ -2194,6 +2252,7 @@ class LLMEnhancement(Star):
                         drop_dynamic_batch_from_unresolved(member, dynamic_batch_keys)
                     if member.dynamic_inflight_seq == dynamic_req_seq:
                         member.dynamic_inflight_seq = 0
+                        reset_dynamic_capture_session(member)
                     if g.dynamic_owner_uid == state_uid:
                         g.dynamic_owner_uid = None
                     next_inflight_seq = int(member.dynamic_inflight_seq or 0)

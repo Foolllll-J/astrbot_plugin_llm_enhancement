@@ -65,15 +65,21 @@ def extract_json_key_info(inner_json: Dict[str, Any]) -> str:
                 break
 
     title = _truncate_text(detail.get("title", ""))
+    contact_name = _truncate_text(detail.get("contact", ""))
     detail_desc = _truncate_text(detail.get("desc", ""))
+    forward_message = _truncate_text(detail.get("forwardMessage", ""))
     url = _truncate_text(detail.get("qqdocurl") or detail.get("url") or "", limit=200)
 
     summary_text = prompt or detail_desc or desc
     parts: List[str] = []
     if title:
         parts.append(f"标题: {title}")
+    if contact_name and contact_name not in {title, prompt, detail_desc, desc}:
+        parts.append(f"名片: {contact_name}")
     if summary_text:
         parts.append(f"摘要: {summary_text}")
+    if forward_message and forward_message != summary_text:
+        parts.append(f"动态: {forward_message}")
     if app:
         parts.append(f"应用: {app}")
     if url:

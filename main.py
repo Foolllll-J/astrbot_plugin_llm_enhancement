@@ -13,7 +13,6 @@ from .modules.similarity import Similarity
 from .modules.state_manager import StateManager, GroupState, MemberState
 from .modules.forward_parser import process_forward_record_content
 from .modules.reference_parser import (
-    ReferenceContextResult,
     process_reference_context,
     inject_current_message_image_context,
     inject_current_message_forward_origin_context,
@@ -126,10 +125,8 @@ from .modules.dialogue_context import (
     build_non_text_context_text,
     build_context_text,
     append_group_context_message,
-    find_context_entry_by_msg_id,
-    can_reuse_reply_context_entry,
+    append_notice_context_from_raw,
     inject_context_into_request,
-    inject_cached_reply_context,
 )
 try:
     from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import AiocqhttpMessageEvent
@@ -346,6 +343,7 @@ class LLMEnhancement(Star):
 
     # ==================== 唤醒消息级别 ====================
     
+
     @filter.event_message_type(filter.EventMessageType.ALL, priority=1)
     async def on_message_event(self, event: AstrMessageEvent):
         """处理消息的初步过滤、黑白名单检查及唤醒逻辑。支持群聊和私聊。"""
@@ -368,6 +366,19 @@ class LLMEnhancement(Star):
                     f"umo={event.unified_msg_origin}, recalled_msg_id={recalled_msg_id}, "
                     f"notice_type={raw_notice_type}"
                 )
+            raw_group_id = str(_raw_get(raw_message, "group_id") or "").strip()
+            if raw_group_id and is_context_injection_enabled(self._get_cfg):
+                notice_group_state = StateManager.get_group(raw_group_id)
+                appended_notice_context, notice_source = append_notice_context_from_raw(
+                    group_state=notice_group_state,
+                    raw_message=raw_message,
+                    get_cfg=self._get_cfg,
+                )
+                if appended_notice_context:
+                    logger.debug(
+                        "[LLMEnhancement][ContextInjection] notice context appended: "
+                        f"group={raw_group_id}, source={notice_source}, post_type={raw_post_type}, notice_type={raw_notice_type}"
+                    )
             logger.debug(
                 "[LLMEnhancement] 忽略非消息事件："
                 f"post_type={raw_post_type}, "
@@ -557,7 +568,7 @@ class LLMEnhancement(Star):
                 parse_features.append("url")
             if "JSON解析:" in context_text:
                 parse_features.append("json")
-            if "文件摘要:" in context_text:
+            if "文件信息:" in context_text:
                 parse_features.append("file")
             if ("图片转述:" in context_text) or ("表情包转述:" in context_text):
                 parse_features.append("image")
@@ -2103,41 +2114,6 @@ class LLMEnhancement(Star):
             # 注册清理路径容器
             req._cleanup_paths = []
 
-            # 引用并直接唤醒时，优先尝试按 message_id 复用本地上下文缓存，避免重复解析。
-            skip_reference_parse = False
-            if bool(event.is_at_or_wake_command):
-                _at_targets, _at_bot, _at_all, _reply_to_id, reply_msg_id = extract_addressing_signals(
-                    all_components,
-                    bot_id=event.get_self_id(),
-                )
-                cached_entry = find_context_entry_by_msg_id(
-                    group_state=g,
-                    msg_id=reply_msg_id,
-                    get_cfg=self._get_cfg,
-                )
-                allow_cache_reuse = can_reuse_reply_context_entry(
-                    entry=cached_entry,
-                    get_cfg=self._get_cfg,
-                )
-                if allow_cache_reuse:
-                    reused, reuse_detail, _reuse_block = inject_cached_reply_context(
-                        req=req,
-                        group_state=g,
-                        reply_msg_id=reply_msg_id,
-                        get_cfg=self._get_cfg,
-                    )
-                    if reused:
-                        skip_reference_parse = True
-                        logger.debug(
-                            "[LLMEnhancement][ContextInjection] 引用缓存复用命中："
-                            f"group={gid or 'private'}, uid={uid}, detail={reuse_detail}"
-                        )
-                elif cached_entry is not None:
-                    logger.debug(
-                        "[LLMEnhancement][ContextInjection] 引用缓存命中但未直接复用："
-                        f"group={gid or 'private'}, uid={uid}, reason=forward_media_parse_enabled"
-                    )
-
             dynamic_batch_msg_ids = event.get_extra("_llme_dynamic_batch_msg_ids", default=[]) or []
             if not dynamic_batch_msg_ids:
                 await inject_current_message_image_context(
@@ -2150,16 +2126,13 @@ class LLMEnhancement(Star):
             )
              
             # ==================== 3. 引用/JSON/文件上下文注入（不含转发聊天记录解析） ====================
-            if skip_reference_parse:
-                ref_result = ReferenceContextResult()
-            else:
-                ref_result = await process_reference_context(
-                    event=event,
-                    req=req,
-                    all_components=all_components,
-                    get_cfg=self._get_cfg,
-                    download_media=download_video_to_temp,
-                )
+            ref_result = await process_reference_context(
+                event=event,
+                req=req,
+                all_components=all_components,
+                get_cfg=self._get_cfg,
+                download_media=download_video_to_temp,
+            )
             injection_summary["json"] = bool(getattr(ref_result, "injected_json", False))
             injection_summary["file"] = bool(getattr(ref_result, "injected_file", False))
             injection_summary["url"] = bool(getattr(ref_result, "injected_url", False))

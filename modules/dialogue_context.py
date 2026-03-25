@@ -145,48 +145,31 @@ def get_wake_history_messages(
     ]
 
 
-def _forward_media_parse_enabled(get_cfg: Any) -> bool:
-    if not bool(get_cfg("forward_parse_enable", True)):
-        return False
+def _extract_file_names_from_chain(message_chain: Any) -> list[str]:
+    file_names: list[str] = []
+    seen: set[str] = set()
     try:
-        max_forward_images = int(get_cfg("forward_image_max_count", 8) or 8)
+        for seg in list(message_chain or []):
+            name = ""
+            if isinstance(seg, Comp.File):
+                name = str(getattr(seg, "name", "") or "").strip()
+            elif isinstance(seg, dict):
+                if str(seg.get("type") or "").lower() != "file":
+                    continue
+                data = seg.get("data") or {}
+                if isinstance(data, dict):
+                    name = str(
+                        data.get("name") or data.get("file_name") or data.get("file") or ""
+                    ).strip()
+            if not name:
+                continue
+            if name in seen:
+                continue
+            seen.add(name)
+            file_names.append(name)
     except Exception:
-        max_forward_images = 8
-    try:
-        max_forward_videos = int(get_cfg("forward_video_max_count", 2) or 2)
-    except Exception:
-        max_forward_videos = 2
-    try:
-        max_forward_video_frames = int(get_cfg("forward_video_max_frame_count", 1) or 1)
-    except Exception:
-        max_forward_video_frames = 1
-    image_enabled = max_forward_images > 0
-    video_enabled = (max_forward_videos > 0) and (max_forward_video_frames > 0)
-    return image_enabled or video_enabled
-
-
-def can_reuse_reply_context_entry(
-    *,
-    entry: Optional[dict[str, Any]],
-    get_cfg: Any,
-) -> bool:
-    """
-    判断引用缓存是否可直接复用。
-    约束：
-    - 若该缓存条目来自聊天记录抽取，且聊天记录模块开启了媒体解析，则不能直接复用，
-      需要继续走引用解析链路（以便处理图片/视频媒体信息）。
-    """
-    if not isinstance(entry, dict):
-        return False
-    features_raw = entry.get("parse_features") or []
-    features = {str(x or "").strip().lower() for x in features_raw if str(x or "").strip()}
-    if not features:
-        text = str(entry.get("text") or "")
-        if "聊天记录抽取:" in text:
-            features.add("forward")
-    if "forward" in features and _forward_media_parse_enabled(get_cfg):
-        return False
-    return True
+        return file_names
+    return file_names
 
 
 def compute_active_wake_adjustment(
@@ -767,30 +750,9 @@ async def build_text_context_enrichment(
     # 文件解析（仅在主配置开启文件文本注入且长度>0时生效）
     if "file" in parse_options and bool(get_cfg("file_parse_enable", True)):
         try:
-            from .file_parser import extract_file_infos_from_chain
-
-            try:
-                file_text_inject_len = max(0, int(get_cfg("inject_file_text_length", 0) or 0))
-            except Exception:
-                file_text_inject_len = 0
-            try:
-                file_inject_max_size_mb = max(0, int(get_cfg("inject_file_max_size_mb", 20) or 20))
-            except Exception:
-                file_inject_max_size_mb = 20
-
-            if file_text_inject_len > 0:
-                file_infos = await extract_file_infos_from_chain(
-                    event=event,
-                    chain=list(message_chain or []),
-                    max_chars=file_text_inject_len,
-                    max_file_size_mb=file_inject_max_size_mb,
-                    cleanup_paths=[],
-                )
-                file_infos = list(dict.fromkeys(file_infos))
-                if file_infos:
-                    parts.append(
-                        "文件摘要: " + _clip("；".join(f"{name}: {text}" for name, text in file_infos), 220)
-                    )
+            file_names = _extract_file_names_from_chain(message_chain)
+            if file_names:
+                parts.append("文件信息: " + _clip("；".join(file_names[:3]), 220))
         except Exception:
             pass
 
@@ -873,7 +835,7 @@ async def build_non_text_context_text(
                 return f"发送了一个链接，{only}"
             if only.startswith("JSON解析:"):
                 return f"发送了分享卡片，{only}"
-            if only.startswith("文件摘要:"):
+            if only.startswith("文件信息:"):
                 return f"发送了一个文件，{only}"
         return f"发送了复合媒体消息，解析结果：{' | '.join(parts)}"
     return ""
@@ -949,6 +911,24 @@ def should_inject_context(
     return _is_active_wake_reason(wake_reason)
 
 
+def _dedup_simple_notice_text(sender: str, text: str) -> str:
+    sender_text = str(sender or "").strip()
+    value = str(text or "").strip()
+    if not sender_text or not value:
+        return value
+    for marker in ("通知: ", "申请: "):
+        if marker not in value:
+            continue
+        left, right = value.split(marker, 1)
+        right = right.strip()
+        if not right.startswith(sender_text):
+            continue
+        tail = right[len(sender_text):].lstrip()
+        if tail:
+            return f"{left}{marker}{tail}"
+    return value
+
+
 def _render_context_line(item: dict[str, Any], *, detailed: bool, limit: int = 110) -> str:
     sender = str(item.get("sender_name") or item.get("uid") or "未知用户").strip()
     ts = item.get("ts")
@@ -959,7 +939,13 @@ def _render_context_line(item: dict[str, Any], *, detailed: bool, limit: int = 1
     except Exception:
         pass
     if not detailed:
-        text = _clip(str(item.get("text") or ""), limit)
+        source_text = str(item.get("source") or "").strip().lower()
+        text_raw = str(item.get("text") or "")
+        is_notice_line = source_text.startswith("notice_") or source_text.startswith("request_")
+        if is_notice_line:
+            text = _clip(text_raw, limit)
+            return f"[{time_text}] {text}"
+        text = _clip(_dedup_simple_notice_text(sender, text_raw), limit)
         reply_preview = _clip(str(item.get("reply_preview") or ""), 80)
         suffix = f" | 引用: {reply_preview}" if reply_preview else ""
         return f"[{time_text}] {sender}: {text}{suffix}"
@@ -1005,6 +991,295 @@ def _render_context_line(item: dict[str, Any], *, detailed: bool, limit: int = 1
     return f"[{time_text}] " + " ".join(detail_parts)
 
 
+def _raw_value(raw: Any, key: str, default: Any = None) -> Any:
+    if raw is None:
+        return default
+    try:
+        if isinstance(raw, dict):
+            return raw.get(key, default)
+        if hasattr(raw, "get"):
+            return raw.get(key, default)
+        return getattr(raw, key, default)
+    except Exception:
+        return default
+
+
+def _resolve_uid_label(group_state: GroupState, uid: str) -> str:
+    uid_text = str(uid or "").strip()
+    if not uid_text:
+        return "某成员"
+    for item in reversed(list(group_state.context_messages or [])):
+        if str(item.get("uid") or "").strip() != uid_text:
+            continue
+        sender_name = str(item.get("sender_name") or "").strip()
+        if sender_name:
+            return sender_name
+    return f"用户{uid_text}"
+
+
+def _extract_poke_action_text(raw_info: Any) -> str:
+    if not isinstance(raw_info, list):
+        return ""
+    texts: list[str] = []
+    for node in raw_info:
+        if not isinstance(node, dict):
+            continue
+        if str(node.get("type") or "").strip().lower() != "nor":
+            continue
+        txt = str(node.get("txt") or "").strip()
+        if txt:
+            texts.append(txt)
+    if not texts:
+        return ""
+    return _clip("".join(texts), 80)
+
+
+def _extract_poke_action_parts(raw_info: Any) -> list[str]:
+    if not isinstance(raw_info, list):
+        return []
+    texts: list[str] = []
+    for node in raw_info:
+        if not isinstance(node, dict):
+            continue
+        if str(node.get("type") or "").strip().lower() != "nor":
+            continue
+        txt = str(node.get("txt") or "").strip()
+        if txt:
+            texts.append(txt)
+    return texts
+
+
+def append_notice_context_from_raw(
+    *,
+    group_state: GroupState,
+    raw_message: Any,
+    get_cfg: Any,
+) -> tuple[bool, str]:
+    if not is_context_injection_enabled(get_cfg):
+        return False, "context_disabled"
+
+    post_type = str(_raw_value(raw_message, "post_type") or "").strip().lower()
+    if post_type not in {"notice", "request"}:
+        return False, "not_notice_or_request"
+
+    group_id = str(_raw_value(raw_message, "group_id") or "").strip()
+    if not group_id:
+        return False, "no_group_id"
+
+    uid_text = ""
+    sender_name = "系统通知"
+    message_text = ""
+    msg_id = ""
+    reply_to_id = ""
+    source = ""
+    parse_features: list[str] = []
+
+    raw_ts = _raw_value(raw_message, "time")
+    try:
+        now_ts = float(raw_ts) if raw_ts is not None else time.time()
+    except Exception:
+        now_ts = time.time()
+
+    if post_type == "notice":
+        notice_type = str(_raw_value(raw_message, "notice_type") or "").strip().lower()
+        sub_type = str(_raw_value(raw_message, "sub_type") or "").strip().lower()
+        user_id = str(_raw_value(raw_message, "user_id") or "").strip()
+        operator_id = str(_raw_value(raw_message, "operator_id") or "").strip()
+        sender_id = str(_raw_value(raw_message, "sender_id") or "").strip()
+        target_id = str(_raw_value(raw_message, "target_id") or "").strip()
+        source = f"notice_{notice_type or 'unknown'}"
+        parse_features = ["notice"]
+        if notice_type:
+            parse_features.append(notice_type)
+
+        if notice_type in {"group_recall", "friend_recall"}:
+            msg_id = str(_raw_value(raw_message, "message_id") or "").strip()
+            actor_uid = operator_id or user_id
+            actor_label = _resolve_uid_label(group_state, actor_uid)
+            target_label = _resolve_uid_label(group_state, user_id)
+            uid_text = actor_uid
+            sender_name = actor_label
+            if actor_uid and user_id and actor_uid != user_id:
+                message_text = (
+                    f"撤回通知: {actor_label}"
+                    f"撤回了 {target_label} 的一条消息"
+                )
+                reply_to_id = user_id
+            else:
+                message_text = f"撤回通知: {actor_label}撤回了自己的一条消息"
+        elif notice_type == "group_increase":
+            target_label = _resolve_uid_label(group_state, user_id)
+            reply_to_id = user_id
+            if sub_type == "invite":
+                actor_uid = operator_id
+                actor_label = _resolve_uid_label(group_state, actor_uid) if actor_uid else "管理员"
+                uid_text = actor_uid or user_id
+                sender_name = actor_label
+                message_text = f"入群通知: {actor_label}邀请 {target_label} 加入了群聊"
+            elif sub_type == "approve":
+                uid_text = user_id
+                sender_name = target_label
+                message_text = f"入群通知: {target_label}申请入群并已通过"
+            else:
+                uid_text = user_id
+                sender_name = target_label
+                message_text = f"入群通知: {target_label}加入了群聊"
+        elif notice_type == "group_decrease":
+            target_label = _resolve_uid_label(group_state, user_id)
+            reply_to_id = user_id
+            if sub_type == "kick":
+                actor_uid = operator_id if operator_id and operator_id != "0" else ""
+                actor_label = _resolve_uid_label(group_state, actor_uid) if actor_uid else "管理员"
+                uid_text = actor_uid or user_id
+                sender_name = actor_label
+                message_text = f"退群通知: {actor_label}将 {target_label} 移出了群聊"
+            elif sub_type == "leave":
+                uid_text = user_id
+                sender_name = target_label
+                message_text = f"退群通知: {target_label}退出了群聊"
+            elif sub_type == "kick_me":
+                actor_uid = operator_id if operator_id and operator_id != "0" else ""
+                actor_label = _resolve_uid_label(group_state, actor_uid) if actor_uid else "管理员"
+                uid_text = actor_uid or user_id
+                sender_name = actor_label
+                message_text = f"退群通知: {actor_label}将机器人移出了群聊"
+            else:
+                uid_text = user_id
+                sender_name = target_label
+                message_text = f"退群通知: {target_label}离开了群聊"
+        elif notice_type == "group_admin":
+            target_label = _resolve_uid_label(group_state, user_id)
+            uid_text = operator_id or user_id
+            sender_name = _resolve_uid_label(group_state, uid_text)
+            reply_to_id = user_id
+            if sub_type == "set":
+                if operator_id and operator_id != user_id:
+                    actor_label = _resolve_uid_label(group_state, operator_id)
+                    message_text = f"管理通知: {actor_label}将 {target_label} 设为了管理员"
+                else:
+                    message_text = f"管理通知: {target_label}被设为了管理员"
+            elif sub_type == "unset":
+                if operator_id and operator_id != user_id:
+                    actor_label = _resolve_uid_label(group_state, operator_id)
+                    message_text = f"管理通知: {actor_label}取消了 {target_label} 的管理员身份"
+                else:
+                    message_text = f"管理通知: {target_label}被取消了管理员身份"
+            else:
+                message_text = f"管理通知: {target_label}管理员身份发生变更"
+        elif notice_type == "group_ban":
+            actor_uid = operator_id if operator_id and operator_id != "0" else ""
+            actor_label = _resolve_uid_label(group_state, actor_uid) if actor_uid else "管理员"
+            target_label = _resolve_uid_label(group_state, user_id)
+            uid_text = actor_uid or user_id
+            sender_name = actor_label
+            reply_to_id = user_id
+            try:
+                duration = int(_raw_value(raw_message, "duration") or 0)
+            except Exception:
+                duration = 0
+            if sub_type in {"lift_ban", "unban"} or duration <= 0:
+                message_text = f"禁言通知: {actor_label}取消了 {target_label} 的禁言"
+            else:
+                message_text = f"禁言通知: {actor_label}禁言了 {target_label} {duration}秒"
+        elif notice_type == "notify" and sub_type == "poke":
+            actor_uid = user_id
+            target_uid = target_id
+            actor_label = _resolve_uid_label(group_state, actor_uid)
+            target_label = _resolve_uid_label(group_state, target_uid)
+            raw_info = _raw_value(raw_message, "raw_info")
+            action_parts = _extract_poke_action_parts(raw_info)
+            action_text = _extract_poke_action_text(raw_info)
+            uid_text = actor_uid
+            sender_name = actor_label
+            reply_to_id = target_uid
+            target_display = "自己" if (actor_uid and target_uid and actor_uid == target_uid) else target_label
+            if action_parts:
+                action_head = str(action_parts[0] or "").strip()
+                action_tail = str("".join(action_parts[1:]) or "").strip()
+                if action_head and action_tail:
+                    message_text = f"互动通知: {actor_label} {action_head} {target_display} {action_tail}"
+                elif action_head:
+                    message_text = f"互动通知: {actor_label} {action_head} {target_display}"
+                elif action_text:
+                    message_text = f"互动通知: {actor_label} {action_text} {target_display}"
+                else:
+                    message_text = f"互动通知: {actor_label} 戳了戳 {target_display}"
+            elif action_text:
+                message_text = f"互动通知: {actor_label} {action_text} {target_display}"
+            else:
+                message_text = f"互动通知: {actor_label} 戳了戳 {target_display}"
+        elif notice_type == "essence":
+            msg_id = str(_raw_value(raw_message, "message_id") or "").strip()
+            actor_uid = operator_id or user_id or sender_id
+            sender_uid = sender_id or user_id
+            actor_label = _resolve_uid_label(group_state, actor_uid)
+            sender_label = _resolve_uid_label(group_state, sender_uid)
+            uid_text = actor_uid
+            sender_name = actor_label
+            reply_to_id = sender_uid
+            if sub_type == "add":
+                if actor_uid and sender_uid and actor_uid != sender_uid:
+                    message_text = f"精华通知: {actor_label}将 {sender_label} 的消息设为了精华"
+                else:
+                    message_text = f"精华通知: {sender_label}的一条消息被设为了精华"
+            elif sub_type in {"del", "delete", "remove"}:
+                if actor_uid and sender_uid and actor_uid != sender_uid:
+                    message_text = f"精华通知: {actor_label}取消了 {sender_label} 的精华消息"
+                else:
+                    message_text = f"精华通知: {sender_label}的一条精华消息被取消"
+            else:
+                message_text = f"精华通知: {sender_label}的精华消息发生变更"
+        else:
+            return False, "unsupported_notice"
+    else:
+        request_type = str(_raw_value(raw_message, "request_type") or "").strip().lower()
+        sub_type = str(_raw_value(raw_message, "sub_type") or "").strip().lower()
+        if request_type != "group" or sub_type != "add":
+            return False, "unsupported_request"
+        user_id = str(_raw_value(raw_message, "user_id") or "").strip()
+        requester_label = _resolve_uid_label(group_state, user_id)
+        comment = _clip(str(_raw_value(raw_message, "comment") or "").strip(), 120)
+        uid_text = user_id
+        sender_name = requester_label
+        source = "request_group_add"
+        parse_features = ["request", "group_add"]
+        reply_to_id = user_id
+        if comment:
+            message_text = (
+                f"入群申请: {requester_label}申请加入群聊，"
+                f"验证信息：{comment}"
+            )
+        else:
+            message_text = f"入群申请: {requester_label}申请加入群聊"
+
+    if not message_text:
+        return False, "empty_notice_text"
+
+    max_messages = get_context_injection_max_messages(get_cfg)
+    ok = append_group_context_message(
+        group_state,
+        uid=uid_text,
+        sender_name=sender_name,
+        message_text=message_text,
+        max_messages=max_messages,
+        msg_id=msg_id,
+        is_bot=False,
+        source=source or "notice_unknown",
+        at_targets=[],
+        at_bot=False,
+        at_all=False,
+        reply_to_id=reply_to_id,
+        reply_msg_id="",
+        reply_preview="",
+        parse_features=parse_features,
+        now_ts=now_ts,
+        get_cfg=get_cfg,
+    )
+    if not ok:
+        return False, "append_failed"
+    return True, source or "notice_unknown"
+
+
 def inject_context_into_request(
     *,
     req: Any,
@@ -1039,48 +1314,6 @@ def inject_context_into_request(
     )
     req.prompt = f"{(req.prompt or '').strip()}{block}".strip()
     return True, f"injected:{len(lines)}", block.strip()
-
-
-def find_context_entry_by_msg_id(
-    group_state: GroupState,
-    msg_id: str,
-    get_cfg: Any,
-) -> Optional[dict[str, Any]]:
-    prune_group_context_state(group_state=group_state, get_cfg=get_cfg)
-    target = str(msg_id or "").strip()
-    if not target:
-        return None
-    for item in reversed(list(group_state.context_messages or [])):
-        if str(item.get("msg_id") or "").strip() == target:
-            return item
-    return None
-
-
-def inject_cached_reply_context(
-    *,
-    req: Any,
-    group_state: GroupState,
-    reply_msg_id: str,
-    get_cfg: Any,
-) -> tuple[bool, str, str]:
-    target = str(reply_msg_id or "").strip()
-    if not target:
-        return False, "no_reply_msg_id", ""
-    entry = find_context_entry_by_msg_id(group_state, target, get_cfg=get_cfg)
-    if not entry:
-        return False, "cache_miss", ""
-    try:
-        payload = json.dumps(entry, ensure_ascii=False, separators=(",", ":"))
-    except Exception:
-        payload = str(entry)
-    block = (
-        "\n\n[引用消息缓存复用]\n"
-        f"reply_msg_id={target}\n"
-        f"context_entry={payload}\n"
-        "[说明] 以下内容来自本地上下文缓存，已按 message_id 关联到被引用消息。"
-    )
-    req.prompt = f"{(req.prompt or '').strip()}{block}".strip()
-    return True, "cache_hit", block.strip()
 
 
 def append_group_context_message(

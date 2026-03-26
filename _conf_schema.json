@@ -5,22 +5,24 @@
         "type": "list",
         "default": []
     },
-    "group_blacklist": {
-        "description": "群聊黑名单",
-        "hint": "屏蔽黑名单中的群聊，该群消息无法唤醒bot。",
-        "type": "list",
-        "default": []
-    },
     "intelligent_wake": {
         "type": "object",
         "description": "智能唤醒",
         "hint": "配置智能唤醒相关参数",
         "items": {
-            "request_cd": {
-                "description": "请求CD(秒)",
-                "hint": "防止频繁发送LLM请求的冷却时间。距离上次发送请求小于此时间的所有消息会被阻止。设为 0 时关闭检测。",
-                "type": "float",
-                "default": 1.0
+            "max_user_concurrent_requests": {
+                "description": "用户级并发请求上限",
+                "hint": "限制单个用户同时进行中的 LLM 请求数。设为 0 表示不限制。",
+                "type": "int",
+                "minimum": 0,
+                "default": 0
+            },
+            "max_group_concurrent_requests": {
+                "description": "群聊级并发请求上限",
+                "hint": "限制单个群同时进行中的 LLM 请求数。设为 0 表示不限制。",
+                "type": "int",
+                "minimum": 0,
+                "default": 0
             },
             "wake_extend": {
                 "description": "唤醒延长(秒)",

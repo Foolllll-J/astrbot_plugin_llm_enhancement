@@ -7,7 +7,6 @@ class MemberState(BaseModel):
     """群成员状态"""
     uid: str                                               # 用户ID
     silence_until: float = 0.0                             # 沉默截止时间（时间戳）
-    last_request: float = 0.0                              # 最后一次发送LLM请求的时间（时间戳）
     last_response: float = 0.0                             # 最后一次LLM响应的时间（时间戳）
     lock: asyncio.Lock = Field(default_factory=asyncio.Lock)  # 异步锁
     in_merging: bool = False                               # 是否正在消息合并状态中

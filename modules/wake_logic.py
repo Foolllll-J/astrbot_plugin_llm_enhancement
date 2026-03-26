@@ -10,6 +10,7 @@ from astrbot.core import astrbot_config, db_helper, sp
 
 from .state_manager import GroupState, MemberState
 
+
 _MENTION_WAKE_REGEX_CACHE: dict[str, re.Pattern[str]] = {}
 _MENTION_WAKE_REGEX_INVALID: set[str] = set()
 _ACTIVE_WAKE_JUDGE_TYPES = {"mention", "relevant", "ask", "bored", "prob"}
@@ -71,6 +72,122 @@ _WAKE_EXTEND_JUDGE_PROMPT_DEFAULT = """请判断当前消息是否与上文足�
 
 [输出格式]
 只能输出一个大写字母：T 或 F。"""
+
+
+def normalize_concurrency_limit(raw: Any) -> int:
+    try:
+        value = int(raw)
+    except Exception:
+        return 0
+    return max(0, value)
+
+
+def build_request_concurrency_key(
+    *,
+    dynamic_merge_mode: bool,
+    scope_id: str,
+    state_uid: str,
+    current_msg_id: str,
+    event_identity: int,
+    now_ns: int,
+) -> str:
+    if dynamic_merge_mode:
+        return f"dynamic::{scope_id}::{state_uid}"
+    sid = str(current_msg_id or "").strip()
+    if sid:
+        return f"request::{scope_id}::{state_uid}::{sid}::{now_ns}"
+    return f"request::{scope_id}::{state_uid}::{event_identity}::{now_ns}"
+
+
+def _count_active_user_requests(
+    active_request_refs: Dict[str, int],
+    active_request_meta: Dict[str, Tuple[str, str]],
+    uid: str,
+) -> int:
+    return sum(
+        1
+        for key, ref in active_request_refs.items()
+        if ref > 0 and active_request_meta.get(key, ("", ""))[0] == uid
+    )
+
+
+def _count_active_group_requests(
+    active_request_refs: Dict[str, int],
+    active_request_meta: Dict[str, Tuple[str, str]],
+    gid: str,
+) -> int:
+    if not gid:
+        return 0
+    return sum(
+        1
+        for key, ref in active_request_refs.items()
+        if ref > 0 and active_request_meta.get(key, ("", ""))[1] == gid
+    )
+
+
+def try_acquire_request_concurrency_slot(
+    *,
+    active_request_refs: Dict[str, int],
+    active_request_meta: Dict[str, Tuple[str, str]],
+    uid: str,
+    gid: str,
+    state_uid: str,
+    dynamic_merge_mode: bool,
+    current_msg_id: str,
+    event_identity: int,
+    now_ns: int,
+    user_limit: int,
+    group_limit: int,
+) -> tuple[bool, str, str]:
+    """Try to allocate one request-concurrency slot.
+
+    Returns: (accepted, key, detail)
+    """
+    scope_id = gid or f"private_{uid}"
+    key = build_request_concurrency_key(
+        dynamic_merge_mode=dynamic_merge_mode,
+        scope_id=scope_id,
+        state_uid=state_uid,
+        current_msg_id=current_msg_id,
+        event_identity=event_identity,
+        now_ns=now_ns,
+    )
+
+    current_ref = int(active_request_refs.get(key, 0) or 0)
+    is_new_slot = current_ref <= 0
+    if not is_new_slot:
+        active_request_refs[key] = current_ref + 1
+        return True, key, "reuse_existing_dynamic_session"
+
+    user_active = _count_active_user_requests(active_request_refs, active_request_meta, uid)
+    group_active = _count_active_group_requests(active_request_refs, active_request_meta, gid)
+    if user_limit > 0 and user_active >= user_limit:
+        detail = f"user_limit({user_active}/{user_limit}, uid={uid}, group={gid or 'private'})"
+        return False, key, detail
+    if gid and group_limit > 0 and group_active >= group_limit:
+        detail = f"group_limit({group_active}/{group_limit}, gid={gid}, uid={uid})"
+        return False, key, detail
+
+    active_request_refs[key] = 1
+    active_request_meta[key] = (uid, gid or "")
+    return True, key, "accepted_new_slot"
+
+
+def release_request_concurrency_slot(
+    *,
+    active_request_refs: Dict[str, int],
+    active_request_meta: Dict[str, Tuple[str, str]],
+    key: str,
+) -> int:
+    """Release one request-concurrency ref and return the remaining ref count."""
+    current_ref = int(active_request_refs.get(key, 0) or 0)
+    if current_ref <= 1:
+        active_request_refs.pop(key, None)
+        active_request_meta.pop(key, None)
+        return 0
+    left_ref = current_ref - 1
+    active_request_refs[key] = left_ref
+    return left_ref
 
 
 def _parse_regex_flags(flags_text: str) -> int:

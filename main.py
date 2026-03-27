@@ -71,6 +71,7 @@ from .modules.wake_logic import (
     normalize_concurrency_limit,
     try_acquire_request_concurrency_slot,
     release_request_concurrency_slot,
+    is_wake_prefix_triggered,
     evaluate_wake_extend,
     apply_post_wake_judge_gate,
     build_media_trigger_message,
@@ -472,6 +473,23 @@ class LLMEnhancement(Star):
             message_chain,
             bot_id=bid,
         )
+        reply_to_bot = bool(bid and reply_to_id and str(reply_to_id) == str(bid))
+        wake_prefixes = []
+        try:
+            config = self.context.get_config(event.unified_msg_origin)
+            wake_prefixes = config.get("wake_prefix", []) or []
+        except Exception:
+            try:
+                config = self.context.get_config()
+                wake_prefixes = config.get("wake_prefix", []) or []
+            except Exception:
+                wake_prefixes = []
+        prefix_wake_triggered = is_wake_prefix_triggered(
+            original_message=getattr(event.message_obj, "message_str", ""),
+            wake_prefixes=wake_prefixes,
+        )
+        event.set_extra("_llme_prefix_wake_triggered", prefix_wake_triggered)
+        event.set_extra("_llme_addressed_to_bot", bool(at_bot or reply_to_bot))
         raw_image_datas = extract_raw_image_datas_from_event(event)
         active_wake_factor = 1.0
         active_wake_reasons: list[str] = []
@@ -2072,6 +2090,22 @@ class LLMEnhancement(Star):
             wake_reason = str(event.get_extra("_llme_wake_reason", default="") or "")
             command_trigger_event = bool(event.get_extra("_llme_command_trigger_event", default=False))
             force_dynamic_followup = bool(event.get_extra("_llme_force_dynamic_followup", default=False))
+            require_at_for_wake_prefix = bool(self._get_cfg("require_at_for_wake_prefix", False))
+            prefix_wake_triggered = bool(event.get_extra("_llme_prefix_wake_triggered", default=False))
+            addressed_to_bot = bool(event.get_extra("_llme_addressed_to_bot", default=False))
+            if (
+                require_at_for_wake_prefix
+                and gid
+                and direct_wake
+                and prefix_wake_triggered
+                and (not addressed_to_bot)
+            ):
+                logger.debug(
+                    "[LLMEnhancement] on_llm_request 拦截：已启用唤醒前缀需@Bot，"
+                    f"检测到仅前缀唤醒。group={gid or 'private'}, uid={uid}, reason={wake_reason}"
+                )
+                event.stop_event()
+                return
             wake, wake_judge_detail = await apply_post_wake_judge_gate(
                 event=event,
                 msg=event.message_str,

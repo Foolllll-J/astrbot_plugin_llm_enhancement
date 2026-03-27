@@ -151,6 +151,12 @@
                 "type": "float",
                 "default": 0.0002
             },
+            "require_at_for_wake_prefix": {
+                "description": "唤醒需 @Bot",
+                "hint": "开启后，仅通过唤醒前缀触发的 LLM 请求会被拦截，必须 @Bot 或引用 Bot 消息才放行。",
+                "type": "bool",
+                "default": false
+            },
             "wake_forbidden_words": {
                 "description": "屏蔽唤醒规则",
                 "hint": "支持格式同唤醒规则。命中规则时不会唤醒bot。",

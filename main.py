@@ -220,6 +220,35 @@ class LLMEnhancement(Star):
             value = 90
         return max(10, min(600, value))
 
+    async def _release_concurrency_slot_if_needed(
+        self,
+        event: AstrMessageEvent,
+        *,
+        reason: str,
+    ) -> int:
+        """Release pre-acquired concurrency slot if still held."""
+        if not bool(event.get_extra("_llme_concurrency_acquired", default=False)):
+            return -1
+        if bool(event.get_extra("_llme_concurrency_released", default=False)):
+            return -1
+
+        slot_key = str(event.get_extra("_llme_concurrency_key", default="") or "").strip()
+        left_ref = 0
+        if slot_key:
+            async with self._request_counter_lock:
+                left_ref = release_request_concurrency_slot(
+                    active_request_refs=self._active_request_refs,
+                    active_request_meta=self._active_request_meta,
+                    key=slot_key,
+                )
+        event.set_extra("_llme_concurrency_released", True)
+        logger.debug(
+            "[LLMEnhancement] 并发槽位释放："
+            f"key={slot_key}, left_ref={left_ref}, reason={reason}, "
+            f"group={event.get_group_id() or 'private'}, uid={event.get_sender_id()}"
+        )
+        return left_ref
+
     def _is_command_trigger_event(self, event: AstrMessageEvent) -> bool:
         handlers_parsed_params = event.get_extra("handlers_parsed_params", default={}) or {}
         if not isinstance(handlers_parsed_params, dict) or not handlers_parsed_params:
@@ -1921,32 +1950,23 @@ class LLMEnhancement(Star):
         """在请求发送给 LLM 前执行，处理防护、合并及多媒体注入。"""
         setattr(event, "_provider_req", req)
         if event.is_stopped():
-            if bool(event.get_extra("_llme_concurrency_acquired", default=False)) and (
-                not bool(event.get_extra("_llme_concurrency_released", default=False))
-            ):
-                slot_key = str(event.get_extra("_llme_concurrency_key", default="") or "").strip()
-                left_ref = 0
-                if slot_key:
-                    async with self._request_counter_lock:
-                        left_ref = release_request_concurrency_slot(
-                            active_request_refs=self._active_request_refs,
-                            active_request_meta=self._active_request_meta,
-                            key=slot_key,
-                        )
-                event.set_extra("_llme_concurrency_released", True)
-                logger.debug(
-                    "[LLMEnhancement] 并发槽位释放："
-                    f"key={slot_key}, left_ref={left_ref}, reason=on_llm_request_skip_stopped, "
-                    f"group={event.get_group_id() or 'private'}, uid={event.get_sender_id()}"
-                )
+            await self._release_concurrency_slot_if_needed(
+                event, reason="on_llm_request_skip_stopped"
+            )
             return
         gid: str = event.get_group_id()
         uid: str = event.get_sender_id()
         if not uid:
+            await self._release_concurrency_slot_if_needed(
+                event, reason="on_llm_request_missing_uid"
+            )
             return
 
         # 任意拦截等级都会拦截 LLM 请求。
         if await self.blacklist.intercept_llm_request(event):
+            await self._release_concurrency_slot_if_needed(
+                event, reason="on_llm_request_blacklist_intercept"
+            )
             return
         
         merge_cfg = load_merge_runtime_config(self._get_cfg)
@@ -1981,6 +2001,9 @@ class LLMEnhancement(Star):
                     f"requeue_from_seq={requeue_from_seq}, current_req_seq={current_req_seq}"
                 )
                 event.stop_event()
+                await self._release_concurrency_slot_if_needed(
+                    event, reason="on_llm_request_stale_dynamic_requeue"
+                )
                 return
         if dynamic_merge_mode and state_uid != uid:
             logger.debug(
@@ -1997,6 +2020,9 @@ class LLMEnhancement(Star):
                 f"umo={event.unified_msg_origin}, msg_id={current_msg_id}, uid={uid}"
             )
             event.stop_event()
+            await self._release_concurrency_slot_if_needed(
+                event, reason="on_llm_request_message_recalled"
+            )
             return
         merge_delay = merge_cfg.delay_sec
         cache_keep_sec = max(max(merge_cfg.delay_sec, 10.0) * 6, 60.0)
@@ -2036,9 +2062,15 @@ class LLMEnhancement(Star):
                     f"group={gid or 'private'}, sender_uid={uid}, state_uid={state_uid}, msg_id={current_msg_id}"
                 )
                 event.stop_event()
+                await self._release_concurrency_slot_if_needed(
+                    event, reason="on_llm_request_skip_merged_dynamic"
+                )
                 return
             if not dynamic_merge_mode and current_msg_id and current_msg_id in merge_member.merged_msg_ids:
                 event.stop_event()
+                await self._release_concurrency_slot_if_needed(
+                    event, reason="on_llm_request_skip_merged_static"
+                )
                 return
 
         message_chain = []
@@ -2047,18 +2079,30 @@ class LLMEnhancement(Star):
         if not msg and not message_chain:
             logger.debug(f"[LLMEnhancement] 忽略空消息事件: gid={gid or 'private'}, uid={uid}")
             event.stop_event()
+            await self._release_concurrency_slot_if_needed(
+                event, reason="on_llm_request_empty_message"
+            )
             return
         
         if (not dynamic_merge_mode) and merge_member.in_merging:
             logger.debug(f"[LLMEnhancement] 当前存在进行中的合并会话，跳过重复请求: gid={gid or 'private'}, uid={uid}")
             event.stop_event()
+            await self._release_concurrency_slot_if_needed(
+                event, reason="on_llm_request_merge_in_progress"
+            )
             return
 
         if gid and g.shutup_until > now:
             event.stop_event()
+            await self._release_concurrency_slot_if_needed(
+                event, reason="on_llm_request_group_shutup"
+            )
             return
         if not event.is_admin() and sender_member.silence_until > now:
             event.stop_event()
+            await self._release_concurrency_slot_if_needed(
+                event, reason="on_llm_request_user_silenced"
+            )
             return
 
         has_preacquired_slot = bool(event.get_extra("_llme_concurrency_preacquired", default=False)) and bool(
@@ -2279,24 +2323,9 @@ class LLMEnhancement(Star):
         
         finally:
             if not request_forwarded:
-                if bool(event.get_extra("_llme_concurrency_acquired", default=False)) and (
-                    not bool(event.get_extra("_llme_concurrency_released", default=False))
-                ):
-                    slot_key = str(event.get_extra("_llme_concurrency_key", default="") or "").strip()
-                    left_ref = 0
-                    if slot_key:
-                        async with self._request_counter_lock:
-                            left_ref = release_request_concurrency_slot(
-                                active_request_refs=self._active_request_refs,
-                                active_request_meta=self._active_request_meta,
-                                key=slot_key,
-                            )
-                    event.set_extra("_llme_concurrency_released", True)
-                    logger.debug(
-                        "[LLMEnhancement] 并发槽位释放："
-                        f"key={slot_key}, left_ref={left_ref}, reason=request_blocked_before_provider, "
-                        f"group={event.get_group_id() or 'private'}, uid={event.get_sender_id()}"
-                    )
+                await self._release_concurrency_slot_if_needed(
+                    event, reason="request_blocked_before_provider"
+                )
             if dynamic_merge_mode and event.is_stopped():
                 dynamic_req_seq = int(event.get_extra("_llme_dynamic_request_seq") or 0)
                 dynamic_batch_keys = event.get_extra("_llme_dynamic_batch_keys", default=[]) or []
@@ -2322,198 +2351,140 @@ class LLMEnhancement(Star):
         gid: str = event.get_group_id()
         uid: str = event.get_sender_id()
         if not uid:
-            if bool(event.get_extra("_llme_concurrency_acquired", default=False)) and (
-                not bool(event.get_extra("_llme_concurrency_released", default=False))
-            ):
-                slot_key = str(event.get_extra("_llme_concurrency_key", default="") or "").strip()
-                left_ref = 0
-                if slot_key:
-                    async with self._request_counter_lock:
-                        left_ref = release_request_concurrency_slot(
-                            active_request_refs=self._active_request_refs,
-                            active_request_meta=self._active_request_meta,
-                            key=slot_key,
-                        )
-                event.set_extra("_llme_concurrency_released", True)
-                logger.debug(
-                    "[LLMEnhancement] 并发槽位释放："
-                    f"key={slot_key}, left_ref={left_ref}, reason=llm_response_missing_uid, "
-                    f"group={event.get_group_id() or 'private'}, uid={event.get_sender_id()}"
-                )
+            await self._release_concurrency_slot_if_needed(
+                event, reason="llm_response_missing_uid"
+            )
             return
 
-        target_id = gid or f"private_{uid}"
-        g = StateManager.get_group(target_id)
-        context_injection_enabled = bool(gid) and is_context_injection_enabled(self._get_cfg)
-        context_injection_max_messages = (
-            get_context_injection_max_messages(self._get_cfg)
-            if context_injection_enabled
-            else 0
-        )
-        state_uid = str(event.get_extra("_llme_dynamic_state_uid", default=uid) or uid).strip()
-        member = g.members.get(state_uid)
-
-        if member:
-            merge_cfg = load_merge_runtime_config(self._get_cfg)
-            dynamic_merge_mode = bool(merge_cfg.dynamic_mode and merge_cfg.delay_sec > 0)
-            cache_ttl_sec = get_discarded_response_ttl_sec(self._get_cfg, DYNAMIC_DISCARDED_RESPONSE_TTL_SEC)
-            dynamic_req_seq = int(event.get_extra("_llme_dynamic_request_seq") or 0)
-            is_dynamic_request = dynamic_merge_mode and dynamic_req_seq > 0
-            dynamic_batch_keys = event.get_extra("_llme_dynamic_batch_keys", default=[]) or []
-            if dynamic_merge_mode and dynamic_req_seq > 0:
-                should_drop = False
-                cache_stored = False
-                next_inflight_seq = 0
-                async with member.lock:
-                    if dynamic_req_seq <= member.dynamic_discard_before_seq:
-                        should_drop = True
-                        cache_stored = store_discarded_response_cache(member, dynamic_req_seq, resp)
-                    else:
-                        drop_dynamic_batch_from_unresolved(member, dynamic_batch_keys)
-                    if member.dynamic_inflight_seq == dynamic_req_seq:
-                        member.dynamic_inflight_seq = 0
-                        reset_dynamic_capture_session(member)
-                    if g.dynamic_owner_uid == state_uid:
-                        g.dynamic_owner_uid = None
-                    next_inflight_seq = int(member.dynamic_inflight_seq or 0)
-
-                if should_drop:
-                    has_newer_inflight = next_inflight_seq > dynamic_req_seq
-                    if has_newer_inflight:
-                        logger.debug(
-                            "[LLMEnhancement] 动态合并放弃上次请求响应："
-                            f"uid={state_uid}, sender_uid={uid}, group={gid or 'private'}, response_seq={dynamic_req_seq}, "
-                            f"discard_before_seq={member.dynamic_discard_before_seq}, cache_stored={cache_stored}, "
-                            f"next_inflight_seq={next_inflight_seq}"
-                        )
-                        clear_pending_msg_ids(g, member)
-                        member.cancel_merge = False
-                        event.set_extra("_llme_pending_last_response_update", False)
-                        event.stop_event()
-                        if bool(event.get_extra("_llme_concurrency_acquired", default=False)) and (
-                            not bool(event.get_extra("_llme_concurrency_released", default=False))
-                        ):
-                            slot_key = str(event.get_extra("_llme_concurrency_key", default="") or "").strip()
-                            left_ref = 0
-                            if slot_key:
-                                async with self._request_counter_lock:
-                                    left_ref = release_request_concurrency_slot(
-                                        active_request_refs=self._active_request_refs,
-                                        active_request_meta=self._active_request_meta,
-                                        key=slot_key,
-                                    )
-                            event.set_extra("_llme_concurrency_released", True)
-                            logger.debug(
-                                "[LLMEnhancement] 并发槽位释放："
-                                f"key={slot_key}, left_ref={left_ref}, reason=llm_response_discarded, "
-                                f"group={event.get_group_id() or 'private'}, uid={event.get_sender_id()}"
-                            )
-                        return
-                    logger.warning(
-                        "[LLMEnhancement] 动态丢弃保护触发：未检测到更新中的后续请求，保留当前响应以避免整轮无回复。"
-                        f"uid={state_uid}, sender_uid={uid}, group={gid or 'private'}, response_seq={dynamic_req_seq}, "
-                        f"discard_before_seq={member.dynamic_discard_before_seq}, cache_stored={cache_stored}"
-                    )
-
-            # 检查是否在此期间发生了撤回
-            if member.cancel_merge:
-                logger.info(
-                    " [LLMEnhancement] LLM 响应生成完成，但检测到消息已撤回，拦截回复 "
-                    f"(state_uid: {state_uid}, sender_uid: {uid})。"
-                )
-                member.cancel_merge = False
-                clear_pending_msg_ids(g, member)
-                event.set_extra("_llme_pending_last_response_update", False)
-                event.set_extra("_llme_effective_assistant_text_candidate", "")
-                event.stop_event()
-                if bool(event.get_extra("_llme_concurrency_acquired", default=False)) and (
-                    not bool(event.get_extra("_llme_concurrency_released", default=False))
-                ):
-                    slot_key = str(event.get_extra("_llme_concurrency_key", default="") or "").strip()
-                    left_ref = 0
-                    if slot_key:
-                        async with self._request_counter_lock:
-                            left_ref = release_request_concurrency_slot(
-                                active_request_refs=self._active_request_refs,
-                                active_request_meta=self._active_request_meta,
-                                key=slot_key,
-                            )
-                    event.set_extra("_llme_concurrency_released", True)
-                    logger.debug(
-                        "[LLMEnhancement] 并发槽位释放："
-                        f"key={slot_key}, left_ref={left_ref}, reason=llm_response_cancelled_by_recall, "
-                        f"group={event.get_group_id() or 'private'}, uid={event.get_sender_id()}"
-                    )
-                return
-
-            event.set_extra("_llme_pending_last_response_update", True)
-            event.set_extra("_llme_discard_cache_clear_after_sent", False)
-            event.set_extra(
-                "_llme_effective_assistant_text_candidate",
-                self._effective_dialog_history.extract_assistant_text_from_response(resp),
+        try:
+            target_id = gid or f"private_{uid}"
+            g = StateManager.get_group(target_id)
+            context_injection_enabled = bool(gid) and is_context_injection_enabled(self._get_cfg)
+            context_injection_max_messages = (
+                get_context_injection_max_messages(self._get_cfg)
+                if context_injection_enabled
+                else 0
             )
-            # 清理待处理消息 ID
-            clear_pending_msg_ids(g, member)
-            member.cancel_merge = False
+            state_uid = str(event.get_extra("_llme_dynamic_state_uid", default=uid) or uid).strip()
+            member = g.members.get(state_uid)
 
-            is_err_resp = str(resp.role or "").lower() == "err"
-            is_empty_resp = is_llm_response_empty_without_tool(resp)
-            if is_dynamic_request and (is_err_resp or is_empty_resp):
-                await apply_discarded_response_fallback(
-                    event=event,
-                    member=member,
-                    gid=gid,
-                    uid=uid,
-                    reason="llm_response_err" if is_err_resp else "llm_response_empty",
-                    ttl_sec=cache_ttl_sec,
+            if member:
+                merge_cfg = load_merge_runtime_config(self._get_cfg)
+                dynamic_merge_mode = bool(merge_cfg.dynamic_mode and merge_cfg.delay_sec > 0)
+                cache_ttl_sec = get_discarded_response_ttl_sec(self._get_cfg, DYNAMIC_DISCARDED_RESPONSE_TTL_SEC)
+                dynamic_req_seq = int(event.get_extra("_llme_dynamic_request_seq") or 0)
+                is_dynamic_request = dynamic_merge_mode and dynamic_req_seq > 0
+                dynamic_batch_keys = event.get_extra("_llme_dynamic_batch_keys", default=[]) or []
+                if dynamic_merge_mode and dynamic_req_seq > 0:
+                    should_drop = False
+                    cache_stored = False
+                    next_inflight_seq = 0
+                    async with member.lock:
+                        if dynamic_req_seq <= member.dynamic_discard_before_seq:
+                            should_drop = True
+                            cache_stored = store_discarded_response_cache(member, dynamic_req_seq, resp)
+                        else:
+                            drop_dynamic_batch_from_unresolved(member, dynamic_batch_keys)
+                        if member.dynamic_inflight_seq == dynamic_req_seq:
+                            member.dynamic_inflight_seq = 0
+                            reset_dynamic_capture_session(member)
+                        if g.dynamic_owner_uid == state_uid:
+                            g.dynamic_owner_uid = None
+                        next_inflight_seq = int(member.dynamic_inflight_seq or 0)
+
+                    if should_drop:
+                        has_newer_inflight = next_inflight_seq > dynamic_req_seq
+                        if has_newer_inflight:
+                            logger.debug(
+                                "[LLMEnhancement] 动态合并放弃上次请求响应："
+                                f"uid={state_uid}, sender_uid={uid}, group={gid or 'private'}, response_seq={dynamic_req_seq}, "
+                                f"discard_before_seq={member.dynamic_discard_before_seq}, cache_stored={cache_stored}, "
+                                f"next_inflight_seq={next_inflight_seq}"
+                            )
+                            clear_pending_msg_ids(g, member)
+                            member.cancel_merge = False
+                            event.set_extra("_llme_pending_last_response_update", False)
+                            event.stop_event()
+                            await self._release_concurrency_slot_if_needed(
+                                event, reason="llm_response_discarded"
+                            )
+                            return
+                        logger.warning(
+                            "[LLMEnhancement] 动态丢弃保护触发：未检测到更新中的后续请求，保留当前响应以避免整轮无回复。"
+                            f"uid={state_uid}, sender_uid={uid}, group={gid or 'private'}, response_seq={dynamic_req_seq}, "
+                            f"discard_before_seq={member.dynamic_discard_before_seq}, cache_stored={cache_stored}"
+                        )
+
+                # 检查是否在此期间发生了撤回
+                if member.cancel_merge:
+                    logger.info(
+                        " [LLMEnhancement] LLM 响应生成完成，但检测到消息已撤回，拦截回复 "
+                        f"(state_uid: {state_uid}, sender_uid: {uid})。"
+                    )
+                    member.cancel_merge = False
+                    clear_pending_msg_ids(g, member)
+                    event.set_extra("_llme_pending_last_response_update", False)
+                    event.set_extra("_llme_effective_assistant_text_candidate", "")
+                    event.stop_event()
+                    await self._release_concurrency_slot_if_needed(
+                        event, reason="llm_response_cancelled_by_recall"
+                    )
+                    return
+
+                event.set_extra("_llme_pending_last_response_update", True)
+                event.set_extra("_llme_discard_cache_clear_after_sent", False)
+                event.set_extra(
+                    "_llme_effective_assistant_text_candidate",
+                    self._effective_dialog_history.extract_assistant_text_from_response(resp),
                 )
-            else:
-                # 正常可发送内容，发送成功后清理缓存。
-                event.set_extra("_llme_discard_cache_clear_after_sent", True)
+                # 清理待处理消息 ID
+                clear_pending_msg_ids(g, member)
+                member.cancel_merge = False
 
-            if context_injection_enabled:
-                assistant_text = self._effective_dialog_history.extract_assistant_text_from_response(resp)
-                if not assistant_text:
-                    assistant_text = str(resp.completion_text or "").strip()
-                if assistant_text and str(resp.role or "").lower() != "err":
-                    append_group_context_message(
-                        g,
-                        uid=str(event.get_self_id() or "bot"),
-                        sender_name="Bot",
-                        message_text=assistant_text,
-                        max_messages=context_injection_max_messages,
-                        msg_id="",
-                        is_bot=True,
-                        source="assistant",
-                        at_targets=[],
-                        at_bot=False,
-                        at_all=False,
-                        reply_to_id=state_uid,
-                        reply_msg_id="",
-                        reply_preview="",
-                        now_ts=time.time(),
-                        get_cfg=self._get_cfg,
+                is_err_resp = str(resp.role or "").lower() == "err"
+                is_empty_resp = is_llm_response_empty_without_tool(resp)
+                if is_dynamic_request and (is_err_resp or is_empty_resp):
+                    await apply_discarded_response_fallback(
+                        event=event,
+                        member=member,
+                        gid=gid,
+                        uid=uid,
+                        reason="llm_response_err" if is_err_resp else "llm_response_empty",
+                        ttl_sec=cache_ttl_sec,
                     )
-                    sender_name = event.get_sender_name()
-                    g.context_bot_last_replied_to_uid = state_uid
+                else:
+                    # 正常可发送内容，发送成功后清理缓存。
+                    event.set_extra("_llme_discard_cache_clear_after_sent", True)
 
-        if bool(event.get_extra("_llme_concurrency_acquired", default=False)) and (
-            not bool(event.get_extra("_llme_concurrency_released", default=False))
-        ):
-            slot_key = str(event.get_extra("_llme_concurrency_key", default="") or "").strip()
-            left_ref = 0
-            if slot_key:
-                async with self._request_counter_lock:
-                    left_ref = release_request_concurrency_slot(
-                        active_request_refs=self._active_request_refs,
-                        active_request_meta=self._active_request_meta,
-                        key=slot_key,
-                    )
-            event.set_extra("_llme_concurrency_released", True)
-            logger.debug(
-                "[LLMEnhancement] 并发槽位释放："
-                f"key={slot_key}, left_ref={left_ref}, reason=llm_response_finished, "
-                f"group={event.get_group_id() or 'private'}, uid={event.get_sender_id()}"
+                if context_injection_enabled:
+                    assistant_text = self._effective_dialog_history.extract_assistant_text_from_response(resp)
+                    if not assistant_text:
+                        assistant_text = str(resp.completion_text or "").strip()
+                    if assistant_text and str(resp.role or "").lower() != "err":
+                        append_group_context_message(
+                            g,
+                            uid=str(event.get_self_id() or "bot"),
+                            sender_name="Bot",
+                            message_text=assistant_text,
+                            max_messages=context_injection_max_messages,
+                            msg_id="",
+                            is_bot=True,
+                            source="assistant",
+                            at_targets=[],
+                            at_bot=False,
+                            at_all=False,
+                            reply_to_id=state_uid,
+                            reply_msg_id="",
+                            reply_preview="",
+                            now_ts=time.time(),
+                            get_cfg=self._get_cfg,
+                        )
+                        sender_name = event.get_sender_name()
+                        g.context_bot_last_replied_to_uid = state_uid
+
+        finally:
+            await self._release_concurrency_slot_if_needed(
+                event, reason="llm_response_finished"
             )
 
     @filter.on_decorating_result(priority=95)

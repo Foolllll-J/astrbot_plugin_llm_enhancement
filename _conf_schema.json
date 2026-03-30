@@ -267,6 +267,7 @@
                 "type": "list",
                 "options": [
                     "image",
+                    "record",
                     "forward",
                     "url",
                     "file",
@@ -274,6 +275,7 @@
                 ],
                 "labels": [
                     "图片",
+                    "语音",
                     "聊天记录",
                     "URL",
                     "文件",
@@ -324,6 +326,12 @@
                 "type": "bool",
                 "default": true,
                 "hint": "关闭后，不再抓取并注入消息中的 URL 内容摘要。"
+            },
+            "record_parse_enable": {
+                "description": "启用语音解析",
+                "type": "bool",
+                "default": true,
+                "hint": "关闭后，不再进行语音转写（ASR），仅保留占位提示。"
             }
         }
     },

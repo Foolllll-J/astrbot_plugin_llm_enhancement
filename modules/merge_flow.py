@@ -91,11 +91,11 @@ def get_event_msg_id(event: AstrMessageEvent) -> Optional[str]:
 
 
 def is_merge_component(seg: Any) -> bool:
-    if isinstance(seg, (Comp.Image, Comp.Forward, Comp.Reply, Comp.Video, Comp.File, Comp.Json)):
+    if isinstance(seg, (Comp.Image, Comp.Forward, Comp.Reply, Comp.Video, Comp.File, Comp.Json, Comp.Record)):
         return True
     if isinstance(seg, dict):
         seg_type = str(seg.get("type") or "").lower()
-        return seg_type in {"image", "forward", "reply", "video", "file", "json"}
+        return seg_type in {"image", "forward", "reply", "video", "file", "json", "record"}
     return False
 
 
@@ -108,11 +108,11 @@ def extract_merge_components(event: AstrMessageEvent) -> list[Any]:
 
 def is_message_payload_component(seg: Any) -> bool:
     """是否属于可视为消息载荷的非文本组件。"""
-    if isinstance(seg, (Comp.Image, Comp.Video, Comp.File, Comp.Forward, Comp.Json)):
+    if isinstance(seg, (Comp.Image, Comp.Video, Comp.File, Comp.Forward, Comp.Json, Comp.Record)):
         return True
     if isinstance(seg, dict):
         seg_type = str(seg.get("type") or "").lower()
-        return seg_type in {"image", "video", "file", "forward", "json"}
+        return seg_type in {"image", "video", "file", "forward", "json", "record"}
     return False
 
 

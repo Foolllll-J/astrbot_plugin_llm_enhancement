@@ -10,10 +10,11 @@ from astrbot.api import logger
 import astrbot.api.message_components as Comp
 
 from .state_manager import GroupState
+from .runtime_helpers import cleanup_paths_later, transcribe_record_from_chain, clear_effective_dialog_history
 from .wake_logic import build_media_trigger_message
 
 _CONTEXT_IMAGE_CAPTION_PROMPT = "请用中文简洁描述这张图片，包含主体、关键动作和可能场景，不超过50字。"
-_NON_TEXT_PARSE_OPTIONS = {"image", "forward", "url", "file", "json"}
+_NON_TEXT_PARSE_OPTIONS = {"image", "forward", "url", "file", "json", "record"}
 _LAST_USER_INTERACTION_TTL_SEC = 24 * 60 * 60
 _CONTEXT_IMAGE_CAPTION_CACHE_TTL_SEC = 10 * 60
 _CONTEXT_IMAGE_CAPTION_CACHE_MAX_SIZE = 256
@@ -366,6 +367,36 @@ def _is_emoji_image_data(seg_data: dict[str, Any]) -> bool:
     except (TypeError, ValueError):
         pass
 
+    for key in ("emoji_id", "emojiId", "emojiID"):
+        value = seg_data.get(key)
+        if value not in (None, ""):
+            return True
+    for key in ("emoji_package_id", "emojiPackageId", "emojiPackageID"):
+        value = seg_data.get(key)
+        if value not in (None, ""):
+            return True
+    package = seg_data.get("emoji_package") or seg_data.get("emojiPackage")
+    if isinstance(package, dict):
+        if (
+            package.get("id")
+            or package.get("package_id")
+            or package.get("packageId")
+        ):
+            return True
+
+    for key in ("url", "file"):
+        value = seg_data.get(key)
+        if isinstance(value, str) and value:
+            lowered = value.lower()
+            if "gxh.vip.qq.com/club/item/parcel/item/" in lowered:
+                return True
+            if ("emoji_id=" in lowered) or ("emojiid=" in lowered):
+                return True
+            if "/emoji" in lowered or "/sticker" in lowered or "/face" in lowered:
+                return True
+            if key == "file" and lowered.startswith("fb-") and lowered.endswith(".gif"):
+                return True
+
     for key in ("type", "image_type", "imageType"):
         value = seg_data.get(key)
         if isinstance(value, str) and value.strip().lower() in {"emoji", "sticker", "face", "meme"}:
@@ -376,8 +407,85 @@ def _is_emoji_image_data(seg_data: dict[str, Any]) -> bool:
         lowered = summary.lower()
         if ("表情" in summary) or ("emoji" in lowered) or ("sticker" in lowered):
             return True
+        text = summary.strip()
+        if text.startswith("[") and text.endswith("]"):
+            inner = text[1:-1].strip()
+            if inner:
+                lowered_inner = inner.lower()
+                if (
+                    ("图片" not in inner)
+                    and ("视频" not in inner)
+                    and ("image" not in lowered_inner)
+                    and ("video" not in lowered_inner)
+                ):
+                    return True
     return False
 
+
+def _normalize_emoji_summary(summary: str) -> str:
+    text = str(summary or "").strip()
+    if text.startswith("[") and text.endswith("]"):
+        text = text[1:-1].strip()
+    return text
+
+
+def _extract_emoji_summary_from_data(seg_data: dict[str, Any]) -> str:
+    summary = seg_data.get("summary")
+    if isinstance(summary, str):
+        text = _normalize_emoji_summary(summary)
+        if text:
+            return text
+    return ""
+
+
+def get_emoji_summary_from_sources(
+    message_chain: Any,
+    raw_image_datas: Optional[list[dict[str, Any]]] = None,
+) -> str:
+    for data in list(raw_image_datas or []):
+        if _is_emoji_image_data(data):
+            text = _extract_emoji_summary_from_data(data)
+            if text:
+                return text
+    try:
+        for seg in (message_chain or []):
+            if isinstance(seg, dict) and str(seg.get("type") or "").lower() == "image":
+                data = seg.get("data") or {}
+                if isinstance(data, dict) and _is_emoji_image_data(data):
+                    text = _extract_emoji_summary_from_data(data)
+                    if text:
+                        return text
+            elif isinstance(seg, Comp.Image):
+                seg_data = _extract_image_data_from_component(seg)
+                if _is_emoji_image_data(seg_data):
+                    text = _extract_emoji_summary_from_data(seg_data)
+                    if text:
+                        return text
+    except Exception:
+        pass
+    return ""
+
+
+def _merge_image_caption_and_emoji_summary(caption: str, emoji_summary: str) -> str:
+    cap = str(caption or "").strip()
+    summary = str(emoji_summary or "").strip()
+    if not summary:
+        return cap
+    if not cap:
+        return summary
+    if summary in cap:
+        return cap
+    return f"{cap}；表情：{summary}"
+
+
+def append_emoji_summary_suffix(base_text: str, emoji_summary: str) -> str:
+    base = str(base_text or "").strip()
+    summary = str(emoji_summary or "").strip()
+    if not base or not summary:
+        return base
+    if summary in base:
+        return base
+    return f"{base}（表情：{summary}）"
 
 def _extract_image_data_from_component(comp: Any) -> dict[str, Any]:
     seg_data: dict[str, Any] = {}
@@ -504,7 +612,9 @@ def _summary_from_raw_message_chain(chain: Any) -> str:
     has_video = False
     has_forward = False
     has_json = False
+    has_record = False
     file_name = ""
+    emoji_summary = get_emoji_summary_from_sources(chain)
     try:
         for seg in (chain or []):
             if isinstance(seg, dict):
@@ -518,6 +628,8 @@ def _summary_from_raw_message_chain(chain: Any) -> str:
                     has_image = True
                 elif seg_type == "video":
                     has_video = True
+                elif seg_type == "record":
+                    has_record = True
                 elif seg_type == "forward":
                     has_forward = True
                 elif seg_type == "json":
@@ -533,6 +645,8 @@ def _summary_from_raw_message_chain(chain: Any) -> str:
                     has_image = True
                 elif isinstance(seg, Comp.Video):
                     has_video = True
+                elif isinstance(seg, Comp.Record):
+                    has_record = True
                 elif isinstance(seg, Comp.Forward):
                     has_forward = True
                 elif isinstance(seg, Comp.Json):
@@ -544,7 +658,8 @@ def _summary_from_raw_message_chain(chain: Any) -> str:
 
     text = " ".join([t for t in texts if t]).strip()
     if text:
-        return _clip(text, 120)
+        return append_emoji_summary_suffix(_clip(text, 120), emoji_summary)
+    image_label = get_image_component_label(chain)
     placeholder, _ = build_media_trigger_message(
         sender_name="对方",
         has_image_component=has_image,
@@ -552,10 +667,12 @@ def _summary_from_raw_message_chain(chain: Any) -> str:
         has_file_component=bool(file_name),
         has_forward_component=has_forward,
         has_json_component=has_json,
+        has_record_component=has_record,
         file_name=file_name,
+        image_label=image_label,
     )
     if placeholder:
-        return placeholder
+        return append_emoji_summary_suffix(placeholder, emoji_summary)
     return "[引用消息]"
 
 
@@ -585,18 +702,20 @@ async def try_get_image_caption(
     *,
     event: Any = None,
     message_chain: Any,
+    raw_image_datas: Optional[list[dict[str, Any]]] = None,
     get_cfg: Any,
     provider_by_id_resolver: Any,
     default_provider_resolver: Any,
     timeout_sec: float = 20.0,
 ) -> str:
+    emoji_summary = get_emoji_summary_from_sources(message_chain, raw_image_datas=raw_image_datas)
     image_file, image_url = _extract_first_image_file_and_url(message_chain)
     if not image_file and not image_url:
-        return ""
+        return emoji_summary or ""
     cache_key = _build_image_caption_cache_key(image_file, image_url)
     cached_caption = _get_cached_image_caption(cache_key)
     if cached_caption:
-        return cached_caption
+        return _merge_image_caption_and_emoji_summary(cached_caption, emoji_summary)
 
     provider_id = str(
         get_cfg(
@@ -607,11 +726,11 @@ async def try_get_image_caption(
     ).strip()
     provider = provider_by_id_resolver(provider_id) if provider_id else default_provider_resolver()
     if not provider or (not hasattr(provider, "text_chat")):
-        return ""
+        return emoji_summary or ""
 
     prompt = _CONTEXT_IMAGE_CAPTION_PROMPT
     if not prompt:
-        return ""
+        return emoji_summary or ""
 
     image_input = _normalize_local_image_path(image_file) or _normalize_local_image_path(image_url)
     temp_image_path = ""
@@ -639,7 +758,7 @@ async def try_get_image_caption(
 
             source = str(image_url or image_file or "").strip()
             if not source:
-                return ""
+                return emoji_summary or ""
             temp_image_path = str(
                 await download_video_to_temp(
                     source,
@@ -652,7 +771,7 @@ async def try_get_image_caption(
             logger.debug(f"[LLMEnhancement][ContextInjection] 图像转述失败(download): {type(e).__name__}: {e}")
             image_input = ""
     if not image_input:
-        return ""
+        return emoji_summary or ""
 
     try:
         async with _context_image_caption_semaphore:
@@ -669,10 +788,10 @@ async def try_get_image_caption(
             caption = text[:200]
             if caption:
                 _set_cached_image_caption(cache_key, caption)
-            return caption
+            return _merge_image_caption_and_emoji_summary(caption, emoji_summary)
     except Exception as e:
         logger.debug(f"[LLMEnhancement][ContextInjection] 图像转述失败(model): {type(e).__name__}: {e}")
-        return ""
+        return emoji_summary or ""
     finally:
         if temp_image_path:
             try:
@@ -762,6 +881,7 @@ async def build_text_context_enrichment(
 async def build_non_text_context_text(
     *,
     event: Any,
+    context: Any,
     get_cfg: Any,
     message_chain: Any,
     sender_name: str,
@@ -772,12 +892,24 @@ async def build_non_text_context_text(
     default_provider_resolver: Any,
 ) -> str:
     parts: list[str] = []
+    has_record_component = False
+    try:
+        for seg in (message_chain or []):
+            if isinstance(seg, Comp.Record):
+                has_record_component = True
+                break
+            if isinstance(seg, dict) and str(seg.get("type") or "").lower() == "record":
+                has_record_component = True
+                break
+    except Exception:
+        has_record_component = False
 
     # image: 复用图片转述逻辑
     if "image" in parse_options:
         image_caption = await try_get_image_caption(
             event=event,
             message_chain=message_chain,
+            raw_image_datas=raw_image_datas,
             get_cfg=get_cfg,
             provider_by_id_resolver=provider_by_id_resolver,
             default_provider_resolver=default_provider_resolver,
@@ -812,6 +944,22 @@ async def build_non_text_context_text(
             except Exception:
                 pass
 
+    if "record" in parse_options and has_record_component:
+        record_text = ""
+        if bool(get_cfg("record_parse_enable", True)):
+            record_text, cleanup_paths = await transcribe_record_from_chain(
+                context=context,
+                get_cfg=get_cfg,
+                event=event,
+                chain=message_chain,
+            )
+            if cleanup_paths:
+                await cleanup_paths_later(cleanup_paths)
+        if record_text:
+            parts.append(f"语音转写: {_clip(record_text, 220)}")
+        else:
+            parts.append("语音消息")
+
     # url/file/json: 复用现有解析逻辑
     structured_enrichment = await build_text_context_enrichment(
         event=event,
@@ -825,6 +973,10 @@ async def build_non_text_context_text(
     if parts:
         if len(parts) == 1:
             only = parts[0]
+            if only == "语音消息":
+                return "发送了一条语音消息"
+            if only.startswith("语音转写:"):
+                return f"发送了一条语音消息，{only}"
             if only.startswith("表情包转述:"):
                 return f"发送了一个表情包，{only}"
             if only.startswith("图片转述:"):
@@ -851,16 +1003,21 @@ def build_context_text(
     has_file_component: bool,
     has_forward_component: bool,
     has_json_component: bool,
+    has_record_component: bool,
     file_name: str,
     image_label: str = "图片",
+    emoji_summary: str = "",
 ) -> str:
     text = str(message_text or "").strip()
     if has_image_component and image_caption:
         if text:
-            return f"{text} [{image_label}描述: {image_caption}]"
-        return f"{sender_name}发送了一张{image_label}：{image_caption}"
+            return append_emoji_summary_suffix(f"{text} [{image_label}描述: {image_caption}]", emoji_summary)
+        return append_emoji_summary_suffix(
+            f"{sender_name}发送了一张{image_label}：{image_caption}",
+            emoji_summary,
+        )
     if text:
-        return text
+        return append_emoji_summary_suffix(text, emoji_summary)
     media_text, _ = build_media_trigger_message(
         sender_name=sender_name,
         has_image_component=has_image_component,
@@ -868,10 +1025,11 @@ def build_context_text(
         has_file_component=has_file_component,
         has_forward_component=has_forward_component,
         has_json_component=has_json_component,
+        has_record_component=has_record_component,
         file_name=file_name,
+        image_label=image_label,
     )
-    return str(media_text or "").strip()
-
+    return append_emoji_summary_suffix(str(media_text or "").strip(), emoji_summary)
 
 def _clip(text: str, limit: int = 120) -> str:
     t = str(text or "").replace("\n", " ").replace("\r", " ").strip()
@@ -931,6 +1089,7 @@ def _dedup_simple_notice_text(sender: str, text: str) -> str:
 
 def _render_context_line(item: dict[str, Any], *, detailed: bool, limit: int = 110) -> str:
     sender = str(item.get("sender_name") or item.get("uid") or "未知用户").strip()
+    uid_text = str(item.get("uid") or "").strip()
     ts = item.get("ts")
     time_text = "--:--:--"
     try:
@@ -942,16 +1101,16 @@ def _render_context_line(item: dict[str, Any], *, detailed: bool, limit: int = 1
         source_text = str(item.get("source") or "").strip().lower()
         text_raw = str(item.get("text") or "")
         is_notice_line = source_text.startswith("notice_") or source_text.startswith("request_")
+        sender_with_uid = f"{sender}(uid={uid_text})" if uid_text else sender
         if is_notice_line:
             text = _clip(text_raw, limit)
-            return f"[{time_text}] {text}"
+            return f"[{time_text}] {sender_with_uid}: {text}"
         text = _clip(_dedup_simple_notice_text(sender, text_raw), limit)
         reply_preview = _clip(str(item.get("reply_preview") or ""), 80)
         suffix = f" | 引用: {reply_preview}" if reply_preview else ""
-        return f"[{time_text}] {sender}: {text}{suffix}"
+        return f"[{time_text}] {sender_with_uid}: {text}{suffix}"
 
     detail_parts: list[str] = [f"sender={sender}"]
-    uid_text = str(item.get("uid") or "").strip()
     msg_id_text = str(item.get("msg_id") or "").strip()
     source_text = str(item.get("source") or "").strip()
     reply_to_id = str(item.get("reply_to_id") or "").strip()
@@ -1313,6 +1472,12 @@ def inject_context_into_request(
         + "\n[说明] 以上为最近对话片段，请结合其连续性理解当前消息。"
     )
     req.prompt = f"{(req.prompt or '').strip()}{block}".strip()
+    gid = str(getattr(group_state, "gid", "") or "").strip()
+    logger.info(
+        "[LLMEnhancement][ContextInjection] 请求上下文注入内容："
+        f"group={gid or 'private'}, wake_reason={wake_reason}, detail=injected:{len(lines)}\n"
+        f"{block.strip()}"
+    )
     return True, f"injected:{len(lines)}", block.strip()
 
 
@@ -1387,6 +1552,31 @@ def append_group_context_message(
     logger.debug(
         "[LLMEnhancement][ContextInjection] 记录上下文："
         f"source={entry.get('source', 'incoming')}, uid={entry['uid'] or 'unknown'}, "
-        f"total={len(group_state.context_messages)}"
+        f"total={len(group_state.context_messages)}, text={text}"
     )
     return True
+
+
+def clear_group_context_records(group_state: GroupState) -> int:
+    removed = len(group_state.context_messages or [])
+    group_state.context_messages = []
+    group_state.last_user_interaction = {}
+    group_state.context_bot_last_replied_to_uid = ""
+    return removed
+
+
+def clear_context_records_for_group(
+    *,
+    group_state: GroupState,
+    effective_history: Any,
+    umo: str,
+) -> tuple[int, int]:
+    removed = clear_group_context_records(group_state)
+    effective_removed = clear_effective_dialog_history(effective_history, umo)
+    gid = str(getattr(group_state, "gid", "") or "")
+    scope_label = f"群({gid})" if gid else "群(unknown)"
+    logger.debug(
+        "[LLMEnhancement] 清除上下文完成："
+        f"{scope_label}, removed={removed}, effective_removed={effective_removed}"
+    )
+    return removed, effective_removed

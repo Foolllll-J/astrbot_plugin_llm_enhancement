@@ -52,6 +52,10 @@ FALLBACK_BUILT_CMDS = {
     "alter",
 }
 
+_RECORD_ASR_CACHE_TTL_SEC = 10 * 60
+_RECORD_ASR_CACHE_MAX_SIZE = 100
+_record_asr_cache: dict[str, dict[str, Any]] = {}
+
 
 class BuiltinCommandMatcher:
     def __init__(self, cache_ttl_sec: float = 60.0):
@@ -257,6 +261,12 @@ class EffectiveDialogHistory:
                     contexts.append(f"assistant: {assistant_text}")
         return contexts[-count:] if count else contexts
 
+    def clear_session(self, umo: str) -> int:
+        if not umo:
+            return 0
+        turns = self._turns_by_session.pop(umo, None)
+        return len(turns) if turns else 0
+
     def append_turn(
         self,
         umo: str,
@@ -285,8 +295,14 @@ class EffectiveDialogHistory:
         self._turns_by_session[umo] = turns[-self._max_turns:]
 
 
+def clear_effective_dialog_history(history: EffectiveDialogHistory, umo: str) -> int:
+    if not history:
+        return 0
+    return history.clear_session(umo)
+
+
 def resolve_provider(context: Any, provider_id: str):
-    """Find provider by configured id or name among available providers."""
+    """按配置的 id 或名称查找可用 Provider。"""
     return find_provider(context, provider_id)
 
 
@@ -295,7 +311,7 @@ def get_llm_provider(
     event: Optional[AstrMessageEvent] = None,
     umo: Optional[str] = None,
 ):
-    """Get current session LLM provider."""
+    """获取当前会话使用的 LLM Provider。"""
     try:
         using_umo = umo or (getattr(event, "unified_msg_origin", None) if event is not None else None)
         if using_umo:
@@ -311,7 +327,7 @@ def get_stt_provider(
     event: Optional[AstrMessageEvent] = None,
     umo: Optional[str] = None,
 ):
-    """Get configured STT provider with fallback to current session provider."""
+    """获取配置的 STT Provider，未命中时回退到当前会话 Provider。"""
     asr_pid = get_cfg("asr_provider_id")
     p = resolve_provider(context, asr_pid)
     if p:
@@ -336,7 +352,7 @@ def get_vision_provider(
     event: Optional[AstrMessageEvent] = None,
     umo: Optional[str] = None,
 ):
-    """Get configured vision provider with fallback to current LLM provider."""
+    """获取配置的视觉 Provider，未命中时回退到当前会话 LLM Provider。"""
     image_pid = get_cfg("image_provider_id")
     p = resolve_provider(context, image_pid)
     if p:
@@ -349,8 +365,224 @@ def get_vision_provider(
     return get_llm_provider(context=context, event=event, umo=umo)
 
 
+def _build_record_cache_key(segment: Any) -> str:
+    if isinstance(segment, dict):
+        data = segment.get("data") or {}
+        if isinstance(data, dict):
+            for key in ("file_id", "file", "url", "path", "file_path", "id"):
+                value = data.get(key)
+                if value not in (None, ""):
+                    return str(value)
+        for key in ("file_id", "file", "url", "path", "file_path", "id"):
+            value = segment.get(key)
+            if value not in (None, ""):
+                return str(value)
+        return ""
+
+    for attr in ("file_id", "file", "url", "path", "file_path", "id"):
+        value = getattr(segment, attr, None)
+        if value not in (None, ""):
+            return str(value)
+    return ""
+
+
+def _get_record_asr_cache(cache_key: str) -> str:
+    if not cache_key:
+        return ""
+    item = _record_asr_cache.get(cache_key)
+    if not isinstance(item, dict):
+        return ""
+    expire_at = float(item.get("expire_at", 0.0) or 0.0)
+    if expire_at <= time.time():
+        _record_asr_cache.pop(cache_key, None)
+        return ""
+    return str(item.get("text") or "")
+
+
+def _set_record_asr_cache(cache_key: str, text: str) -> None:
+    if not cache_key:
+        return
+    normalized = str(text or "").strip()
+    if not normalized:
+        return
+    _record_asr_cache[cache_key] = {
+        "text": normalized,
+        "expire_at": time.time() + _RECORD_ASR_CACHE_TTL_SEC,
+    }
+    if len(_record_asr_cache) > _RECORD_ASR_CACHE_MAX_SIZE:
+        now_ts = time.time()
+        expired_keys = [
+            k
+            for k, v in _record_asr_cache.items()
+            if float((v or {}).get("expire_at", 0.0) or 0.0) <= now_ts
+        ]
+        for k in expired_keys:
+            _record_asr_cache.pop(k, None)
+        if len(_record_asr_cache) > _RECORD_ASR_CACHE_MAX_SIZE:
+            _record_asr_cache.clear()
+
+
+def _normalize_record_source(value: Any) -> str:
+    return str(value or "").strip()
+
+
+async def resolve_record_file_path(
+    event: Optional[AstrMessageEvent],
+    segment: Any,
+) -> tuple[Optional[str], bool]:
+    """将语音 segment 解析为本地文件路径，返回 `(path, should_cleanup)`。"""
+    def _build_candidates(data: dict) -> list[str]:
+        candidates: list[str] = []
+        url = _normalize_record_source(data.get("url"))
+        if url:
+            candidates.append(url)
+        file_value = _normalize_record_source(data.get("file"))
+        if file_value:
+            candidates.append(file_value)
+        path_value = _normalize_record_source(data.get("path"))
+        if path_value:
+            candidates.append(path_value)
+        file_id = _normalize_record_source(data.get("file_id"))
+        if file_id:
+            candidates.append(file_id)
+        return candidates
+
+    async def _resolve_from_candidates(candidates: list[str]) -> tuple[Optional[str], bool]:
+        for cand in candidates:
+            if cand.startswith("http"):
+                try:
+                    record = Comp.Record.fromURL(cand)
+                    path = await record.convert_to_file_path()
+                    return path, True
+                except Exception:
+                    continue
+            if cand.startswith("file://"):
+                try:
+                    record = Comp.Record(file=cand)
+                    path = await record.convert_to_file_path()
+                    return path, False
+                except Exception:
+                    continue
+            if os.path.exists(cand):
+                return os.path.abspath(cand), False
+
+        # 兜底：针对不是本地路径的 file id，尝试调用平台 get_record 获取文件
+        if candidates and event is not None and getattr(event, "bot", None) is not None:
+            api = getattr(event.bot, "api", None)
+            if api and hasattr(api, "call_action"):
+                try:
+                    resp = await api.call_action("get_record", file=candidates[0])
+                    if isinstance(resp, dict):
+                        resp_file = _normalize_record_source(resp.get("file"))
+                        resp_url = _normalize_record_source(resp.get("url"))
+                        if resp_file and os.path.exists(resp_file):
+                            return os.path.abspath(resp_file), False
+                        if resp_url:
+                            record = Comp.Record.fromURL(resp_url)
+                            path = await record.convert_to_file_path()
+                            return path, True
+                except Exception:
+                    pass
+        return None, False
+
+    try:
+        if isinstance(segment, Comp.Record):
+            data = {
+                "file": getattr(segment, "file", None),
+                "url": getattr(segment, "url", None),
+                "path": getattr(segment, "path", None) or getattr(segment, "file_path", None),
+                "file_id": getattr(segment, "file_id", None),
+            }
+            candidates = _build_candidates(data)
+            if not candidates:
+                return None, False
+            return await _resolve_from_candidates(candidates)
+
+        if not isinstance(segment, dict):
+            return None, False
+        seg_type = str(segment.get("type") or "").lower()
+        if seg_type != "record":
+            return None, False
+        data = segment.get("data") or {}
+        if not isinstance(data, dict):
+            data = {}
+
+        candidates = _build_candidates(data)
+        if not candidates:
+            return None, False
+        return await _resolve_from_candidates(candidates)
+    except Exception:
+        return None, False
+    return None, False
+
+
+async def transcribe_record_segment(
+    *,
+    context: Any,
+    get_cfg: Callable[[str, Any], Any],
+    event: Optional[AstrMessageEvent],
+    segment: Any,
+) -> tuple[str, list[str]]:
+    """尽可能转写单个语音 segment，返回 `(text, cleanup_paths)`。"""
+    if not bool(get_cfg("record_parse_enable", True)):
+        return "", []
+    cache_key = _build_record_cache_key(segment)
+    cached_text = _get_record_asr_cache(cache_key)
+    if cached_text:
+        return cached_text, []
+    stt = get_stt_provider(context, get_cfg, event=event)
+    if not stt:
+        return "", []
+    record_path, should_cleanup = await resolve_record_file_path(event, segment)
+    if not record_path:
+        return "", []
+    text = ""
+    try:
+        if hasattr(stt, "get_text"):
+            text = await stt.get_text(record_path)
+        elif hasattr(stt, "speech_to_text"):
+            res = await stt.speech_to_text(record_path)
+            if isinstance(res, dict):
+                text = str(res.get("text") or "")
+            elif hasattr(res, "text"):
+                text = str(res.text)
+            else:
+                text = str(res or "")
+        else:
+            text = ""
+    except Exception as e:
+        text = ""
+    cleanup_paths = [record_path] if should_cleanup else []
+    text = str(text or "").strip()
+    if text:
+        _set_record_asr_cache(cache_key or record_path, text)
+    return text, cleanup_paths
+
+
+async def transcribe_record_from_chain(
+    *,
+    context: Any,
+    get_cfg: Callable[[str, Any], Any],
+    event: Optional[AstrMessageEvent],
+    chain: Any,
+) -> tuple[str, list[str]]:
+    """在消息链中查找第一个语音 segment 并执行转写。"""
+    for seg in list(chain or []):
+        if isinstance(seg, Comp.Record) or (
+            isinstance(seg, dict) and str(seg.get("type") or "").lower() == "record"
+        ):
+            text, cleanup_paths = await transcribe_record_segment(
+                context=context,
+                get_cfg=get_cfg,
+                event=event,
+                segment=seg,
+            )
+            return text, cleanup_paths
+    return "", []
+
+
 async def cleanup_paths_later(cleanup_paths: list[str], delay_sec: int = 120):
-    """Cleanup temporary paths after delay, fire-and-forget."""
+    """延迟清理临时路径，采用 fire-and-forget 方式执行。"""
     if not cleanup_paths:
         return
 
@@ -428,7 +660,7 @@ async def get_history_messages(
     count: int | None = 0,
     with_role_prefix: bool = False,
 ) -> list[str]:
-    """Read current conversation history contents by role."""
+    """按角色读取当前会话历史消息内容。"""
     try:
         umo = event.unified_msg_origin
         curr_cid = await context.conversation_manager.get_curr_conversation_id(umo)

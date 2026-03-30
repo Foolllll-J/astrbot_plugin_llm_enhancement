@@ -16,6 +16,7 @@ from .json_parser import (
     parse_json_segment_data,
 )
 from .url_parser import extract_url_infos_from_chain
+from .runtime_helpers import transcribe_record_segment, transcribe_record_from_chain, cleanup_paths_later
 
 try:
     from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import AiocqhttpMessageEvent
@@ -119,6 +120,36 @@ def _segment_is_emoji_image(seg_data: dict[str, Any]) -> bool:
     except (TypeError, ValueError):
         pass
 
+    for key in ("emoji_id", "emojiId", "emojiID"):
+        value = seg_data.get(key)
+        if value not in (None, ""):
+            return True
+    for key in ("emoji_package_id", "emojiPackageId", "emojiPackageID"):
+        value = seg_data.get(key)
+        if value not in (None, ""):
+            return True
+    package = seg_data.get("emoji_package") or seg_data.get("emojiPackage")
+    if isinstance(package, dict):
+        if (
+            package.get("id")
+            or package.get("package_id")
+            or package.get("packageId")
+        ):
+            return True
+
+    for key in ("url", "file"):
+        value = seg_data.get(key)
+        if isinstance(value, str) and value:
+            lowered = value.lower()
+            if "gxh.vip.qq.com/club/item/parcel/item/" in lowered:
+                return True
+            if ("emoji_id=" in lowered) or ("emojiid=" in lowered):
+                return True
+            if "/emoji" in lowered or "/sticker" in lowered or "/face" in lowered:
+                return True
+            if key == "file" and lowered.startswith("fb-") and lowered.endswith(".gif"):
+                return True
+
     for key in ("type", "image_type", "imageType"):
         value = seg_data.get(key)
         if isinstance(value, str) and value.strip().lower() in {"emoji", "sticker", "face", "meme"}:
@@ -129,8 +160,48 @@ def _segment_is_emoji_image(seg_data: dict[str, Any]) -> bool:
         lowered = summary.lower()
         if ("表情" in summary) or ("emoji" in lowered) or ("sticker" in lowered):
             return True
+        text = summary.strip()
+        if text.startswith("[") and text.endswith("]"):
+            inner = text[1:-1].strip()
+            if inner:
+                lowered_inner = inner.lower()
+                if (
+                    ("图片" not in inner)
+                    and ("视频" not in inner)
+                    and ("image" not in lowered_inner)
+                    and ("video" not in lowered_inner)
+                ):
+                    return True
 
     return False
+
+
+def _normalize_emoji_summary(summary: str) -> str:
+    text = str(summary or "").strip()
+    if text.startswith("[") and text.endswith("]"):
+        text = text[1:-1].strip()
+    return text
+
+
+def _extract_emoji_summary(seg_data: dict[str, Any]) -> str:
+    return _normalize_emoji_summary(str(seg_data.get("summary") or ""))
+
+
+def _append_emoji_summary_suffix(base_text: str, emoji_summary: str) -> str:
+    base = str(base_text or "").strip()
+    summary = _normalize_emoji_summary(emoji_summary)
+    if not base or not summary:
+        return base
+    if summary in base:
+        return base
+    return f"{base}（表情：{summary}）"
+
+
+def _describe_image_segment(seg_data: dict[str, Any]) -> str:
+    label = "表情包" if _segment_is_emoji_image(seg_data) else "图片"
+    if label == "表情包":
+        return _append_emoji_summary_suffix(label, _extract_emoji_summary(seg_data))
+    return label
 
 
 def _extract_raw_message_segments(event: AstrMessageEvent) -> list[dict[str, Any]]:
@@ -187,13 +258,13 @@ async def inject_current_message_image_context(
         if str(segment.get("type") or "").lower() != "image":
             continue
         seg_data = segment.get("data", {}) or {}
-        label = "表情包" if _segment_is_emoji_image(seg_data) else "图片"
+        label = _describe_image_segment(seg_data)
         if label not in image_labels:
             image_labels.append(label)
 
     if not image_labels:
         for seg_data in chain_image_datas:
-            label = "表情包" if _segment_is_emoji_image(seg_data) else "图片"
+            label = _describe_image_segment(seg_data)
             if label not in image_labels:
                 image_labels.append(label)
 
@@ -322,6 +393,7 @@ async def inject_current_message_forward_origin_context(
 
 async def parse_reply_context(
     event: AstrMessageEvent,
+    context: Any,
     req: ProviderRequest,
     reply_seg: Comp.Reply,
     forward_id: Optional[str],
@@ -345,6 +417,7 @@ async def parse_reply_context(
         enable_forward_parse = bool(get_cfg("forward_parse_enable", True))
         enable_file_parse = bool(get_cfg("file_parse_enable", True))
         enable_json_parse = bool(get_cfg("json_parse_enable", True))
+        enable_record_parse = bool(get_cfg("record_parse_enable", True))
 
         if original_sender == self_id:
             message_list = original_msg["message"] if isinstance(original_msg["message"], list) else []
@@ -394,6 +467,8 @@ async def parse_reply_context(
         quoted_file_names: list[str] = []
         quoted_file_infos: list[str] = []
         quoted_json_infos: list[str] = []
+        quoted_record_texts: list[str] = []
+        quoted_record_count = 0
 
         if not hasattr(req, "image_urls") or req.image_urls is None:
             req.image_urls = []
@@ -423,9 +498,23 @@ async def parse_reply_context(
                     break
 
             elif seg_type == "image":
-                label = "表情包" if _segment_is_emoji_image(seg_data) else "图片"
+                label = _describe_image_segment(seg_data)
                 if label not in quoted_image_labels:
                     quoted_image_labels.append(label)
+
+            elif seg_type == "record":
+                quoted_record_count += 1
+                if enable_record_parse:
+                    asr_text, cleanup_paths = await transcribe_record_segment(
+                        context=context,
+                        get_cfg=get_cfg,
+                        event=event,
+                        segment=segment,
+                    )
+                    if cleanup_paths:
+                        req._cleanup_paths.extend(cleanup_paths)
+                    if asr_text:
+                        quoted_record_texts.append(asr_text)
 
             elif enable_file_parse and seg_type == "file":
                 file_name = seg_data.get("name") or seg_data.get("file_name") or seg_data.get("file")
@@ -478,7 +567,7 @@ async def parse_reply_context(
                         f"has_key_info={bool(key_info)}, news_count={len(forward_news_texts)}"
                     )
 
-        if quoted_image_labels or quoted_file_names or quoted_file_infos or quoted_json_infos:
+        if quoted_image_labels or quoted_file_names or quoted_file_infos or quoted_json_infos or quoted_record_count:
             quoted_sender = getattr(req, "_quoted_sender", "未知用户")
             parts: list[str] = []
             if quoted_image_labels:
@@ -490,6 +579,11 @@ async def parse_reply_context(
                 parts.append(f"被引用文件的内容摘要：{'；'.join(quoted_file_infos[:2])}。")
             if quoted_json_infos:
                 parts.append(f"被引用卡片的关键信息：{'；'.join(quoted_json_infos[:2])}。")
+            if quoted_record_count:
+                if quoted_record_texts:
+                    parts.append(f"当前用户引用了 {quoted_sender} 发送的语音，转写内容：{ ' / '.join(quoted_record_texts[:2]) }。")
+                else:
+                    parts.append(f"当前用户引用了 {quoted_sender} 发送的语音。")
             _append_prompt_context(req, parts)
             if quoted_json_infos:
                 result.injected_json = True
@@ -504,6 +598,7 @@ async def parse_reply_context(
 
 async def process_reference_context(
     event: AstrMessageEvent,
+    context: Any,
     req: ProviderRequest,
     all_components: list[Any],
     get_cfg: Callable[[str, Any], Any],
@@ -528,6 +623,7 @@ async def process_reference_context(
     if is_aiocqhttp_event and event.is_at_or_wake_command and (not result.forward_id) and result.reply_seg:
         parsed_reply = await parse_reply_context(
             event=event,
+            context=context,
             req=req,
             reply_seg=result.reply_seg,
             forward_id=result.forward_id,
@@ -690,7 +786,7 @@ async def process_reference_context(
                             if is_forward_card and forward_id_from_json and forward_id_from_json not in merged_forward_ids:
                                 merged_forward_ids.append(forward_id_from_json)
                     elif seg_type == "image":
-                        label = "表情包" if _segment_is_emoji_image(seg_data) else "图片"
+                        label = _describe_image_segment(seg_data)
                         text = f"{sender_name} 发送的{label}"
                         if text not in merged_image_parts:
                             merged_image_parts.append(text)
@@ -783,3 +879,36 @@ async def process_reference_context(
                     )
                     result.injected_url = True
     return result
+
+
+async def inject_record_asr_context(
+    *,
+    context: Any,
+    event: AstrMessageEvent,
+    req: ProviderRequest,
+    all_components: list[Any],
+    get_cfg: Callable[[str, Any], Any],
+    cleanup_paths=cleanup_paths_later,
+) -> bool:
+    """在 LLM 请求阶段注入语音转写文本。"""
+    record_asr_text, record_cleanup_paths = await transcribe_record_from_chain(
+        context=context,
+        get_cfg=get_cfg,
+        event=event,
+        chain=all_components,
+    )
+    if record_cleanup_paths:
+        await cleanup_paths(record_cleanup_paths)
+    if not record_asr_text:
+        return False
+    sender_name = event.get_sender_name() or ""
+    user_question = (getattr(req, "prompt", "") or "").strip()
+    sender_prefix = f"该语音消息由 {sender_name} 发送/提供。\n" if sender_name else ""
+    context_prompt = (
+        "\n\n以下是系统为你解析的语音转写，请结合此转写来响应用户的要求。信息如下：\n"
+        "--- 注入内容开始 ---\n"
+        f"{sender_prefix}[语音转写] {record_asr_text}\n"
+        "--- 注入内容结束 ---"
+    )
+    req.prompt = (user_question + context_prompt) if user_question else context_prompt.strip()
+    return True

@@ -17,6 +17,7 @@ from .modules.reference_parser import (
     process_reference_context,
     inject_current_message_image_context,
     inject_current_message_forward_origin_context,
+    inject_record_asr_context,
 )
 from .modules.video_parser import (
     download_video_to_temp,
@@ -71,6 +72,7 @@ from .modules.wake_logic import (
     normalize_concurrency_limit,
     try_acquire_request_concurrency_slot,
     release_request_concurrency_slot,
+    evict_stale_concurrency_slots,
     is_wake_prefix_triggered,
     evaluate_wake_extend,
     apply_post_wake_judge_gate,
@@ -120,7 +122,9 @@ from .modules.dialogue_context import (
     get_context_injection_max_messages,
     get_context_non_text_parse_options,
     get_wake_history_messages,
+    append_emoji_summary_suffix,
     get_image_component_label,
+    get_emoji_summary_from_sources,
     extract_raw_image_datas_from_event,
     compute_active_wake_adjustment,
     extract_addressing_signals,
@@ -132,6 +136,7 @@ from .modules.dialogue_context import (
     append_group_context_message,
     append_notice_context_from_raw,
     inject_context_into_request,
+    clear_context_records_for_group,
 )
 try:
     from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import AiocqhttpMessageEvent
@@ -166,6 +171,7 @@ class LLMEnhancement(Star):
         self._request_counter_lock = asyncio.Lock()
         self._active_request_refs: dict[str, int] = {}
         self._active_request_meta: dict[str, tuple[str, str]] = {}
+        self._active_request_ts: dict[str, float] = {}
         self._effective_dialog_history = EffectiveDialogHistory(max_turns=4)
         self._builtin_cmd_matcher = BuiltinCommandMatcher(cache_ttl_sec=60.0)
         self._refresh_config()
@@ -241,6 +247,8 @@ class LLMEnhancement(Star):
                     active_request_meta=self._active_request_meta,
                     key=slot_key,
                 )
+                if left_ref <= 0:
+                    self._active_request_ts.pop(slot_key, None)
         event.set_extra("_llme_concurrency_released", True)
         logger.debug(
             "[LLMEnhancement] 并发槽位释放："
@@ -496,6 +504,7 @@ class LLMEnhancement(Star):
             has_file_component,
             has_forward_component,
             has_json_component,
+            has_record_component,
             file_name,
         ) = detect_wake_media_components(message_chain)
         at_targets, at_bot, at_all, reply_to_id, reply_msg_id = extract_addressing_signals(
@@ -520,6 +529,10 @@ class LLMEnhancement(Star):
         event.set_extra("_llme_prefix_wake_triggered", prefix_wake_triggered)
         event.set_extra("_llme_addressed_to_bot", bool(at_bot or reply_to_bot))
         raw_image_datas = extract_raw_image_datas_from_event(event)
+        emoji_summary = get_emoji_summary_from_sources(
+            message_chain,
+            raw_image_datas=raw_image_datas,
+        )
         active_wake_factor = 1.0
         active_wake_reasons: list[str] = []
         relevant_wake_factor = 1.0
@@ -560,6 +573,7 @@ class LLMEnhancement(Star):
                     image_caption = await try_get_image_caption(
                         event=event,
                         message_chain=message_chain,
+                        raw_image_datas=raw_image_datas,
                         get_cfg=self._get_cfg,
                         provider_by_id_resolver=lambda provider_id: resolve_provider(self.context, provider_id),
                         default_provider_resolver=lambda: get_vision_provider(self.context, self._get_cfg, event=event),
@@ -576,6 +590,7 @@ class LLMEnhancement(Star):
             if (not context_text) and (not msg):
                 context_text = await build_non_text_context_text(
                     event=event,
+                    context=self.context,
                     get_cfg=self._get_cfg,
                     message_chain=message_chain,
                     sender_name=event.get_sender_name(),
@@ -593,6 +608,7 @@ class LLMEnhancement(Star):
                     image_caption = await try_get_image_caption(
                         event=event,
                         message_chain=message_chain,
+                        raw_image_datas=raw_image_datas,
                         get_cfg=self._get_cfg,
                         provider_by_id_resolver=lambda provider_id: resolve_provider(self.context, provider_id),
                         default_provider_resolver=lambda: get_vision_provider(self.context, self._get_cfg, event=event),
@@ -607,9 +623,13 @@ class LLMEnhancement(Star):
                     has_file_component=has_file_component,
                     has_forward_component=has_forward_component,
                     has_json_component=has_json_component,
+                    has_record_component=has_record_component,
                     file_name=file_name,
                     image_label=image_label,
+                    emoji_summary=emoji_summary,
                 )
+            if context_text:
+                context_text = append_emoji_summary_suffix(context_text, emoji_summary)
             parse_features: list[str] = []
             if "聊天记录抽取:" in context_text:
                 parse_features.append("forward")
@@ -621,6 +641,8 @@ class LLMEnhancement(Star):
                 parse_features.append("file")
             if ("图片转述:" in context_text) or ("表情包转述:" in context_text):
                 parse_features.append("image")
+            if has_record_component:
+                parse_features.append("record")
             append_group_context_message(
                 g,
                 uid=uid,
@@ -641,6 +663,7 @@ class LLMEnhancement(Star):
                 get_cfg=self._get_cfg,
             )
 
+        image_label = get_image_component_label(message_chain, raw_image_datas=raw_image_datas)
         normalized_msg, normalized_reason = normalize_wake_trigger_message(
             wake=wake,
             msg=msg,
@@ -651,7 +674,10 @@ class LLMEnhancement(Star):
             has_file_component=has_file_component,
             has_forward_component=has_forward_component,
             has_json_component=has_json_component,
+            has_record_component=has_record_component,
             file_name=file_name,
+            image_label=image_label,
+            emoji_summary=emoji_summary,
         )
         if normalized_reason:
             msg = normalized_msg
@@ -675,6 +701,7 @@ class LLMEnhancement(Star):
         requeued_dynamic_followup = bool(event.get_extra("_llme_dynamic_requeued", default=False))
 
         if not msg and dynamic_merge_mode and (not followup_require_wake) and (not wake):
+            image_label = get_image_component_label(message_chain, raw_image_datas=raw_image_datas)
             dynamic_msg, dynamic_reason = build_media_trigger_message(
                 sender_name=event.get_sender_name(),
                 has_image_component=has_image_component,
@@ -682,7 +709,10 @@ class LLMEnhancement(Star):
                 has_file_component=has_file_component,
                 has_forward_component=has_forward_component,
                 has_json_component=has_json_component,
+                has_record_component=has_record_component,
                 file_name=file_name,
+                image_label=image_label,
+                emoji_summary=emoji_summary,
             )
             if dynamic_reason:
                 msg = dynamic_msg
@@ -1261,12 +1291,30 @@ class LLMEnhancement(Star):
 
     # ==================== LLM 工具注册 ====================
 
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("清除上下文", alias={"clear"})
+    async def clear_context_records(self, event: AstrMessageEvent):
+        """清空当前会话记录的上下文。用法: /清除上下文"""
+        gid = str(event.get_group_id() or "").strip()
+        if not gid:
+            yield event.plain_result("该指令仅群聊可用。")
+            return
+        state_id = gid
+        group_state = StateManager.get_group(state_id)
+
+        clear_context_records_for_group(
+            group_state=group_state,
+            effective_history=self._effective_dialog_history,
+            umo=event.unified_msg_origin,
+        )
+        yield event.plain_result("清除上下文成功！")
+
     @filter.command_group("黑名单", alias={"bl"})
+    @filter.permission_type(filter.PermissionType.ADMIN)
     def blacklist():
         """黑名单管理命令组。用法: /黑名单 列表|添加|移除|详情|清空 ..."""
         pass
 
-    @filter.permission_type(filter.PermissionType.ADMIN)
     @blacklist.command("列表", alias={"ls"})
     async def blacklist_ls(self, event: AstrMessageEvent, page: int = 1, page_size: int = 10):
         """查看黑名单列表。用法: /黑名单 列表 [页码] [每页数量]"""
@@ -1276,7 +1324,6 @@ class LLMEnhancement(Star):
         else:
             yield event.plain_result(result.text)
 
-    @filter.permission_type(filter.PermissionType.ADMIN)
     @blacklist.command("添加", alias={"add", "拉黑"})
     async def blacklist_add(
         self,
@@ -1294,14 +1341,12 @@ class LLMEnhancement(Star):
         )
         yield event.plain_result(result)
 
-    @filter.permission_type(filter.PermissionType.ADMIN)
     @blacklist.command("移除", alias={"rm", "解除"})
     async def blacklist_rm(self, event: AstrMessageEvent, user_ref: str = ""):
         """移除黑名单。支持用户ID或@目标。用法: /黑名单 移除 <用户ID/@用户>"""
         result = await self.blacklist.command_rm(event=event, user_ref=user_ref)
         yield event.plain_result(result)
 
-    @filter.permission_type(filter.PermissionType.ADMIN)
     @blacklist.command("详情", alias={"info", "状态"})
     async def blacklist_info(self, event: AstrMessageEvent, user_ref: str = ""):
         """查看黑名单详情。支持用户ID或@目标。用法: /黑名单 详情 <用户ID/@用户>"""
@@ -1311,7 +1356,6 @@ class LLMEnhancement(Star):
         else:
             yield event.plain_result(result.text)
 
-    @filter.permission_type(filter.PermissionType.ADMIN)
     @blacklist.command("清空", alias={"clear", "清除"})
     async def blacklist_clear(self, event: AstrMessageEvent):
         """清空黑名单。用法: /黑名单 清空"""
@@ -1904,6 +1948,8 @@ class LLMEnhancement(Star):
         if not uid:
             return
         gid: str = event.get_group_id()
+        if not gid:
+            return
 
         if bool(event.get_extra("_llme_concurrency_acquired", default=False)) and (
             not bool(event.get_extra("_llme_concurrency_released", default=False))
@@ -1922,6 +1968,14 @@ class LLMEnhancement(Star):
         user_limit = normalize_concurrency_limit(self._get_cfg("max_user_concurrent_requests", 0))
         group_limit = normalize_concurrency_limit(self._get_cfg("max_group_concurrent_requests", 0))
         async with self._request_counter_lock:
+            now_ts = time.time()
+            evict_stale_concurrency_slots(
+                active_request_refs=self._active_request_refs,
+                active_request_meta=self._active_request_meta,
+                active_request_ts=self._active_request_ts,
+                now_ts=now_ts,
+                ttl_sec=600.0,
+            )
             accepted_slot, slot_key, slot_detail = try_acquire_request_concurrency_slot(
                 active_request_refs=self._active_request_refs,
                 active_request_meta=self._active_request_meta,
@@ -1935,6 +1989,8 @@ class LLMEnhancement(Star):
                 user_limit=user_limit,
                 group_limit=group_limit,
             )
+            if accepted_slot:
+                self._active_request_ts[slot_key] = now_ts
         if not accepted_slot:
             logger.debug(f"[LLMEnhancement] on_waiting_llm_request 并发拦截：{slot_detail}")
             event.stop_event()
@@ -2105,10 +2161,12 @@ class LLMEnhancement(Star):
             )
             return
 
-        has_preacquired_slot = bool(event.get_extra("_llme_concurrency_preacquired", default=False)) and bool(
-            event.get_extra("_llme_concurrency_acquired", default=False)
-        ) and (not bool(event.get_extra("_llme_concurrency_released", default=False)))
-        if not has_preacquired_slot:
+        has_preacquired_slot = True
+        if gid:
+            has_preacquired_slot = bool(event.get_extra("_llme_concurrency_preacquired", default=False)) and bool(
+                event.get_extra("_llme_concurrency_acquired", default=False)
+            ) and (not bool(event.get_extra("_llme_concurrency_released", default=False)))
+        if gid and (not has_preacquired_slot):
             logger.debug(
                 "[LLMEnhancement] on_llm_request 并发判定跳过：未检测到 on_waiting_llm_request 预占位。"
             )
@@ -2262,6 +2320,7 @@ class LLMEnhancement(Star):
                 "url": False,
                 "forward": False,
                 "video": False,
+                "record": False,
             }
 
             # 注册清理路径容器
@@ -2281,6 +2340,7 @@ class LLMEnhancement(Star):
             # ==================== 3. 引用/JSON/文件上下文注入（不含转发聊天记录解析） ====================
             ref_result = await process_reference_context(
                 event=event,
+                context=self.context,
                 req=req,
                 all_components=all_components,
                 get_cfg=self._get_cfg,
@@ -2308,7 +2368,19 @@ class LLMEnhancement(Star):
             if handled_forward:
                 return
              
-            # ==================== 5. 媒体场景检测与处理 ====================
+            # ==================== 5. 语音转写注入 ====================
+            injection_summary["record"] = bool(
+                await inject_record_asr_context(
+                    context=self.context,
+                    event=event,
+                    req=req,
+                    all_components=all_components,
+                    get_cfg=self._get_cfg,
+                    cleanup_paths=cleanup_paths_later,
+                )
+            )
+
+            # ==================== 6. 媒体场景检测与处理 ====================
             injection_summary["video"] = bool(
                 await process_media_content(
                     context=self.context,
@@ -2533,6 +2605,9 @@ class LLMEnhancement(Star):
     async def after_message_sent(self, event: AstrMessageEvent):
         """消息实际发送后再更新唤醒延长时间锚点。"""
         if not bool(event.get_extra("_llme_pending_last_response_update", default=False)):
+            await self._release_concurrency_slot_if_needed(
+                event, reason="after_message_sent_no_pending"
+            )
             return
 
         uid: str = event.get_sender_id()
@@ -2545,6 +2620,9 @@ class LLMEnhancement(Star):
             logger.debug(
                 "[LLMEnhancement] 跳过唤醒延长锚点更新：本次事件未实际发送消息。"
                 f"uid={uid}, state_uid={state_uid}, group={event.get_group_id() or 'private'}"
+            )
+            await self._release_concurrency_slot_if_needed(
+                event, reason="after_message_sent_no_send"
             )
             event.set_extra("_llme_pending_last_response_update", False)
             event.set_extra("_llme_discard_cache_clear_after_sent", False)

@@ -180,7 +180,7 @@ def try_acquire_request_concurrency_slot(
 
     user_active = _count_active_user_requests(active_request_refs, active_request_meta, uid)
     group_active = _count_active_group_requests(active_request_refs, active_request_meta, gid)
-    if user_limit > 0 and user_active >= user_limit:
+    if gid and user_limit > 0 and user_active >= user_limit:
         detail = f"user_limit({user_active}/{user_limit}, uid={uid}, group={gid or 'private'})"
         return False, key, detail
     if gid and group_limit > 0 and group_active >= group_limit:
@@ -207,6 +207,41 @@ def release_request_concurrency_slot(
     left_ref = current_ref - 1
     active_request_refs[key] = left_ref
     return left_ref
+
+
+def evict_stale_concurrency_slots(
+    *,
+    active_request_refs: Dict[str, int],
+    active_request_meta: Dict[str, Tuple[str, str]],
+    active_request_ts: Dict[str, float],
+    now_ts: float,
+    ttl_sec: float = 600.0,
+) -> int:
+    """清理过期并发槽位，返回清理数量。"""
+    if ttl_sec <= 0:
+        return 0
+    evicted = 0
+    for key, ref in list(active_request_refs.items()):
+        if ref <= 0:
+            active_request_refs.pop(key, None)
+            active_request_meta.pop(key, None)
+            active_request_ts.pop(key, None)
+            continue
+        ts = float(active_request_ts.get(key, 0.0) or 0.0)
+        if ts <= 0:
+            continue
+        age = now_ts - ts
+        if age > ttl_sec:
+            meta = active_request_meta.get(key, ("", ""))
+            active_request_refs.pop(key, None)
+            active_request_meta.pop(key, None)
+            active_request_ts.pop(key, None)
+            evicted += 1
+            logger.warning(
+                "[LLMEnhancement] 并发槽位过期："
+                f"key={key}, age={age:.1f}s, uid={meta[0] or 'unknown'}, gid={meta[1] or 'private'}"
+            )
+    return evicted
 
 
 def _parse_regex_flags(flags_text: str) -> int:
@@ -279,13 +314,14 @@ def match_mention_wake_rule(rule: str, text: str) -> bool:
     return bool(compiled.search(text))
 
 
-def detect_wake_media_components(message_chain: Any) -> tuple[bool, bool, bool, bool, bool, str]:
+def detect_wake_media_components(message_chain: Any) -> tuple[bool, bool, bool, bool, bool, bool, str]:
     """识别消息链中的视频/文件/转发/JSON 组件，并返回文件名。"""
     has_image_component = False
     has_video_component = False
     has_file_component = False
     has_forward_component = False
     has_json_component = False
+    has_record_component = False
     file_name = ""
     try:
         for seg in (message_chain or []):
@@ -293,6 +329,8 @@ def detect_wake_media_components(message_chain: Any) -> tuple[bool, bool, bool, 
                 has_image_component = True
             elif isinstance(seg, Comp.Video):
                 has_video_component = True
+            elif isinstance(seg, Comp.Record):
+                has_record_component = True
             elif isinstance(seg, Comp.File):
                 has_file_component = True
                 file_name = str(getattr(seg, "name", "") or getattr(seg, "file", "") or "").strip()
@@ -307,6 +345,8 @@ def detect_wake_media_components(message_chain: Any) -> tuple[bool, bool, bool, 
                     has_image_component = True
                 elif seg_type == "video":
                     has_video_component = True
+                elif seg_type == "record":
+                    has_record_component = True
                 elif seg_type == "file":
                     has_file_component = True
                     if not file_name:
@@ -316,15 +356,33 @@ def detect_wake_media_components(message_chain: Any) -> tuple[bool, bool, bool, 
                 elif seg_type == "json":
                     has_json_component = True
     except Exception:
-        return False, False, False, False, False, ""
+        return False, False, False, False, False, False, ""
     return (
         has_image_component,
         has_video_component,
         has_file_component,
         has_forward_component,
         has_json_component,
+        has_record_component,
         file_name,
     )
+
+
+def _normalize_emoji_summary(summary: str) -> str:
+    text = str(summary or "").strip()
+    if text.startswith("[") and text.endswith("]"):
+        text = text[1:-1].strip()
+    return text
+
+
+def _append_emoji_summary_suffix(base_text: str, emoji_summary: str) -> str:
+    base = str(base_text or "").strip()
+    summary = _normalize_emoji_summary(emoji_summary)
+    if not base or not summary:
+        return base
+    if summary in base:
+        return base
+    return f"{base}（表情：{summary}）"
 
 
 def build_media_trigger_message(
@@ -334,10 +392,18 @@ def build_media_trigger_message(
     has_file_component: bool,
     has_forward_component: bool,
     has_json_component: bool,
+    has_record_component: bool,
     file_name: str,
+    image_label: str = "图片",
+    emoji_summary: str = "",
 ) -> tuple[str, Optional[str]]:
     if has_image_component:
-        return f"{sender_name}发送了一张图片", "图片消息唤醒"
+        if image_label == "表情包":
+            return _append_emoji_summary_suffix(
+                f"{sender_name}发送了一个表情包",
+                emoji_summary,
+            ), "表情包消息唤醒"
+        return f"{sender_name}发送了一张{image_label}", "图片消息唤醒"
     if has_video_component:
         return f"{sender_name}发送了一个视频", "视频消息唤醒"
     if has_file_component:
@@ -347,6 +413,8 @@ def build_media_trigger_message(
         return f"{sender_name}发送了一条转发消息", "转发消息唤醒"
     if has_json_component:
         return f"{sender_name}发送了一条分享卡片", "JSON卡片唤醒"
+    if has_record_component:
+        return f"{sender_name}发送了一条语音", "语音消息唤醒"
     return "", None
 
 
@@ -360,7 +428,10 @@ def normalize_wake_trigger_message(
     has_file_component: bool,
     has_forward_component: bool,
     has_json_component: bool,
+    has_record_component: bool,
     file_name: str,
+    image_label: str = "图片",
+    emoji_summary: str = "",
 ) -> tuple[str, Optional[str]]:
     """
     对“已触发唤醒但无文本”的场景补齐文本，返回 (normalized_msg, reason)。
@@ -371,16 +442,23 @@ def normalize_wake_trigger_message(
     if gid:
         return f"{sender_name}@了你", "空@唤醒"
     if has_image_component:
-        return f"{sender_name}发送了一张图片", "图片消息唤醒"
+        if image_label == "表情包":
+            return _append_emoji_summary_suffix(
+                f"{sender_name}发送了一个表情包",
+                emoji_summary,
+            ), "表情包消息唤醒"
+        return f"{sender_name}发送了一张{image_label}", "图片消息唤醒"
     if has_video_component:
-        return f"{sender_name}发送了一个视频", "视频消息唤醒"
+        return f"{sender_name}发送了一条视频", "视频消息唤醒"
     if has_file_component:
-        suffix = f"：{file_name}" if file_name else ""
+        suffix = f"（{file_name}）" if file_name else ""
         return f"{sender_name}发送了一个文件{suffix}", "文件消息唤醒"
     if has_forward_component:
         return f"{sender_name}发送了一条转发消息", "转发消息唤醒"
     if has_json_component:
         return f"{sender_name}发送了一条分享卡片", "JSON卡片唤醒"
+    if has_record_component:
+        return f"{sender_name}发送了一条语音", "语音消息唤醒"
     return msg, None
 
 

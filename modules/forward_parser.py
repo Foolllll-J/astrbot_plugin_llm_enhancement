@@ -11,6 +11,7 @@ from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent
 from astrbot.api.provider import ProviderRequest
 
+from .reference_parser import _segment_is_emoji_image
 from .json_parser import parse_json_segment_data
 from .video_parser import extract_audio_wav, extract_forward_video_keyframes
 
@@ -138,6 +139,22 @@ def _inject_forward_context(req: ProviderRequest, context_text: str) -> None:
     req.prompt = user_question + context_prompt
 
 
+def _normalize_emoji_summary(summary: str) -> str:
+    text = str(summary or "").strip()
+    if text.startswith("[") and text.endswith("]"):
+        text = text[1:-1].strip()
+    return text
+
+
+def _build_forward_image_prefix(sender_name: str, seg_data: dict[str, Any]) -> str:
+    if not _segment_is_emoji_image(seg_data):
+        return ""
+    summary = _normalize_emoji_summary(str(seg_data.get("summary") or ""))
+    if not summary:
+        return f"[表情包(来自:{sender_name})]"
+    return f"[表情包(来自:{sender_name}, 表情:{summary})]"
+
+
 def _extract_core_quoted_image_caption(req: ProviderRequest, max_len: int = 280) -> str:
     """提取 Core 的引用图片转述文本，用于转发注入补充说明。"""
     parts = getattr(req, "extra_user_content_parts", None)
@@ -232,8 +249,11 @@ async def extract_content_recursively(
                         node_text_parts.append(text)
                 elif seg_type == "image":
                     url = seg_data.get("url")
+                    image_prefix = _build_forward_image_prefix(sender_name, seg_data)
                     if url:
                         image_urls.append(str(url))
+                        if image_prefix:
+                            node_text_parts.append(image_prefix)
                         node_text_parts.append(f"[图片(来自:{sender_name})]")
                 elif seg_type == "video":
                     url = seg_data.get("url")

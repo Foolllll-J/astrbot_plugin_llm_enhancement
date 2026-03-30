@@ -1472,12 +1472,6 @@ def inject_context_into_request(
         + "\n[说明] 以上为最近对话片段，请结合其连续性理解当前消息。"
     )
     req.prompt = f"{(req.prompt or '').strip()}{block}".strip()
-    gid = str(getattr(group_state, "gid", "") or "").strip()
-    logger.info(
-        "[LLMEnhancement][ContextInjection] 请求上下文注入内容："
-        f"group={gid or 'private'}, wake_reason={wake_reason}, detail=injected:{len(lines)}\n"
-        f"{block.strip()}"
-    )
     return True, f"injected:{len(lines)}", block.strip()
 
 
@@ -1552,7 +1546,7 @@ def append_group_context_message(
     logger.debug(
         "[LLMEnhancement][ContextInjection] 记录上下文："
         f"source={entry.get('source', 'incoming')}, uid={entry['uid'] or 'unknown'}, "
-        f"total={len(group_state.context_messages)}, text={text}"
+        f"total={len(group_state.context_messages)}"
     )
     return True
 

@@ -1974,7 +1974,7 @@ class LLMEnhancement(Star):
                 active_request_meta=self._active_request_meta,
                 active_request_ts=self._active_request_ts,
                 now_ts=now_ts,
-                ttl_sec=600.0,
+                ttl_sec=300.0,
             )
             accepted_slot, slot_key, slot_detail = try_acquire_request_concurrency_slot(
                 active_request_refs=self._active_request_refs,

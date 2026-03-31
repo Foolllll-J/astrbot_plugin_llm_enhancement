@@ -800,8 +800,8 @@ async def process_group_members_info(event: AstrMessageEvent, group_id: Optional
             { 
                 "user_id": str(member.get("user_id", "")), 
                 "nickname": member.get("nickname") or f"用户{member.get('user_id')}",
-                "card": member.get("card") or "",
-                "role": member.get("role", "member") 
+                "role": member.get("role", "member"),
+                **({"card": member.get("card")} if str(member.get("card") or "").strip() else {})
             } 
             for member in members_info if member.get("user_id") 
         ] 

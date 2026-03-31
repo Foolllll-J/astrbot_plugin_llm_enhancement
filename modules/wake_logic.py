@@ -215,7 +215,7 @@ def evict_stale_concurrency_slots(
     active_request_meta: Dict[str, Tuple[str, str]],
     active_request_ts: Dict[str, float],
     now_ts: float,
-    ttl_sec: float = 600.0,
+    ttl_sec: float = 300.0,
 ) -> int:
     """清理过期并发槽位，返回清理数量。"""
     if ttl_sec <= 0:

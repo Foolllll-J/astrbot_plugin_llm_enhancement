@@ -14,6 +14,7 @@ from .state_manager import GroupState, MemberState
 _MENTION_WAKE_REGEX_CACHE: dict[str, re.Pattern[str]] = {}
 _MENTION_WAKE_REGEX_INVALID: set[str] = set()
 _ACTIVE_WAKE_JUDGE_TYPES = {"mention", "relevant", "ask", "bored", "prob"}
+_BOT_ACCOUNT_SKIP_WAKE_TYPES = {"explicit", "active", "wake_extend"}
 _WAKE_JUDGE_PROMPT_DEFAULT = """你是群聊“唤醒判定器”。请判断机器人是否应该响应这条显式唤醒请求。
 
 [当前时间]
@@ -760,6 +761,53 @@ def _parse_active_wake_judge_types(raw_types: Any) -> set[str]:
     return {item for item in candidates if item in _ACTIVE_WAKE_JUDGE_TYPES}
 
 
+def _parse_bot_account_ids(raw_ids: Any) -> set[str]:
+    if isinstance(raw_ids, (list, tuple, set)):
+        candidates = [str(v or "").strip() for v in raw_ids]
+    elif isinstance(raw_ids, str):
+        candidates = [s.strip() for s in re.split(r"[,，|\n\r]+", raw_ids)]
+    else:
+        candidates = []
+    return {item for item in candidates if item}
+
+
+def _parse_bot_account_skip_wake_types(raw_types: Any) -> set[str]:
+    if isinstance(raw_types, (list, tuple, set)):
+        candidates = [str(v or "").strip().lower() for v in raw_types]
+    elif isinstance(raw_types, str):
+        candidates = [s.strip().lower() for s in re.split(r"[,，|\n\r]+", raw_types)]
+    else:
+        candidates = []
+    return {item for item in candidates if item in _BOT_ACCOUNT_SKIP_WAKE_TYPES}
+
+
+def is_bot_account_message(
+    uid: str,
+    get_cfg: Callable[[str, Any], Any],
+) -> bool:
+    normalized_uid = str(uid or "").strip()
+    if not normalized_uid:
+        return False
+    bot_ids = _parse_bot_account_ids(get_cfg("bot_account_ids", []))
+    return normalized_uid in bot_ids
+
+
+def should_skip_bot_wake_type(
+    uid: str,
+    skip_type: str,
+    get_cfg: Callable[[str, Any], Any],
+) -> bool:
+    normalized_type = str(skip_type or "").strip().lower()
+    if normalized_type not in _BOT_ACCOUNT_SKIP_WAKE_TYPES:
+        return False
+    if not is_bot_account_message(uid, get_cfg):
+        return False
+    enabled_types = _parse_bot_account_skip_wake_types(
+        get_cfg("bot_account_skip_wake_types", []),
+    )
+    return normalized_type in enabled_types
+
+
 def _wake_reason_to_active_type(wake_reason: str) -> Optional[str]:
     reason = str(wake_reason or "")
     if reason.startswith("提及唤醒"):
@@ -1162,6 +1210,57 @@ def _mark_wake_extend_consumed(group_state: GroupState, ref_ts: float) -> None:
         group_state.wake_extend_consumed_ref_ts = ref_ts
 
 
+def _resolve_wake_extend_reference(
+    uid: str,
+    group_state: GroupState,
+    member: MemberState,
+    same_user_only: bool,
+) -> tuple[Optional[str], float]:
+    ref_uid = group_state.last_response_uid
+    ref_ts = float(group_state.last_response_ts or 0.0)
+    if ref_ts > 0:
+        return ref_uid, ref_ts
+
+    if same_user_only:
+        return uid, float(member.last_response or 0.0)
+
+    latest_ts = 0.0
+    latest_uid = None
+    for m_uid, m_state in group_state.members.items():
+        m_ts = float(m_state.last_response or 0.0)
+        if m_ts > latest_ts:
+            latest_ts = m_ts
+            latest_uid = m_uid
+    return latest_uid, latest_ts
+
+
+def is_bot_message_in_wake_extend_window(
+    uid: str,
+    now: float,
+    group_state: GroupState,
+    member: MemberState,
+    get_cfg: Callable[[str, Any], Any],
+) -> bool:
+    if not should_skip_bot_wake_type(uid, "wake_extend", get_cfg):
+        return False
+
+    wake_extend = float(get_cfg("wake_extend", 0) or 0)
+    if wake_extend <= 0:
+        return False
+
+    same_user_only = bool(get_cfg("wake_extend_same_user_only", True))
+    ref_uid, ref_ts = _resolve_wake_extend_reference(
+        uid=uid,
+        group_state=group_state,
+        member=member,
+        same_user_only=same_user_only,
+    )
+    in_window = bool(ref_ts > 0 and (now - ref_ts) <= wake_extend)
+    if in_window and same_user_only and ref_uid and uid != ref_uid:
+        in_window = False
+    return in_window
+
+
 
 
 async def evaluate_wake_extend(
@@ -1188,22 +1287,12 @@ async def evaluate_wake_extend(
     same_user_only = bool(get_cfg("wake_extend_same_user_only", True))
 
     # 以群级“最近一次请求用户/时间”为主，历史数据缺失时回退旧状态字段
-    ref_uid = group_state.last_response_uid
-    ref_ts = float(group_state.last_response_ts or 0.0)
-    if ref_ts <= 0:
-        if same_user_only:
-            ref_uid = uid
-            ref_ts = float(member.last_response or 0.0)
-        else:
-            latest_ts = 0.0
-            latest_uid = None
-            for m_uid, m_state in group_state.members.items():
-                m_ts = float(m_state.last_response or 0.0)
-                if m_ts > latest_ts:
-                    latest_ts = m_ts
-                    latest_uid = m_uid
-            ref_uid = latest_uid
-            ref_ts = latest_ts
+    ref_uid, ref_ts = _resolve_wake_extend_reference(
+        uid=uid,
+        group_state=group_state,
+        member=member,
+        same_user_only=same_user_only,
+    )
 
     in_window = bool(ref_ts > 0 and (now - ref_ts) <= wake_extend)
     if in_window and same_user_only and ref_uid and uid != ref_uid:

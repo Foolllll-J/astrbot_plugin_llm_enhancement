@@ -74,6 +74,8 @@ from .modules.wake_logic import (
     release_request_concurrency_slot,
     evict_stale_concurrency_slots,
     is_wake_prefix_triggered,
+    should_skip_bot_wake_type,
+    is_bot_message_in_wake_extend_window,
     evaluate_wake_extend,
     apply_post_wake_judge_gate,
     build_media_trigger_message,
@@ -490,10 +492,41 @@ class LLMEnhancement(Star):
         member = g.members[uid]
         now = time.time()
 
+        skip_explicit_wake_for_bot = should_skip_bot_wake_type(
+            uid=uid,
+            skip_type="explicit",
+            get_cfg=self._get_cfg,
+        )
+        skip_active_wake_for_bot = should_skip_bot_wake_type(
+            uid=uid,
+            skip_type="active",
+            get_cfg=self._get_cfg,
+        )
+        if gid and is_bot_message_in_wake_extend_window(
+            uid=uid,
+            now=now,
+            group_state=g,
+            member=member,
+            get_cfg=self._get_cfg,
+        ):
+            event.is_at_or_wake_command = False
+            logger.debug(
+                "[LLMEnhancement] 跳过机器人消息唤醒判定：当前消息发送者命中机器人 ID 列表，且处于唤醒延长窗口内。"
+                f"group={gid}, uid={uid}, msg={msg[:50]}"
+            )
+            return
+
+        if skip_explicit_wake_for_bot and event.is_at_or_wake_command:
+            logger.debug(
+                "[LLMEnhancement] 跳过机器人消息的显式唤醒判定："
+                f"group={gid or 'private'}, uid={uid}, msg={msg[:50]}"
+            )
+            event.is_at_or_wake_command = False
+
         # 4. 唤醒条件判断
         direct_wake = bool(event.is_at_or_wake_command)
         wake = direct_wake
-        reason = "at_or_cmd"
+        reason = "at_or_cmd" if direct_wake else ""
 
         message_chain = []
         if hasattr(event, "message_obj") and hasattr(event.message_obj, "message"):
@@ -839,7 +872,7 @@ class LLMEnhancement(Star):
                         )
 
         # 提及唤醒 (仅群聊)
-        if gid and not wake:
+        if gid and (not wake) and (not skip_active_wake_for_bot):
             matched_mention = evaluate_mention_wake(msg, self._get_cfg("mention_wake"))
             if matched_mention:
                 wake = True
@@ -864,7 +897,7 @@ class LLMEnhancement(Star):
                 reason = wake_reason
 
         # 话题相关性唤醒 (仅群聊)
-        if gid and not wake:
+        if gid and (not wake) and (not skip_active_wake_for_bot):
             relevant_wake = self._get_cfg("relevant_wake")
             if relevant_wake:
                 relevant_ctx_count = self.similarity.context_count_for_query(msg)
@@ -883,7 +916,7 @@ class LLMEnhancement(Star):
                         reason = f"话题相关性{adjusted_simi:.2f}>={relevant_wake:.2f}"
 
         # 答疑唤醒 (仅群聊)
-        if gid and not wake:
+        if gid and (not wake) and (not skip_active_wake_for_bot):
             ask_wake = self._get_cfg("ask_wake")
             if ask_wake:  
                 ask_score = await self.sent.ask(msg)
@@ -893,7 +926,7 @@ class LLMEnhancement(Star):
                     reason = f"答疑唤醒{adjusted_ask_score:.2f}>={ask_wake:.2f}"
 
         # 无聊唤醒 (仅群聊)
-        if gid and not wake:
+        if gid and (not wake) and (not skip_active_wake_for_bot):
             bored_wake = self._get_cfg("bored_wake")
             if bored_wake:
                 bored_score = await self.sent.bored(msg)
@@ -903,7 +936,7 @@ class LLMEnhancement(Star):
                     reason = f"无聊唤醒{adjusted_bored_score:.2f}>={bored_wake:.2f}"
 
         # 概率唤醒 (仅群聊)
-        if gid and not wake:
+        if gid and (not wake) and (not skip_active_wake_for_bot):
             prob_wake = self._get_cfg("prob_wake")
             if prob_wake:  
                 prob_roll = random.random()
@@ -1467,16 +1500,16 @@ class LLMEnhancement(Star):
         auto_escape: bool = False,
     ) -> str:
         """
-        发送消息到 QQ 私聊或群聊。仅用于被要求发送消息至非当前会话时调用，例如“帮我发消息给某人/某群”。
-        本工具只执行基础发送，不参与其他插件的二次语义解析。
-        不要在 message 中附加“表情包触发标记/特殊控制标记”等约定字符串来触发额外行为。
+        发送消息到 QQ 私聊或群聊。
+        本工具只执行基础发送，不参与其他插件的二次语义解析；不要在 `message` 中附加“表情包触发标记/特殊控制标记”等约定字符串来触发额外行为。
+        如需使用 QQ/OneBot CQ 码（例如 reply、at），请直接将 CQ 码写入 `message`；`message` 会按原样发送，是否解析 CQ 码由 `auto_escape` 决定。
 
         Args:
-            chat_type (str): 发送类型。仅支持 group 或 private。
-            message (str): 要发送的消息文本。
-            group_id (str, optional): 当 chat_type=group 时必填。
-            user_id (str, optional): 当 chat_type=private 时必填。
-            auto_escape (bool, optional): 是否将 CQ 码按纯文本发送（True=不解析，False=按 CQ 码解析），默认 False。
+            chat_type (str): 发送类型。仅支持 `group` 或 `private`。
+            message (str): 要发送的消息字符串。普通文本可直接填写；若需特殊格式（如引用回复、`@` 某人），请直接在此字段中写入对应 CQ 码。
+            group_id (str, optional): 当 `chat_type=group` 时必填，表示目标群号。
+            user_id (str, optional): 当 `chat_type=private` 时必填，表示目标用户 QQ 号。
+            auto_escape (bool, optional): 是否将 CQ 码按纯文本发送。`True`=不解析，`False`=按 CQ 码解析。默认 `False`。
         """
         return await send_message_logic(
             event=event,

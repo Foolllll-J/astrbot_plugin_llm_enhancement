@@ -157,6 +157,28 @@
                 "type": "bool",
                 "default": false
             },
+            "bot_account_ids": {
+                "description": "机器人 ID",
+                "hint": "配置群内其他机器人的用户 ID。",
+                "type": "list",
+                "default": []
+            },
+            "bot_account_skip_wake_types": {
+                "description": "机器人消息跳过类型",
+                "hint": "来自其他机器人的消息将跳过所选唤醒逻辑。",
+                "type": "list",
+                "options": [
+                    "explicit",
+                    "active",
+                    "wake_extend"
+                ],
+                "labels": [
+                    "显式唤醒",
+                    "主动唤醒",
+                    "唤醒延长"
+                ],
+                "default": []
+            },
             "wake_forbidden_words": {
                 "description": "屏蔽唤醒规则",
                 "hint": "支持格式同唤醒规则。命中规则时不会唤醒bot。",

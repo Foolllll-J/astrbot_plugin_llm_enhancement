@@ -6,7 +6,6 @@ from pydantic import BaseModel, ConfigDict, Field
 class MemberState(BaseModel):
     """群成员状态"""
     uid: str                                               # 用户ID
-    silence_until: float = 0.0                             # 沉默截止时间（时间戳）
     last_response: float = 0.0                             # 最后一次LLM响应的时间（时间戳）
     lock: asyncio.Lock = Field(default_factory=asyncio.Lock)  # 异步锁
     in_merging: bool = False                               # 是否正在消息合并状态中
@@ -31,11 +30,15 @@ class GroupState(BaseModel):
     """群组状态"""
     gid: str                                               # 群组ID
     members: dict[str, MemberState] = Field(default_factory=dict)   # 成员状态字典
-    shutup_until: float = 0.0                              # 群组闭嘴截止时间（时间戳）
     pending_msg_index: dict[str, str] = Field(default_factory=dict) # 撤回快速索引：message_id -> uid
     last_response_uid: Optional[str] = None                # 最近一次触发响应的用户
     last_response_ts: float = 0.0                          # 最近一次响应时间（时间戳）
     wake_extend_consumed_ref_ts: float = 0.0               # 已消费一次性唤醒延长期所对应的响应时间戳
+    active_wake_new_msg_count: int = 0                     # 距上次Bot回复后累计的普通群消息数
+    prob_wake_pending_count: int = 0                       # 距上次概率观察后累计的普通群消息数
+    prob_wake_no_reply_count: int = 0                      # 概率观察连续未触发次数
+    prob_wake_last_check_ts: float = 0.0                   # 最近一次概率观察时间戳
+    wake_extend_batch_count: int = 0                       # 当前唤醒延长窗口内累计的普通后续消息数
     dynamic_owner_uid: Optional[str] = None                # 动态合并当前会话所有者（用于多人合并）
     context_messages: list[dict[str, Any]] = Field(default_factory=list) # 轻量上下文缓存（环形裁剪）
     last_user_interaction: dict[str, float] = Field(default_factory=dict) # 每个用户最近互动时间戳

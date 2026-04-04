@@ -73,7 +73,9 @@ from .modules.wake_logic import (
     try_acquire_request_concurrency_slot,
     release_request_concurrency_slot,
     evict_stale_concurrency_slots,
+    can_accept_request_concurrency_slot,
     is_wake_prefix_triggered,
+    is_bot_account_message,
     should_skip_bot_wake_type,
     is_bot_message_in_wake_extend_window,
     evaluate_wake_extend,
@@ -85,6 +87,9 @@ from .modules.wake_logic import (
     evaluate_mention_wake,
     contains_forbidden_wake_word,
     compute_relevant_context_substring_downweight,
+    get_prob_wake_activity,
+    get_prob_wake_observe_threshold,
+    get_prob_wake_trigger_chance,
 )
 from .modules.merge_flow import (
     load_merge_runtime_config,
@@ -485,6 +490,40 @@ class LLMEnhancement(Star):
                 if self._builtin_cmd_matcher.is_builtin_trigger_event(event) or self._builtin_cmd_matcher.is_builtin_command_text(msg):
                     event.stop_event()
                     return
+
+        # 2.5 并发预检查（不占位，仅在超限时提前跳过唤醒计算）
+        merge_cfg = load_merge_runtime_config(self._get_cfg)
+        dynamic_merge_mode = bool(merge_cfg.dynamic_mode and merge_cfg.delay_sec > 0)
+        state_uid = (
+            str(event.get_extra("_llme_dynamic_state_uid", default=uid) or uid).strip()
+            if dynamic_merge_mode
+            else uid
+        )
+        user_limit = normalize_concurrency_limit(self._get_cfg("max_user_concurrent_requests", 0))
+        group_limit = normalize_concurrency_limit(self._get_cfg("max_group_concurrent_requests", 0))
+        if gid and (user_limit > 0 or group_limit > 0):
+            async with self._request_counter_lock:
+                now_ts = time.time()
+                evict_stale_concurrency_slots(
+                    active_request_refs=self._active_request_refs,
+                    active_request_meta=self._active_request_meta,
+                    active_request_ts=self._active_request_ts,
+                    now_ts=now_ts,
+                    ttl_sec=300.0,
+                )
+                accepted_slot, slot_detail = can_accept_request_concurrency_slot(
+                    active_request_refs=self._active_request_refs,
+                    active_request_meta=self._active_request_meta,
+                    uid=uid,
+                    gid=gid,
+                    state_uid=state_uid,
+                    dynamic_merge_mode=dynamic_merge_mode,
+                    user_limit=user_limit,
+                    group_limit=group_limit,
+                )
+            if not accepted_slot:
+                logger.debug(f"[LLMEnhancement] 并发预检查拦截：{slot_detail}")
+                return
         
         # 3. 初始化状态
         if uid not in g.members:
@@ -560,7 +599,28 @@ class LLMEnhancement(Star):
             wake_prefixes=wake_prefixes,
         )
         event.set_extra("_llme_prefix_wake_triggered", prefix_wake_triggered)
-        event.set_extra("_llme_addressed_to_bot", bool(at_bot or reply_to_bot))
+        addressed_to_bot = bool(at_bot or reply_to_bot)
+        event.set_extra("_llme_addressed_to_bot", addressed_to_bot)
+        ordinary_group_msg = False
+        if gid:
+            ordinary_group_msg = (
+                (not direct_wake)
+                and (not command_trigger_event)
+                and (not addressed_to_bot)
+                and (not at_all)
+                and (not is_bot_account_message(uid, self._get_cfg))
+            )
+            wake_extend_window = float(self._get_cfg("wake_extend", 0) or 0)
+            ref_ts = float(g.last_response_ts or 0.0)
+            if ordinary_group_msg:
+                g.active_wake_new_msg_count = max(0, int(g.active_wake_new_msg_count or 0)) + 1
+                g.prob_wake_pending_count = max(0, int(g.prob_wake_pending_count or 0)) + 1
+                if ref_ts > 0 and wake_extend_window > 0 and (now - ref_ts) <= wake_extend_window:
+                    g.wake_extend_batch_count = max(0, int(g.wake_extend_batch_count or 0)) + 1
+                else:
+                    g.wake_extend_batch_count = 0
+            elif ref_ts <= 0 or wake_extend_window <= 0 or (now - ref_ts) > wake_extend_window:
+                g.wake_extend_batch_count = 0
         raw_image_datas = extract_raw_image_datas_from_event(event)
         emoji_summary = get_emoji_summary_from_sources(
             message_chain,
@@ -579,6 +639,7 @@ class LLMEnhancement(Star):
                 at_all=at_all,
                 reply_to_id=reply_to_id,
                 include_state_bias=False,
+                get_cfg=self._get_cfg,
             )
             relevant_wake_factor, relevant_wake_reasons = compute_active_wake_adjustment(
                 group_state=g,
@@ -588,6 +649,7 @@ class LLMEnhancement(Star):
                 at_all=at_all,
                 reply_to_id=reply_to_id,
                 include_state_bias=True,
+                get_cfg=self._get_cfg,
             )
 
         if context_injection_enabled:
@@ -937,13 +999,39 @@ class LLMEnhancement(Star):
 
         # 概率唤醒 (仅群聊)
         if gid and (not wake) and (not skip_active_wake_for_bot):
-            prob_wake = self._get_cfg("prob_wake")
-            if prob_wake:  
-                prob_roll = random.random()
-                adjusted_prob_wake = float(prob_wake) * active_wake_factor
-                if prob_roll < adjusted_prob_wake:
-                    wake = True
-                    reason = f"概率唤醒{prob_roll:.4f}<{adjusted_prob_wake:.4f}"
+            prob_wake_activity = get_prob_wake_activity(self._get_cfg)
+            if prob_wake_activity > 0 and ordinary_group_msg and (not has_video_component) and (not has_file_component):
+                observe_threshold = get_prob_wake_observe_threshold(g, self._get_cfg)
+                trigger_chance = get_prob_wake_trigger_chance(self._get_cfg)
+                pending_count = max(0, int(g.prob_wake_pending_count or 0))
+                if pending_count >= observe_threshold:
+                    current_no_reply = max(0, int(g.prob_wake_no_reply_count or 0))
+                    prob_roll = random.random()
+                    g.prob_wake_last_check_ts = now
+                    g.prob_wake_pending_count = 0
+                    if prob_roll < trigger_chance:
+                        g.prob_wake_no_reply_count = 0
+                        wake = True
+                        backoff_note = f", 退避{current_no_reply}次" if current_no_reply > 0 else ""
+                        reason = (
+                            f"概率唤醒(活跃度{prob_wake_activity:.2f}, 批次{pending_count}>={observe_threshold}{backoff_note}, "
+                            f"{prob_roll:.4f}<{trigger_chance:.4f})"
+                        )
+                    else:
+                        g.prob_wake_no_reply_count = max(0, int(g.prob_wake_no_reply_count or 0)) + 1
+                        logger.debug(
+                            "[LLMEnhancement] 概率唤醒批次观察未命中："
+                            f"group={gid}, uid={uid}, pending={pending_count}, "
+                            f"threshold={observe_threshold}, activity={prob_wake_activity:.2f}, "
+                            f"roll={prob_roll:.4f}, chance={trigger_chance:.4f}, "
+                            f"no_reply={g.prob_wake_no_reply_count}"
+                        )
+                else:
+                    logger.debug(
+                        "[LLMEnhancement] 概率唤醒等待累计消息："
+                        f"group={gid}, uid={uid}, pending={pending_count}, threshold={observe_threshold}, "
+                        f"activity={prob_wake_activity:.2f}"
+                    )
 
         event.set_extra("_llme_direct_wake", direct_wake)
         event.set_extra("_llme_wake_reason", reason)
@@ -2181,19 +2269,6 @@ class LLMEnhancement(Star):
             )
             return
 
-        if gid and g.shutup_until > now:
-            event.stop_event()
-            await self._release_concurrency_slot_if_needed(
-                event, reason="on_llm_request_group_shutup"
-            )
-            return
-        if not event.is_admin() and sender_member.silence_until > now:
-            event.stop_event()
-            await self._release_concurrency_slot_if_needed(
-                event, reason="on_llm_request_user_silenced"
-            )
-            return
-
         has_preacquired_slot = True
         if gid:
             has_preacquired_slot = bool(event.get_extra("_llme_concurrency_preacquired", default=False)) and bool(
@@ -2274,25 +2349,6 @@ class LLMEnhancement(Star):
                 self._effective_dialog_history.build_user_text(msg, all_components),
             )
             now = time.time()
-
-            if gid:
-                shutup_th_cfg = self._get_cfg("shutup")
-                if shutup_th_cfg:
-                    shut_th = await self.sent.shut(msg)
-                    if shut_th > shutup_th_cfg:
-                        silence_sec = shut_th * self._get_cfg("silence_multiple", 500)
-                        g.shutup_until = now + silence_sec
-                        logger.info(f"群({gid})触发闭嘴，沉默{silence_sec:.1f}秒")
-                        event.stop_event()
-                        return
-
-            insult_th_cfg = self._get_cfg("insult")
-            if insult_th_cfg:
-                insult_th = await self.sent.insult(msg)
-                if insult_th > insult_th_cfg:
-                    silence_sec = insult_th * self._get_cfg("silence_multiple", 500)
-                    sender_member.silence_until = now + silence_sec
-                    logger.info(f"用户({uid})触发辱骂沉默{silence_sec:.1f}秒(下次生效)")
 
             empty_mention_ctx = str(event.get_extra("_llme_empty_mention_context", default="") or "").strip()
             if empty_mention_ctx:
@@ -2675,6 +2731,11 @@ class LLMEnhancement(Star):
         member.last_response = resp_ts
         g.last_response_uid = state_uid
         g.last_response_ts = resp_ts
+        g.active_wake_new_msg_count = 0
+        g.prob_wake_pending_count = 0
+        g.prob_wake_no_reply_count = 0
+        g.prob_wake_last_check_ts = resp_ts
+        g.wake_extend_batch_count = 0
 
         cleared_recent_wake_count = 0
         async with member.lock:

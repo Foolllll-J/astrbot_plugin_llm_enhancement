@@ -10,54 +10,93 @@
         "description": "智能唤醒",
         "hint": "配置智能唤醒相关参数",
         "items": {
-            "max_user_concurrent_requests": {
-                "description": "用户级并发请求上限",
-                "hint": "限制单个用户同时进行中的 LLM 请求数。设为 0 表示不限制。",
-                "type": "int",
-                "minimum": 0,
-                "default": 0
-            },
-            "max_group_concurrent_requests": {
-                "description": "群聊级并发请求上限",
-                "hint": "限制单个群同时进行中的 LLM 请求数。设为 0 表示不限制。",
-                "type": "int",
-                "minimum": 0,
-                "default": 0
-            },
-            "wake_extend": {
-                "description": "唤醒延长(秒)",
-                "hint": "LLM 响应后，在此时间窗口内可继续维持唤醒状态。设为 0 时关闭。",
+            "prob_wake": {
+                "description": "概率唤醒活跃度",
+                "hint": "数值越高，Bot 在普通群消息中的主动插话意愿越强。设为 0 时关闭该模式。",
                 "type": "float",
-                "default": 30.0
+                "default": 0.3,
+                "slider": {
+                    "min": 0,
+                    "max": 1,
+                    "step": 0.1
+                },
+                "minimum": 0,
+                "maximum": 1
             },
-            "wake_extend_same_user_only": {
-                "description": "唤醒延长仅对原用户生效",
-                "hint": "开启后，唤醒延长窗口内仅处理上次触发请求的用户消息，忽略其他用户。",
+            "mention_wake": {
+                "description": "提及唤醒规则",
+                "hint": "支持普通文本包含、re:pattern 与 /pattern/flags（flags: i,m,s,x,a,u,L）。不填时关闭提及检测。",
+                "type": "list",
+                "default": []
+            },
+            "relevant_wake": {
+                "description": "相关性唤醒阈值",
+                "hint": "当前消息与上文 Bot 的消息相关性超过阈值时，唤醒 Bot。设为 0 时关闭检测。",
+                "type": "float",
+                "default": 0.68,
+                "slider": {
+                    "min": 0,
+                    "max": 1,
+                    "step": 0.01
+                },
+                "minimum": 0,
+                "maximum": 1
+            },
+            "ask_wake": {
+                "description": "答疑唤醒阈值",
+                "hint": "当群里有人问专业性问题时，唤醒 Bot。设为 0 时关闭检测。",
+                "type": "float",
+                "default": 0.78,
+                "slider": {
+                    "min": 0,
+                    "max": 1,
+                    "step": 0.01
+                },
+                "minimum": 0,
+                "maximum": 1
+            },
+            "bored_wake": {
+                "description": "无聊唤醒阈值",
+                "hint": "当群里出现无聊/冷场/求聊天等表达时，唤醒 Bot。设为 0 时关闭检测。",
+                "type": "float",
+                "default": 0.74,
+                "slider": {
+                    "min": 0,
+                    "max": 1,
+                    "step": 0.01
+                },
+                "minimum": 0,
+                "maximum": 1
+            },
+            "active_wake_silence_bonus_enabled": {
+                "description": "主动唤醒沉默补偿",
+                "hint": "开启后，Bot 距离上次回复后累积的消息越多，会更容易触发语义型主动唤醒。",
                 "type": "bool",
                 "default": true
             },
-            "wake_extend_similarity": {
-                "description": "唤醒延长相关性阈值",
-                "hint": "唤醒延长期间，当前消息与上文的相关性阈值。",
-                "type": "float",
-                "default": 0.1
-            },
-            "wake_extend_provider_id": {
-                "description": "唤醒延长判定 Provider ID",
-                "type": "string",
-                "_special": "select_provider",
-                "default": "",
-                "hint": "留空时不启用模型判定。配置后会让该模型仅输出 T/F，用于判断是否继续响应。"
-            },
-            "wake_extend_judge_prompt": {
-                "description": "唤醒延长判定提示词",
-                "type": "text",
-                "obvious_hint": true,
-                "editor_mode": true,
-                "editor_language": "markdown",
-                "editor_theme": "vs-dark",
-                "default": "请判断当前消息是否与上文足够相关，是否需要继续响应。\n\n[当前时间]\n{time}\n\n[用户ID]\n{user_id}\n\n[用户名]\n{user_name}\n\n[群组ID]\n{group_id}\n\n[相关性阈值参考]\n{threshold}\n\n[上文]\n{history}\n\n[当前消息]\n{message}\n\n[判定规则]\n1) 如果当前消息是对上文的自然追问、补充、纠正、承接或继续讨论，输出 T。\n2) 如果当前消息与上文明显无关、话题跳转过大，或不需要机器人继续响应，输出 F。\n3) 不确定时优先结合上文连续性判断；只有在明显无关时才输出 F。\n\n[输出格式]\n只能输出一个大写字母：T 或 F。",
-                "hint": "支持占位符：{time}、{user_id}、{user_name}、{group_id}、{threshold}、{history}、{message}、{persona}、{random}。仅在配置了 wake_extend_provider_id 时生效。"
+            "wake_judge_types": {
+                "description": "唤醒判定类型",
+                "hint": "选择后，这些唤醒类型会在触发后再经过一次唤醒判定。留空表示不额外判定。",
+                "type": "list",
+                "options": [
+                    "explicit",
+                    "prob",
+                    "mention",
+                    "relevant",
+                    "ask",
+                    "bored"
+                ],
+                "labels": [
+                    "显式唤醒",
+                    "概率唤醒",
+                    "提及唤醒",
+                    "相关性唤醒",
+                    "答疑唤醒",
+                    "无聊唤醒"
+                ],
+                "default": [
+                    "prob"
+                ]
             },
             "wake_judge_provider_id": {
                 "description": "唤醒判定 Provider ID",
@@ -83,73 +122,77 @@
                 "default": 10,
                 "minimum": 1
             },
-            "active_wake_judge_types": {
-                "description": "主动唤醒判定类型",
-                "hint": "选择后，这些主动唤醒类型会在触发后再经过一次唤醒判定。留空表示不对主动唤醒额外判定。",
+            "wake_extend": {
+                "description": "唤醒延长（秒）",
+                "hint": "LLM 响应后，在此时间窗口内可继续维持唤醒状态。设为 0 时关闭。",
+                "type": "float",
+                "default": 30.0
+            },
+            "wake_extend_same_user_only": {
+                "description": "唤醒延长仅对原用户生效",
+                "hint": "开启后，唤醒延长窗口内仅处理上次触发请求的用户消息，忽略其他用户。",
+                "type": "bool",
+                "default": true
+            },
+            "wake_extend_similarity": {
+                "description": "唤醒延长相关性阈值",
+                "hint": "唤醒延长期间，当前消息与上文的相关性阈值。",
+                "type": "float",
+                "default": 0.12,
+                "slider": {
+                    "min": 0,
+                    "max": 1,
+                    "step": 0.01
+                },
+                "minimum": 0,
+                "maximum": 1
+            },
+            "wake_extend_provider_id": {
+                "description": "唤醒延长判定 Provider ID",
+                "type": "string",
+                "_special": "select_provider",
+                "default": "",
+                "hint": "留空时不启用模型判定。配置后会让该模型仅输出 T/F，用于判断是否继续响应。"
+            },
+            "wake_extend_judge_prompt": {
+                "description": "唤醒延长判定提示词",
+                "type": "text",
+                "obvious_hint": true,
+                "editor_mode": true,
+                "editor_language": "markdown",
+                "editor_theme": "vs-dark",
+                "default": "请判断当前消息是否与上文足够相关，是否需要继续响应。\n\n[当前时间]\n{time}\n\n[用户ID]\n{user_id}\n\n[用户名]\n{user_name}\n\n[群组ID]\n{group_id}\n\n[相关性阈值参考]\n{threshold}\n\n[上文]\n{history}\n\n[当前消息]\n{message}\n\n[判定规则]\n1) 如果当前消息是对上文的自然追问、补充、纠正、承接或继续讨论，输出 T。\n2) 如果当前消息与上文明显无关、话题跳转过大，或不需要机器人继续响应，输出 F。\n3) 不确定时优先结合上文连续性判断；只有在明显无关时才输出 F。\n\n[输出格式]\n只能输出一个大写字母：T 或 F。",
+                "hint": "支持占位符：{time}、{user_id}、{user_name}、{group_id}、{threshold}、{history}、{message}、{persona}、{random}。仅在配置了 wake_extend_provider_id 时生效。"
+            },
+            "max_user_concurrent_requests": {
+                "description": "用户级并发请求上限",
+                "hint": "限制单个用户同时进行中的 LLM 请求数。设为 0 表示不限制。",
+                "type": "int",
+                "minimum": 0,
+                "default": 0
+            },
+            "max_group_concurrent_requests": {
+                "description": "群聊级并发请求上限",
+                "hint": "限制单个群同时进行中的 LLM 请求数。设为 0 表示不限制。",
+                "type": "int",
+                "minimum": 0,
+                "default": 0
+            },
+            "wake_forbidden_words": {
+                "description": "屏蔽唤醒规则",
+                "hint": "支持格式同唤醒规则。命中规则时不会唤醒 Bot。",
                 "type": "list",
-                "options": [
-                    "mention",
-                    "relevant",
-                    "ask",
-                    "bored",
-                    "prob"
-                ],
-                "labels": [
-                    "提及唤醒",
-                    "相关性唤醒",
-                    "答疑唤醒",
-                    "无聊唤醒",
-                    "兜底概率唤醒"
-                ],
-                "default": []
+                "default": [
+                    "政治",
+                    "键证",
+                    "党"
+                ]
             },
-            "mention_wake": {
-                "description": "提及唤醒规则",
-                "hint": "支持普通文本包含、re:pattern 与 /pattern/flags（flags: i,m,s,x,a,u,L）。不填时关闭提及检测。",
-                "type": "list",
-                "default": []
-            },
-            "relevant_wake": {
-                "description": "相关性唤醒阈值",
-                "hint": "当前消息与上文bot的消息相关性超过阈值时，唤醒bot。设为 0 时关闭检测。",
-                "type": "float",
-                "default": 0.68
-            },
-            "ask_wake": {
-                "description": "答疑唤醒阈值",
-                "hint": "当群里有人问专业性问题时，唤醒bot。设为 0 时关闭检测。",
-                "type": "float",
-                "default": 0.78
-            },
-            "bored_wake": {
-                "description": "无聊唤醒阈值",
-                "hint": "当群里出现无聊/冷场/求聊天等表达时，唤醒bot。设为 0 时关闭检测。",
-                "type": "float",
-                "default": 0.74
-            },
-            "shutup": {
-                "description": "闭嘴检测阈值",
-                "hint": "有人感觉bot太多话时，bot自动闭嘴一段时间。设为 0 时关闭检测。",
-                "type": "float",
-                "default": 0.72
-            },
-            "insult": {
-                "description": "辱骂检测阈值",
-                "hint": "有人辱骂bot时，bot自动沉默一段时间。设为 0 时关闭检测。",
-                "type": "float",
-                "default": 0.75
-            },
-            "silence_multiple": {
-                "description": "沉默时间倍数",
-                "hint": "触发bot沉默时的阈值（0~1） * 沉默时间倍数 = 沉默时间。",
-                "type": "float",
-                "default": 300
-            },
-            "prob_wake": {
-                "description": "兜底唤醒概率",
-                "hint": "上述所有唤醒机制都没能唤醒bot时，最后会按照此概率尝试唤醒bot。",
-                "type": "float",
-                "default": 0.0002
+            "block_builtin": {
+                "description": "屏蔽内置指令",
+                "hint": "屏蔽 Astrbot 自带的命令，如 help, tts, llm 等，内置指令被屏蔽后不再会唤醒 Bot。",
+                "type": "bool",
+                "default": false
             },
             "require_at_for_wake_prefix": {
                 "description": "唤醒需 @Bot",
@@ -159,7 +202,7 @@
             },
             "bot_account_ids": {
                 "description": "机器人 ID",
-                "hint": "配置群内其他机器人的用户 ID。",
+                "hint": "配置其他机器人的用户 ID。",
                 "type": "list",
                 "default": []
             },
@@ -178,22 +221,6 @@
                     "唤醒延长"
                 ],
                 "default": []
-            },
-            "wake_forbidden_words": {
-                "description": "屏蔽唤醒规则",
-                "hint": "支持格式同唤醒规则。命中规则时不会唤醒bot。",
-                "type": "list",
-                "default": [
-                    "政治",
-                    "键证",
-                    "党"
-                ]
-            },
-            "block_builtin": {
-                "description": "屏蔽内置指令",
-                "hint": "内置指令即指 Astrbot 自带的命令，如 help, tts, llm 等，内置指令被屏蔽后不再会唤醒bot。",
-                "type": "bool",
-                "default": false
             }
         }
     },
@@ -217,7 +244,7 @@
                 "default": "hard"
             },
             "merge_delay": {
-                "description": "合并窗口(秒)",
+                "description": "合并窗口（秒）",
                 "hint": "硬合并下表示硬等待时间；动态合并下表示可并入消息的时间窗口上限。设为 0 时不启用消息合并。",
                 "type": "float",
                 "default": 0
@@ -265,7 +292,7 @@
             },
             "context_injection_max_messages": {
                 "description": "上下文记录上限",
-                "hint": "每个会话最多保留的上下文消息条数（环形缓存）。建议 6~50。",
+                "hint": "每个会话最多保留的上下文消息条数。建议 6~50。",
                 "type": "int",
                 "default": 12
             },
@@ -329,7 +356,7 @@
                 "description": "启用聊天记录解析",
                 "type": "bool",
                 "default": true,
-                "hint": "关闭后，不再解析聊天记录（转发消息）内容。"
+                "hint": "关闭后，不再解析聊天记录（合并转发消息）内容。"
             },
             "file_parse_enable": {
                 "description": "启用文件解析",
@@ -538,7 +565,7 @@
                 "description": "拦截内网 URL",
                 "type": "bool",
                 "default": true,
-                "hint": "开启后，非 bot 管理员不允许解析内网地址。"
+                "hint": "开启后，非 Bot 管理员不允许解析内网地址。"
             },
             "inject_url_blocked_domains": {
                 "description": "URL 黑名单域名",
@@ -601,11 +628,10 @@
                     "QQ等级",
                     "群身份",
                     "群头衔",
-                    "地区",
-                    "Q龄"
+                    "地区"
                 ],
                 "description": "发送者信息注入字段",
-                "hint": "按需勾选要注入给 LLM 的字段。留空表示关闭该注入。仅群聊(aiocqhttp)生效。"
+                "hint": "按需勾选要注入给 LLM 的字段。留空表示关闭该注入。仅 (aiocqhttp) 群聊生效。"
             },
             "extra_info_injection_include_bot_self": {
                 "type": "bool",

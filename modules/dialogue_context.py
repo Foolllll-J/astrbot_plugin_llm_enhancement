@@ -182,6 +182,7 @@ def compute_active_wake_adjustment(
     at_all: bool,
     reply_to_id: str,
     include_state_bias: bool = True,
+    get_cfg: Any = None,
 ) -> tuple[float, list[str]]:
     """
     计算主动唤醒降权系数（仅用于非 @bot 场景）。
@@ -248,8 +249,54 @@ def compute_active_wake_adjustment(
                 factor *= 0.85
                 reasons.append("user_interaction_stale")
 
-    factor = max(0.05, min(1.0, factor))
+    silence_bonus = _compute_active_wake_silence_bonus(
+        group_state=group_state,
+        include_state_bias=include_state_bias,
+        get_cfg=get_cfg,
+    )
+    if silence_bonus > 0:
+        factor *= (1.0 + silence_bonus)
+        reasons.append(f"silence_bonus+{silence_bonus:.2f}")
+
+    factor = max(0.05, min(1.30, factor))
     return factor, reasons
+
+
+def _compute_active_wake_silence_bonus(
+    *,
+    group_state: GroupState,
+    include_state_bias: bool,
+    get_cfg: Any = None,
+) -> float:
+    steps = [20, 80, 150]
+    values = [0.05, 0.10, 0.20]
+    cap = 0.20
+    relevant_ratio = 0.7
+
+    if get_cfg is None:
+        return 0.0
+    if not bool(get_cfg("active_wake_silence_bonus_enabled", True)):
+        return 0.0
+    if cap <= 0:
+        return 0.0
+
+    msg_count = max(0, int(getattr(group_state, "active_wake_new_msg_count", 0) or 0))
+    if msg_count <= 0:
+        return 0.0
+
+    bonus = 0.0
+    for idx, step in enumerate(steps):
+        if msg_count < step:
+            continue
+        bonus = max(bonus, float(values[idx]))
+
+    if bonus <= 0:
+        return 0.0
+
+    if include_state_bias:
+        bonus *= relevant_ratio
+
+    return max(0.0, min(cap, bonus))
 
 
 def _extract_first_image_url(message_chain: Any) -> str:

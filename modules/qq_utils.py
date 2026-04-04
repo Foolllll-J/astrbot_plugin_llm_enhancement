@@ -38,7 +38,6 @@ INJECTABLE_MEMBER_FIELDS: Dict[str, str] = {
     "role": "群身份",
     "title": "群头衔",
     "area": "地区",
-    "qage": "Q龄",
 }
 INJECTABLE_PERCEPTION_FIELDS: Dict[str, str] = {
     "send_time": "发送时间",
@@ -570,7 +569,6 @@ def _normalize_member_injection_fields(raw_fields: Any) -> List[str]:
         "群头衔": "title",
         "头衔": "title",
         "地区": "area",
-        "q龄": "qage",
     }
 
     for item in raw_fields:

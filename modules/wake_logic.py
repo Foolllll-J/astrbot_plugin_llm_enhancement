@@ -193,6 +193,45 @@ def try_acquire_request_concurrency_slot(
     return True, key, "accepted_new_slot"
 
 
+def can_accept_request_concurrency_slot(
+    *,
+    active_request_refs: Dict[str, int],
+    active_request_meta: Dict[str, Tuple[str, str]],
+    uid: str,
+    gid: str,
+    state_uid: str,
+    dynamic_merge_mode: bool,
+    user_limit: int,
+    group_limit: int,
+) -> tuple[bool, str]:
+    """仅检查是否可接受新并发请求，不分配槽位。"""
+    if not gid:
+        return True, "private_skip_limits"
+    scope_id = gid or f"private_{uid}"
+    if dynamic_merge_mode:
+        key = build_request_concurrency_key(
+            dynamic_merge_mode=True,
+            scope_id=scope_id,
+            state_uid=state_uid,
+            current_msg_id="",
+            event_identity=0,
+            now_ns=0,
+        )
+        current_ref = int(active_request_refs.get(key, 0) or 0)
+        if current_ref > 0:
+            return True, "reuse_existing_dynamic_session"
+
+    user_active = _count_active_user_requests(active_request_refs, active_request_meta, uid)
+    group_active = _count_active_group_requests(active_request_refs, active_request_meta, gid)
+    if user_limit > 0 and user_active >= user_limit:
+        detail = f"user_limit({user_active}/{user_limit}, uid={uid}, group={gid or 'private'})"
+        return False, detail
+    if group_limit > 0 and group_active >= group_limit:
+        detail = f"group_limit({group_active}/{group_limit}, gid={gid}, uid={uid})"
+        return False, detail
+    return True, "available"
+
+
 def release_request_concurrency_slot(
     *,
     active_request_refs: Dict[str, int],
@@ -751,7 +790,7 @@ def compute_relevant_context_substring_downweight(
     return factor, hit_count
 
 
-def _parse_active_wake_judge_types(raw_types: Any) -> set[str]:
+def _parse_wake_judge_types(raw_types: Any) -> set[str]:
     if isinstance(raw_types, (list, tuple, set)):
         candidates = [str(v or "").strip().lower() for v in raw_types]
     elif isinstance(raw_types, str):
@@ -810,6 +849,8 @@ def should_skip_bot_wake_type(
 
 def _wake_reason_to_active_type(wake_reason: str) -> Optional[str]:
     reason = str(wake_reason or "")
+    if reason == "at_or_cmd":
+        return "explicit"
     if reason.startswith("提及唤醒"):
         return "mention"
     if reason.startswith("话题相关性"):
@@ -821,6 +862,69 @@ def _wake_reason_to_active_type(wake_reason: str) -> Optional[str]:
     if reason.startswith("概率唤醒"):
         return "prob"
     return None
+
+
+def get_prob_wake_observe_threshold(
+    group_state: GroupState,
+    get_cfg: Callable[[str, Any], Any],
+) -> int:
+    activity = get_prob_wake_activity(get_cfg)
+    base, _chance, backoff_step, backoff_max = _build_prob_wake_profile(activity)
+
+    base = max(1, base)
+    backoff_step = max(0, backoff_step)
+    backoff_max = max(0, backoff_max)
+    no_reply_count = max(0, int(getattr(group_state, "prob_wake_no_reply_count", 0) or 0))
+    extra = min(backoff_max, no_reply_count * backoff_step)
+    return base + extra
+
+
+def get_prob_wake_activity(
+    get_cfg: Callable[[str, Any], Any],
+) -> float:
+    try:
+        value = float(get_cfg("prob_wake", 0.3) or 0.0)
+    except Exception:
+        value = 0.3
+    return max(0.0, min(1.0, value))
+
+
+def get_prob_wake_trigger_chance(
+    get_cfg: Callable[[str, Any], Any],
+) -> float:
+    activity = get_prob_wake_activity(get_cfg)
+    _base, chance, _backoff_step, _backoff_max = _build_prob_wake_profile(activity)
+    return chance
+
+
+def _build_prob_wake_profile(activity: float) -> tuple[int, float, int, int]:
+    normalized = max(0.0, min(1.0, float(activity or 0.0)))
+    base_threshold = int(round(10 - normalized * 6))
+    trigger_chance = 0.06 + normalized * 0.26
+    backoff_step = 1 if normalized >= 0.5 else 2
+    backoff_max = 4 if normalized >= 0.5 else 6
+    return max(4, base_threshold), min(0.35, trigger_chance), backoff_step, backoff_max
+
+
+def compute_wake_extend_batch_threshold(
+    threshold: float,
+    group_state: GroupState,
+    get_cfg: Callable[[str, Any], Any],
+) -> float:
+    adjusted = float(threshold or 0.0)
+    if adjusted <= 0:
+        return adjusted
+    step = 2
+    cap = 0.08
+    step = max(1, step)
+    cap = max(0.0, cap)
+    batch_count = max(0, int(getattr(group_state, "wake_extend_batch_count", 0) or 0))
+    if batch_count < step or cap <= 0:
+        return adjusted
+
+    bonus = min(cap, (batch_count // step) * 0.02)
+    adjusted -= bonus
+    return max(0.0, adjusted)
 
 
 def _extract_provider_text(response: Any) -> str:
@@ -1004,10 +1108,10 @@ def _build_wake_trigger_note(wake_reason: str) -> str:
         wake_type = mapped or "other"
         source_map = {
             "mention": "提及触发",
-            "relevant": "相关性主动唤醒",
-            "ask": "答疑主动唤醒",
-            "bored": "无聊主动唤醒",
-            "prob": "概率主动唤醒",
+            "relevant": "相关性唤醒",
+            "ask": "答疑唤醒",
+            "bored": "无聊唤醒",
+            "prob": "概率唤醒",
             "other": "其他触发",
         }
         source_desc = source_map.get(wake_type, "其他触发")
@@ -1085,22 +1189,17 @@ def should_apply_post_wake_gate(
 ) -> bool:
     """
     是否执行“唤醒判定”流程。
-    仅作用于普通显式唤醒（@ / 唤醒前缀），不影响插件主动处理的特殊唤醒场景。
+    是否执行由 `wake_judge_types` 控制的后置唤醒判定。
     """
     if command_trigger_event or force_dynamic_followup:
         return False
 
     reason = str(wake_reason or "")
-    # 普通文本显式唤醒（@ / 唤醒前缀）始终走唤醒判定
-    if direct_wake and reason == "at_or_cmd":
-        return True
-
-    # 主动唤醒类型按配置决定是否走唤醒判定
-    active_type = _wake_reason_to_active_type(reason)
-    if not active_type:
+    wake_type = _wake_reason_to_active_type(reason)
+    if not wake_type:
         return False
-    enabled_types = _parse_active_wake_judge_types(get_cfg("active_wake_judge_types", []))
-    return active_type in enabled_types
+    enabled_types = _parse_wake_judge_types(get_cfg("wake_judge_types", []))
+    return wake_type in enabled_types
 
 
 def is_post_wake_gate_enabled(
@@ -1119,7 +1218,7 @@ async def evaluate_post_wake_judge(
     get_history_msg: Callable[[AstrMessageEvent, int], Awaitable[List[str]]],
     find_provider: Callable[[str], Any],
 ) -> Tuple[bool, str]:
-    """对显式唤醒请求执行唤醒判定，返回 (allow_continue, detail)。"""
+    """对指定唤醒类型执行唤醒判定，返回 (allow_continue, detail)。"""
     provider_id = _get_wake_judge_provider_id(get_cfg)
     if not provider_id:
         return True, "skip:disabled"
@@ -1303,6 +1402,11 @@ async def evaluate_wake_extend(
         return False, None
 
     threshold = float(get_cfg("wake_extend_similarity", 0.1) or 0.0)
+    adjusted_threshold = compute_wake_extend_batch_threshold(
+        threshold=threshold,
+        group_state=group_state,
+        get_cfg=get_cfg,
+    )
     if threshold <= 0:
         _mark_wake_extend_consumed(group_state, ref_ts)
         return True, "唤醒延长(阈值0)"
@@ -1319,7 +1423,7 @@ async def evaluate_wake_extend(
             event=event,
             msg=msg,
             history_msgs=history_msgs,
-            threshold=threshold,
+            threshold=adjusted_threshold,
             provider_id=provider_id,
             prompt_template=prompt_template,
             find_provider=find_provider,
@@ -1329,23 +1433,29 @@ async def evaluate_wake_extend(
             return True, "唤醒延长(模型判定T)"
         if llm_decision is False:
             return False, None
-
+        logger.debug(
+            "[LLMEnhancement] 唤醒延长模型判定未返回有效结果，回退本地相似度："
+            f"group={gid}, uid={uid}, threshold={adjusted_threshold:.4f}, "
+            f"batch_count={int(getattr(group_state, 'wake_extend_batch_count', 0) or 0)}"
+        )
         simi = await similarity_fn(gid, msg, history_msgs)
         logger.debug(
             f" [LLMEnhancement] 唤醒延长检查(本地回退): 相关系数={simi:.4f}, "
-            f"阈值={threshold:.4f}, 历史参考={len(history_msgs)}条"
+            f"阈值={adjusted_threshold:.4f}, 历史参考={len(history_msgs)}条, "
+            f"batch_count={int(getattr(group_state, 'wake_extend_batch_count', 0) or 0)}"
         )
-        if simi >= threshold:
+        if simi >= adjusted_threshold:
             _mark_wake_extend_consumed(group_state, ref_ts)
-            return True, f"唤醒延长(相关性{simi:.2f}>={threshold:.2f})"
+            return True, f"唤醒延长(相关性{simi:.2f}>={adjusted_threshold:.2f})"
         return False, None
 
     simi = await similarity_fn(gid, msg, history_msgs)
     logger.debug(
         f" [LLMEnhancement] 唤醒延长检查: 相关系数={simi:.4f}, "
-        f"阈值={threshold:.4f}, 历史参考={len(history_msgs)}条"
+        f"阈值={adjusted_threshold:.4f}, 历史参考={len(history_msgs)}条, "
+        f"batch_count={int(getattr(group_state, 'wake_extend_batch_count', 0) or 0)}"
     )
-    if simi >= threshold:
+    if simi >= adjusted_threshold:
         _mark_wake_extend_consumed(group_state, ref_ts)
-        return True, f"唤醒延长(相关性{simi:.2f}>={threshold:.2f})"
+        return True, f"唤醒延长(相关性{simi:.2f}>={adjusted_threshold:.2f})"
     return False, None

@@ -13,7 +13,7 @@ from .state_manager import GroupState, MemberState
 
 _MENTION_WAKE_REGEX_CACHE: dict[str, re.Pattern[str]] = {}
 _MENTION_WAKE_REGEX_INVALID: set[str] = set()
-_ACTIVE_WAKE_JUDGE_TYPES = {"mention", "relevant", "ask", "bored", "prob"}
+_WAKE_JUDGE_TYPES = {"explicit", "mention", "relevant", "ask", "bored", "prob"}
 _BOT_ACCOUNT_SKIP_WAKE_TYPES = {"explicit", "active", "wake_extend"}
 _WAKE_JUDGE_PROMPT_DEFAULT = """你是群聊“唤醒判定器”。请判断机器人是否应该响应这条显式唤醒请求。
 
@@ -797,7 +797,7 @@ def _parse_wake_judge_types(raw_types: Any) -> set[str]:
         candidates = [s.strip().lower() for s in raw_types.split(",")]
     else:
         candidates = []
-    return {item for item in candidates if item in _ACTIVE_WAKE_JUDGE_TYPES}
+    return {item for item in candidates if item in _WAKE_JUDGE_TYPES}
 
 
 def _parse_bot_account_ids(raw_ids: Any) -> set[str]:
@@ -862,6 +862,12 @@ def _wake_reason_to_active_type(wake_reason: str) -> Optional[str]:
     if reason.startswith("概率唤醒"):
         return "prob"
     return None
+
+
+def _resolve_wake_judge_type(wake_reason: str, direct_wake: bool) -> Optional[str]:
+    if direct_wake:
+        return "explicit"
+    return _wake_reason_to_active_type(wake_reason)
 
 
 def get_prob_wake_observe_threshold(
@@ -1003,6 +1009,7 @@ async def wake_judge_llm_decision(
     msg: str,
     history_msgs: List[str],
     wake_reason: str,
+    direct_wake: bool,
     provider_id: str,
     prompt_template: str,
     find_provider: Callable[[str], Any],
@@ -1030,7 +1037,7 @@ async def wake_judge_llm_decision(
     await _ensure_persona_placeholder(event, placeholders, prompt_template)
     placeholders.update(_build_prompt_extra_placeholders(event))
     prompt = _render_prompt_template(prompt_template, placeholders)
-    trigger_note = _build_wake_trigger_note(wake_reason)
+    trigger_note = _build_wake_trigger_note(wake_reason, direct_wake)
     if trigger_note:
         prompt = f"{trigger_note}\n\n{prompt}"
     system_prompt = (
@@ -1094,13 +1101,13 @@ def _render_prompt_template(template: str, values: Dict[str, str]) -> str:
     return re.sub(r"\{([a-zA-Z_][a-zA-Z0-9_]*)\}", repl, template)
 
 
-def _build_wake_trigger_note(wake_reason: str) -> str:
+def _build_wake_trigger_note(wake_reason: str, direct_wake: bool = False) -> str:
     """构造唤醒判定前置说明"""
     reason = str(wake_reason or "").strip()
     if not reason:
         return ""
 
-    if reason == "at_or_cmd":
+    if direct_wake or reason == "at_or_cmd":
         wake_type = "direct"
         source_desc = "显式唤醒（@ 或唤醒前缀）"
     else:
@@ -1195,7 +1202,7 @@ def should_apply_post_wake_gate(
         return False
 
     reason = str(wake_reason or "")
-    wake_type = _wake_reason_to_active_type(reason)
+    wake_type = _resolve_wake_judge_type(reason, direct_wake)
     if not wake_type:
         return False
     enabled_types = _parse_wake_judge_types(get_cfg("wake_judge_types", []))
@@ -1214,6 +1221,7 @@ async def evaluate_post_wake_judge(
     msg: str,
     gid: str,
     wake_reason: str,
+    direct_wake: bool,
     get_cfg: Callable[[str, Any], Any],
     get_history_msg: Callable[[AstrMessageEvent, int], Awaitable[List[str]]],
     find_provider: Callable[[str], Any],
@@ -1231,6 +1239,7 @@ async def evaluate_post_wake_judge(
         msg=msg,
         history_msgs=history_msgs,
         wake_reason=wake_reason,
+        direct_wake=direct_wake,
         provider_id=provider_id,
         prompt_template=prompt_template,
         find_provider=find_provider,
@@ -1246,6 +1255,10 @@ async def apply_post_wake_judge_gate(
     event: AstrMessageEvent,
     msg: str,
     gid: str,
+    uid: str,
+    now: float,
+    group_state: Optional[GroupState],
+    member: Optional[MemberState],
     wake: bool,
     wake_reason: str,
     command_trigger_event: bool,
@@ -1263,6 +1276,21 @@ async def apply_post_wake_judge_gate(
         return wake, "skip:not_woken"
     if str(wake_reason or "").strip().startswith("唤醒延长"):
         return True, "skip:wake_extend"
+    wake_type = _resolve_wake_judge_type(str(wake_reason or ""), direct_wake)
+    if (
+        wake_type == "explicit"
+        and group_state is not None
+        and member is not None
+    ):
+        skip_explicit, skip_detail = should_skip_explicit_post_wake_judge(
+            uid=uid,
+            now=now,
+            group_state=group_state,
+            member=member,
+            get_cfg=get_cfg,
+        )
+        if skip_explicit:
+            return True, skip_detail
     if not should_apply_post_wake_gate(
         wake_reason=wake_reason,
         command_trigger_event=command_trigger_event,
@@ -1279,6 +1307,7 @@ async def apply_post_wake_judge_gate(
         msg=msg,
         gid=gid,
         wake_reason=wake_reason,
+        direct_wake=direct_wake,
         get_cfg=get_cfg,
         get_history_msg=get_history_msg,
         find_provider=find_provider,
@@ -1286,6 +1315,48 @@ async def apply_post_wake_judge_gate(
     if not allow_continue:
         return False, detail
     return True, detail
+
+
+def should_skip_explicit_post_wake_judge(
+    uid: str,
+    now: float,
+    group_state: GroupState,
+    member: MemberState,
+    get_cfg: Callable[[str, Any], Any],
+) -> tuple[bool, str]:
+    """
+    判断显式唤醒是否可跳过后置唤醒判定。
+
+    规则：
+    1. 若启用了唤醒延长，则复用其窗口与 same_user_only 约束。
+    2. 若未启用唤醒延长，则默认同用户距上次响应 60s 内免判定。
+    """
+    wake_extend = float(get_cfg("wake_extend", 0) or 0)
+    if wake_extend > 0:
+        same_user_only = bool(get_cfg("wake_extend_same_user_only", True))
+        ref_uid, ref_ts = _resolve_wake_extend_reference(
+            uid=uid,
+            group_state=group_state,
+            member=member,
+            same_user_only=same_user_only,
+        )
+        in_window = bool(ref_ts > 0 and (now - ref_ts) <= wake_extend)
+        if in_window and same_user_only and ref_uid and uid != ref_uid:
+            in_window = False
+        if in_window:
+            return True, (
+                f"skip:explicit_recent_followup(wake_extend={wake_extend:.1f}s,"
+                f"same_user_only={same_user_only})"
+            )
+        return False, "skip:explicit_window_miss"
+
+    fallback_window = 60.0
+    ref_ts = float(getattr(member, "last_response", 0.0) or 0.0)
+    if ref_ts <= 0 and str(getattr(group_state, "last_response_uid", "") or "") == str(uid):
+        ref_ts = float(getattr(group_state, "last_response_ts", 0.0) or 0.0)
+    if ref_ts > 0 and (now - ref_ts) <= fallback_window:
+        return True, f"skip:explicit_same_user_recent({fallback_window:.0f}s)"
+    return False, "skip:explicit_not_recent"
 
 
 def _wake_extend_consumed_for_ref(group_state: GroupState, ref_ts: float) -> bool:

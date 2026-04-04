@@ -188,8 +188,15 @@ class LLMEnhancement(Star):
             data_dir=StarTools.get_data_dir("astrbot_plugin_llm_enhancement"),
             get_cfg=self._get_cfg,
         )
-        qq_adapter_status = "可用" if IS_AIOCQHTTP else "不可用"
-        logger.info(f"[LLMEnhancement] 插件初始化完成。QQ 平台适配器（aiocqhttp）状态：{qq_adapter_status}")
+        qq_adapter_runtime_status = (
+            "已加载"
+            if self._has_loaded_platform_adapter("aiocqhttp")
+            else "未加载"
+        )
+        logger.info(
+            "[LLMEnhancement] 插件初始化完成。"
+            f"QQ 平台适配器（aiocqhttp）运行状态：{qq_adapter_runtime_status}"
+        )
 
     async def initialize(self):
         await self.blacklist.initialize()
@@ -218,6 +225,22 @@ class LLMEnhancement(Star):
                 for k, v in section_cfg.items():
                     self.cfg[k] = v
                 
+
+    def _has_loaded_platform_adapter(self, adapter_name: str) -> bool:
+        """检查指定平台适配器实例是否已实际加载。"""
+        try:
+            platform_insts = getattr(self.context.platform_manager, "platform_insts", [])
+            for platform in platform_insts:
+                meta = platform.meta()
+                if meta.id == adapter_name or meta.name == adapter_name:
+                    return True
+        except Exception:
+            logger.debug(
+                "[LLMEnhancement] 检查已加载平台适配器失败",
+                exc_info=True,
+            )
+        return False
+
 
     def _get_cfg(self, key: str, default: Any = None) -> Any:
         """获取配置项"""
@@ -405,6 +428,7 @@ class LLMEnhancement(Star):
             raw_message = event.event
         if (
             IS_AIOCQHTTP
+            and isinstance(event, AiocqhttpMessageEvent)
             and _raw_get(raw_message, "post_type") not in (None, "", "message")
         ):
             raw_post_type = _raw_get(raw_message, "post_type")
@@ -1173,7 +1197,10 @@ class LLMEnhancement(Star):
         additional_components: List[Any] = collect_additional_components_from_snapshots(preselected_snapshots)
 
         @session_waiter(timeout=wait_timeout_sec, record_history_chains=False)
-        async def collect_messages(controller: SessionController, ev: AstrMessageEvent):
+        async def collect_messages(
+            controller: SessionController,
+            followup_event: AstrMessageEvent,
+        ):
             nonlocal message_buffer, additional_components
             if member.cancel_merge:
                 controller.stop()
@@ -1184,16 +1211,20 @@ class LLMEnhancement(Star):
 
             # 单通道实时撤回监控：撤回事件由 session_controller 转发到此处处理。
             raw = (
-                ev.message_obj.raw_message
-                if (hasattr(ev, "message_obj") and hasattr(ev.message_obj, "raw_message"))
+                followup_event.message_obj.raw_message
+                if (
+                    hasattr(followup_event, "message_obj")
+                    and hasattr(followup_event.message_obj, "raw_message")
+                )
                 else {}
             )
-            if not raw and hasattr(ev, "event"):
-                raw = ev.event
+            if not raw and hasattr(followup_event, "event"):
+                raw = followup_event.event
             raw_post_type = _raw_get(raw, "post_type")
             raw_notice_type = _raw_get(raw, "notice_type")
             if (
                 IS_AIOCQHTTP
+                and isinstance(followup_event, AiocqhttpMessageEvent)
                 and raw_post_type == "notice"
                 and raw_notice_type in {"group_recall", "friend_recall"}
             ):
@@ -1250,7 +1281,7 @@ class LLMEnhancement(Star):
                 pass
 
             can_collect, reject_reason = evaluate_followup_collectability(
-                ev=ev,
+                ev=followup_event,
                 gid=gid,
                 uid=uid,
                 allow_multi_user=bool(allow_multi_user),
@@ -1260,15 +1291,15 @@ class LLMEnhancement(Star):
                 if reject_reason == "wake_required":
                     logger.debug(
                         "[LLMEnhancement] 硬等待合并跳过未唤醒后续消息："
-                        f"uid={uid}, group={gid or 'private'}, sender={ev.get_sender_id()}"
+                        f"uid={uid}, group={gid or 'private'}, sender={followup_event.get_sender_id()}"
                     )
                 return
 
-            if is_duplicate_followup_message(message_buffer, ev, uid):
-                ev.stop_event()
+            if is_duplicate_followup_message(message_buffer, followup_event, uid):
+                followup_event.stop_event()
                 return
 
-            ev.stop_event()
+            followup_event.stop_event()
 
             if len(message_buffer) >= merge_max_count:
                 controller.stop()
@@ -1279,7 +1310,7 @@ class LLMEnhancement(Star):
                 member=member,
                 message_buffer=message_buffer,
                 additional_components=additional_components,
-                ev=ev,
+                ev=followup_event,
                 merged_skip_ttl=merged_skip_ttl,
             )
             if len(message_buffer) >= merge_max_count:
@@ -2320,6 +2351,10 @@ class LLMEnhancement(Star):
                 event=event,
                 msg=event.message_str,
                 gid=gid,
+                uid=uid,
+                now=time.time(),
+                group_state=g if gid else None,
+                member=sender_member if gid else None,
                 wake=bool(event.is_at_or_wake_command),
                 wake_reason=wake_reason,
                 command_trigger_event=command_trigger_event,
@@ -2329,7 +2364,11 @@ class LLMEnhancement(Star):
                 get_history_msg=_get_wake_context_messages,
                 find_provider=lambda provider_id: resolve_provider(self.context, provider_id),
             )
-            if wake_judge_detail.startswith("model:") or wake_judge_detail.startswith("fallback_allow:"):
+            if (
+                wake_judge_detail.startswith("model:")
+                or wake_judge_detail.startswith("fallback_allow:")
+                or wake_judge_detail.startswith("skip:explicit")
+            ):
                 logger.debug(
                     "[LLMEnhancement] on_llm_request 唤醒判定："
                     f"group={gid or 'private'}, uid={uid}, reason={wake_reason}, detail={wake_judge_detail}, wake={wake}"
@@ -2449,8 +2488,16 @@ class LLMEnhancement(Star):
                 req=req,
                 forward_id=ref_result.forward_id,
                 get_cfg=self._get_cfg,
-                get_stt_provider=lambda ev: get_stt_provider(self.context, self._get_cfg, event=ev),
-                get_vision_provider=lambda ev: get_vision_provider(self.context, self._get_cfg, event=ev),
+                get_stt_provider=lambda current_event: get_stt_provider(
+                    self.context,
+                    self._get_cfg,
+                    event=current_event,
+                ),
+                get_vision_provider=lambda current_event: get_vision_provider(
+                    self.context,
+                    self._get_cfg,
+                    event=current_event,
+                ),
                 cleanup_paths=cleanup_paths_later,
             )
             injection_summary["forward"] = bool(handled_forward)

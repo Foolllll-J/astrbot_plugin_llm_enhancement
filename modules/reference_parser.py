@@ -18,13 +18,7 @@ from .json_parser import (
 from .url_parser import extract_url_infos_from_chain
 from .runtime_helpers import transcribe_record_segment, transcribe_record_from_chain, cleanup_paths_later
 
-try:
-    from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import AiocqhttpMessageEvent
-
-    IS_AIOCQHTTP = True
-except ImportError:
-    IS_AIOCQHTTP = False
-
+from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import AiocqhttpMessageEvent
 
 @dataclass
 class ReplyParseResult:
@@ -49,7 +43,7 @@ async def _fetch_messages_by_ids(
     event: AstrMessageEvent,
     msg_ids: list[str],
 ) -> list[dict[str, Any]]:
-    if not (IS_AIOCQHTTP and isinstance(event, AiocqhttpMessageEvent)):
+    if not isinstance(event, AiocqhttpMessageEvent):
         return []
     if not msg_ids:
         return []
@@ -391,6 +385,111 @@ async def inject_current_message_forward_origin_context(
     return True
 
 
+async def check_self_reply_block(
+    event: AstrMessageEvent,
+    reply_seg: Comp.Reply,
+    get_cfg: Callable[[str, Any], Any],
+    original_msg: Optional[dict[str, Any]] = None,
+) -> tuple[bool, str]:
+    """检测引用是否为 Bot 自身消息并按概率拦截。返回 (blocked, reason)。"""
+    if not isinstance(event, AiocqhttpMessageEvent):
+        return False, ""
+    if not isinstance(reply_seg, Comp.Reply):
+        return False, ""
+
+    reply_id = str(getattr(reply_seg, "id", "") or "").strip()
+    if not reply_id:
+        return False, ""
+    reply_sender_id = str(getattr(reply_seg, "sender_id", "") or "").strip()
+    self_id = str(event.get_self_id())
+    if reply_sender_id and reply_sender_id != self_id:
+        return False, ""
+
+    try:
+        if original_msg is None:
+            client = event.bot
+            fetched = await client.api.call_action("get_msg", message_id=reply_id)
+            original_msg = fetched if isinstance(fetched, dict) else None
+    except Exception as e:
+        logger.debug(
+            f"[LLMEnhancement] 引用 Bot 自身检测：获取引用消息失败，改为放行。msg_id={reply_id}, err={e}"
+        )
+        return False, "get_msg_failed"
+
+    if not original_msg or "message" not in original_msg:
+        return False, "invalid_original_msg"
+
+    sender_info = original_msg.get("sender", {}) if isinstance(original_msg.get("sender", {}), dict) else {}
+    original_sender = str(sender_info.get("user_id", "") or "").strip()
+    if original_sender != self_id:
+        return False, ""
+
+    enable_video_parse = bool(get_cfg("video_parse_enable", True))
+    enable_forward_parse = bool(get_cfg("forward_parse_enable", True))
+    enable_file_parse = bool(get_cfg("file_parse_enable", True))
+    enable_json_parse = bool(get_cfg("json_parse_enable", True))
+
+    message_payload = original_msg.get("message")
+    message_list = message_payload if isinstance(message_payload, list) else []
+
+    has_video = any(
+        isinstance(seg, dict) and seg.get("type") == "video" for seg in message_list
+    )
+    has_file = any(
+        isinstance(seg, dict) and seg.get("type") == "file" for seg in message_list
+    )
+    has_forward = any(
+        isinstance(seg, dict) and seg.get("type") == "forward" for seg in message_list
+    )
+
+    if (not has_forward) and enable_forward_parse and enable_json_parse:
+        for seg in message_list:
+            if not isinstance(seg, dict) or seg.get("type") != "json":
+                continue
+            inner_data = (seg.get("data") or {}).get("data")
+            if not inner_data:
+                continue
+            raw_json = (
+                json.dumps(inner_data, ensure_ascii=False)
+                if isinstance(inner_data, dict)
+                else str(inner_data)
+            )
+            is_forward_card, _ = parse_forward_card_info_from_json_segment_data(raw_json)
+            if is_forward_card:
+                has_forward = True
+                break
+
+    try:
+        video_prob = float(get_cfg("quote_self_video_block_prob", 0) or 0)
+    except Exception:
+        video_prob = 0.0
+    try:
+        file_prob = float(get_cfg("quote_self_file_block_prob", 0) or 0)
+    except Exception:
+        file_prob = 0.0
+    try:
+        forward_prob = float(get_cfg("quote_self_forward_block_prob", 0) or 0)
+    except Exception:
+        forward_prob = 0.0
+
+    if enable_video_parse and has_video and video_prob > 0 and random.random() < video_prob:
+        reason = f"引用 Bot 自己的视频，按概率拦截（{video_prob}）"
+        logger.debug(f"[LLMEnhancement] {reason}，msg_id={reply_id}")
+        return True, reason
+
+    if enable_file_parse and has_file and file_prob > 0 and random.random() < file_prob:
+        reason = f"引用 Bot 自身的文件，按概率拦截（{file_prob}）"
+        logger.debug(f"[LLMEnhancement] {reason}，msg_id={reply_id}")
+        return True, reason
+
+    if enable_forward_parse and has_forward and forward_prob > 0 and random.random() < forward_prob:
+        reason = f"引用 Bot 自身的转发，按概率拦截（{forward_prob}）"
+        logger.debug(f"[LLMEnhancement] {reason}，msg_id={reply_id}")
+        return True, reason
+
+    return False, ""
+
+
 async def parse_reply_context(
     event: AstrMessageEvent,
     context: Any,
@@ -409,54 +508,12 @@ async def parse_reply_context(
             return result
 
         sender_info = original_msg.get("sender", {})
-        original_sender = str(sender_info.get("user_id", ""))
         original_sender_name = sender_info.get("nickname", "未知用户")
-        self_id = str(event.get_self_id())
 
-        enable_video_parse = bool(get_cfg("video_parse_enable", True))
         enable_forward_parse = bool(get_cfg("forward_parse_enable", True))
         enable_file_parse = bool(get_cfg("file_parse_enable", True))
         enable_json_parse = bool(get_cfg("json_parse_enable", True))
         enable_record_parse = bool(get_cfg("record_parse_enable", True))
-
-        if original_sender == self_id:
-            message_list = original_msg["message"] if isinstance(original_msg["message"], list) else []
-            has_video = any(s.get("type") == "video" for s in message_list if isinstance(s, dict))
-            has_file = any(s.get("type") == "file" for s in message_list if isinstance(s, dict))
-            has_forward = any(s.get("type") == "forward" for s in message_list if isinstance(s, dict))
-            if (not has_forward) and enable_forward_parse and enable_json_parse:
-                for s in message_list:
-                    if not isinstance(s, dict) or s.get("type") != "json":
-                        continue
-                    inner_data = (s.get("data") or {}).get("data")
-                    if not inner_data:
-                        continue
-                    raw_json = (
-                        json.dumps(inner_data, ensure_ascii=False)
-                        if isinstance(inner_data, dict)
-                        else str(inner_data)
-                    )
-                    is_forward_card, _ = parse_forward_card_info_from_json_segment_data(raw_json)
-                    if is_forward_card:
-                        has_forward = True
-                        break
-
-            video_prob = float(get_cfg("quote_self_video_block_prob", 0) or 0)
-            file_prob = float(get_cfg("quote_self_file_block_prob", 0) or 0)
-            forward_prob = float(get_cfg("quote_self_forward_block_prob", 0) or 0)
-
-            if enable_video_parse and has_video and video_prob > 0 and random.random() < video_prob:
-                logger.debug(f"[LLMEnhancement] 引用 Bot 自己的视频，按概率拦截（{video_prob}）")
-                result.blocked = True
-                return result
-            if enable_file_parse and has_file and file_prob > 0 and random.random() < file_prob:
-                logger.debug(f"[LLMEnhancement] 引用 Bot 自己的文件，按概率拦截（{file_prob}）")
-                result.blocked = True
-                return result
-            if enable_forward_parse and has_forward and forward_prob > 0 and random.random() < forward_prob:
-                logger.debug(f"[LLMEnhancement] 引用 Bot 自己的转发，按概率拦截（{forward_prob}）")
-                result.blocked = True
-                return result
 
         setattr(req, "_quoted_sender", original_sender_name)
         original_message_chain = original_msg["message"]
@@ -466,6 +523,7 @@ async def parse_reply_context(
         quoted_image_labels: list[str] = []
         quoted_file_names: list[str] = []
         quoted_file_infos: list[str] = []
+        quoted_file_parse_failed = False
         quoted_json_infos: list[str] = []
         quoted_record_texts: list[str] = []
         quoted_record_count = 0
@@ -521,12 +579,14 @@ async def parse_reply_context(
                 if allow_file_name_inject and file_name:
                     quoted_file_names.append(str(file_name))
                 if file_text_inject_len > 0:
+                    file_failure_details: list[str] = []
                     file_infos = await extract_file_infos_from_chain(
                         event=event,
                         chain=[segment],
                         max_chars=file_text_inject_len,
                         max_file_size_mb=file_inject_max_size_mb,
                         cleanup_paths=req._cleanup_paths,
+                        failure_details=file_failure_details,
                     )
                     if not file_infos:
                         logger.debug(
@@ -534,6 +594,8 @@ async def parse_reply_context(
                             f"file={file_name or 'unknown'}, max_chars={file_text_inject_len}, "
                             f"max_file_size_mb={file_inject_max_size_mb}"
                         )
+                        if file_failure_details:
+                            quoted_file_parse_failed = True
                     for fn, excerpt in file_infos[:2]:
                         quoted_file_infos.append(f"{fn}: {excerpt}")
 
@@ -577,6 +639,8 @@ async def parse_reply_context(
                 parts.append(f"当前用户引用了 {quoted_sender} 发送的文件：{'；'.join(quoted_file_names)}。")
             if quoted_file_infos:
                 parts.append(f"被引用文件的内容摘要：{'；'.join(quoted_file_infos[:2])}。")
+            elif quoted_file_parse_failed:
+                parts.append("被引用文件未能成功解析，已跳过内容摘要注入。")
             if quoted_json_infos:
                 parts.append(f"被引用卡片的关键信息：{'；'.join(quoted_json_infos[:2])}。")
             if quoted_record_count:
@@ -606,7 +670,7 @@ async def process_reference_context(
 ) -> ReferenceContextResult:
     """处理引用、JSON、文件上下文注入，不处理转发聊天记录正文。"""
     result = ReferenceContextResult()
-    is_aiocqhttp_event = IS_AIOCQHTTP and isinstance(event, AiocqhttpMessageEvent)
+    is_aiocqhttp_event = isinstance(event, AiocqhttpMessageEvent)
     dynamic_batch_msg_ids = event.get_extra("_llme_dynamic_batch_msg_ids", default=[]) or []
     dynamic_batch_msg_ids = [str(mid).strip() for mid in dynamic_batch_msg_ids if str(mid).strip()]
     if not is_aiocqhttp_event:

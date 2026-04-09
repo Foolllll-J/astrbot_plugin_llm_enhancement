@@ -14,6 +14,7 @@ from .modules.similarity import Similarity
 from .modules.state_manager import StateManager, GroupState, MemberState
 from .modules.forward_parser import process_forward_record_content
 from .modules.reference_parser import (
+    check_self_reply_block,
     process_reference_context,
     inject_current_message_image_context,
     inject_current_message_forward_origin_context,
@@ -145,12 +146,7 @@ from .modules.dialogue_context import (
     inject_context_into_request,
     clear_context_records_for_group,
 )
-try:
-    from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import AiocqhttpMessageEvent
-    IS_AIOCQHTTP = True
-except ImportError:
-    IS_AIOCQHTTP = False
-
+from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import AiocqhttpMessageEvent
 # ==================== 常量定义 ====================
 
 RECENT_RECALL_TTL_SEC = 120.0
@@ -427,8 +423,7 @@ class LLMEnhancement(Star):
         if not raw_message and hasattr(event, "event"):
             raw_message = event.event
         if (
-            IS_AIOCQHTTP
-            and isinstance(event, AiocqhttpMessageEvent)
+            isinstance(event, AiocqhttpMessageEvent)
             and _raw_get(raw_message, "post_type") not in (None, "", "message")
         ):
             raw_post_type = _raw_get(raw_message, "post_type")
@@ -1223,8 +1218,7 @@ class LLMEnhancement(Star):
             raw_post_type = _raw_get(raw, "post_type")
             raw_notice_type = _raw_get(raw, "notice_type")
             if (
-                IS_AIOCQHTTP
-                and isinstance(followup_event, AiocqhttpMessageEvent)
+                isinstance(followup_event, AiocqhttpMessageEvent)
                 and raw_post_type == "notice"
                 and raw_notice_type in {"group_recall", "friend_recall"}
             ):
@@ -1277,7 +1271,7 @@ class LLMEnhancement(Star):
                         else:
                             controller.keep(timeout=min(wait_timeout_sec, remaining_sec), reset_timeout=True)
                 return
-            elif IS_AIOCQHTTP and raw_post_type == "notice":
+            elif raw_post_type == "notice":
                 pass
 
             can_collect, reject_reason = evaluate_followup_collectability(
@@ -1344,7 +1338,7 @@ class LLMEnhancement(Star):
             return []
 
         # 合并结束后做一次协议端校验，兜底撤回事件延迟/丢失。
-        if message_buffer and IS_AIOCQHTTP and isinstance(event, AiocqhttpMessageEvent):
+        if message_buffer and isinstance(event, AiocqhttpMessageEvent):
             validation_before_count = len(message_buffer)
             filtered_buffer, removed_msg_ids = await filter_unavailable_message_buffer(event, message_buffer)
 
@@ -2347,6 +2341,24 @@ class LLMEnhancement(Star):
                 )
                 event.stop_event()
                 return
+            reply_seg_for_self_block = None
+            for seg in all_components:
+                if isinstance(seg, Comp.Reply):
+                    reply_seg_for_self_block = seg
+                    break
+            if reply_seg_for_self_block:
+                blocked_by_self_reply, self_reply_block_reason = await check_self_reply_block(
+                    event=event,
+                    reply_seg=reply_seg_for_self_block,
+                    get_cfg=self._get_cfg,
+                )
+                if blocked_by_self_reply:
+                    logger.debug(
+                        "[LLMEnhancement] on_llm_request 提前拦截：命中引用 Bot 自身内容屏蔽。"
+                        f"group={gid or 'private'}, uid={uid}, reason={self_reply_block_reason}"
+                    )
+                    event.stop_event()
+                    return
             wake, wake_judge_detail = await apply_post_wake_judge_gate(
                 event=event,
                 msg=event.message_str,

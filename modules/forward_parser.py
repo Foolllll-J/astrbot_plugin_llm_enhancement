@@ -15,13 +15,7 @@ from .reference_parser import _segment_is_emoji_image
 from .json_parser import parse_json_segment_data
 from .video_parser import extract_audio_wav, extract_forward_video_keyframes
 
-try:
-    from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import AiocqhttpMessageEvent
-
-    IS_AIOCQHTTP = True
-except ImportError:
-    IS_AIOCQHTTP = False
-
+from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import AiocqhttpMessageEvent
 
 MAX_RECURSION_DEPTH = 5
 FORWARD_PARSE_CACHE_TTL_SEC = 3600
@@ -526,7 +520,7 @@ async def process_forward_record_content(
         return False
     if not bool(get_cfg("forward_parse_enable", True)):
         return False
-    if not (IS_AIOCQHTTP and isinstance(event, AiocqhttpMessageEvent)):
+    if not isinstance(event, AiocqhttpMessageEvent):
         return False
 
     try:

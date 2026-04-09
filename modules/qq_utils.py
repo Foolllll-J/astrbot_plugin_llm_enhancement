@@ -11,12 +11,7 @@ from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent
 import astrbot.api.message_components as Comp
 
-# 检查是否为 aiocqhttp 平台
-try: 
-    from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import AiocqhttpMessageEvent 
-    IS_AIOCQHTTP = True 
-except ImportError: 
-    IS_AIOCQHTTP = False 
+from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import AiocqhttpMessageEvent
 
 try:
     import chinese_calendar as calendar_cn
@@ -660,7 +655,7 @@ async def _inject_group_member_info(
     """将指定 user_id 在当前群中的成员信息按字段注入到 ProviderRequest.prompt。"""
     if not req or not hasattr(req, "prompt"):
         return False
-    if not (IS_AIOCQHTTP and isinstance(event, AiocqhttpMessageEvent)):
+    if not isinstance(event, AiocqhttpMessageEvent):
         return False
 
     target_group_id = str(event.get_group_id() or "").strip()
@@ -715,7 +710,7 @@ async def get_group_members_internal(event: AstrMessageEvent, group_id: Optional
         if not target_group_id: 
             return None 
 
-        if not IS_AIOCQHTTP or not isinstance(event, AiocqhttpMessageEvent):
+        if not isinstance(event, AiocqhttpMessageEvent):
             return None
 
         client = event.bot 
@@ -751,7 +746,7 @@ async def get_group_member_info_internal(
         if not target_group_id or not target_user_id:
             return None
 
-        if not IS_AIOCQHTTP or not isinstance(event, AiocqhttpMessageEvent):
+        if not isinstance(event, AiocqhttpMessageEvent):
             return None
 
         client = event.bot
@@ -784,7 +779,7 @@ async def process_group_members_info(event: AstrMessageEvent, group_id: Optional
             logger.info("用户在非群聊环境中调用群成员查询工具且未提供群号") 
             return json.dumps({"error": "未识别到群聊环境，请提供目标群号。"}) 
         
-        if not IS_AIOCQHTTP or not isinstance(event, AiocqhttpMessageEvent): 
+        if not isinstance(event, AiocqhttpMessageEvent): 
             logger.info(f"不支持的平台: {event.get_platform_name()}") 
             return json.dumps({"error": f"此功能仅支持QQ群聊(aiocqhttp平台)，当前平台为 {event.get_platform_name()}"}) 
 
@@ -838,7 +833,7 @@ async def process_group_member_info(
         if not target_user_id:
             return json.dumps({"error": "请提供目标用户ID(user_id)。"}, ensure_ascii=False)
 
-        if not IS_AIOCQHTTP or not isinstance(event, AiocqhttpMessageEvent):
+        if not isinstance(event, AiocqhttpMessageEvent):
             logger.info(f"不支持的平台: {event.get_platform_name()}")
             return json.dumps(
                 {"error": f"此功能仅支持QQ群聊(aiocqhttp平台)，当前平台为 {event.get_platform_name()}"},
@@ -904,7 +899,7 @@ async def process_user_avatar(event: AstrMessageEvent, user_id: str) -> Any:
     """
     start_time = time.time()
     try:
-        if not IS_AIOCQHTTP or not isinstance(event, AiocqhttpMessageEvent):
+        if not isinstance(event, AiocqhttpMessageEvent):
             return _json_error(f"此功能仅支持 QQ 平台 (aiocqhttp)，当前平台为 {event.get_platform_name()}")
 
         target_user_id = str(user_id or "").strip() or str(event.get_sender_id() or "").strip()
@@ -982,7 +977,7 @@ def _ensure_group_write_context(
     event: AstrMessageEvent,
     group_id: Optional[str] = None,
 ) -> tuple[Optional[str], Optional[str]]:
-    if not IS_AIOCQHTTP or not isinstance(event, AiocqhttpMessageEvent):
+    if not isinstance(event, AiocqhttpMessageEvent):
         return None, _json_error(f"此功能仅支持 QQ 平台 (aiocqhttp)，当前平台为 {event.get_platform_name()}")
     target_group_id = str(group_id or event.get_group_id() or "").strip()
     if not target_group_id:
@@ -1382,7 +1377,7 @@ async def process_contact_list(event: AstrMessageEvent, limit_each: int = 200) -
     """
     start_time = time.time()
     try:
-        if not IS_AIOCQHTTP or not isinstance(event, AiocqhttpMessageEvent):
+        if not isinstance(event, AiocqhttpMessageEvent):
             return _json_error(f"此功能仅支持 QQ 平台 (aiocqhttp)，当前平台为 {event.get_platform_name()}")
 
         safe_limit = max(1, min(int(limit_each or 200), 1000))
@@ -1469,7 +1464,7 @@ async def send_message_logic(
     - chat_type=private 时调用 send_private_msg
     """
     try:
-        if not IS_AIOCQHTTP or not isinstance(event, AiocqhttpMessageEvent):
+        if not isinstance(event, AiocqhttpMessageEvent):
             return _json_error(f"此功能仅支持 QQ 平台 (aiocqhttp)，当前平台为 {event.get_platform_name()}")
 
         normalized_type = str(chat_type or "").strip().lower()
@@ -1530,7 +1525,7 @@ async def get_group_info_internal(
         target_group_id = group_id or event.get_group_id()
         if not target_group_id:
             return None
-        if not IS_AIOCQHTTP or not isinstance(event, AiocqhttpMessageEvent):
+        if not isinstance(event, AiocqhttpMessageEvent):
             return None
 
         client = event.bot
@@ -1565,7 +1560,7 @@ async def process_group_info(
         target_group_id = group_id or event.get_group_id()
         if not target_group_id:
             return json.dumps({"error": "未识别到群聊环境，请提供目标群号。"}, ensure_ascii=False)
-        if not IS_AIOCQHTTP or not isinstance(event, AiocqhttpMessageEvent):
+        if not isinstance(event, AiocqhttpMessageEvent):
             return json.dumps(
                 {"error": f"此功能仅支持QQ群聊(aiocqhttp平台)，当前平台为 {event.get_platform_name()}"},
                 ensure_ascii=False,
@@ -1598,7 +1593,7 @@ async def get_group_notices_internal(event: AstrMessageEvent, group_id: Optional
         target_group_id = group_id or event.get_group_id()
         if not target_group_id:
             return None
-        if not IS_AIOCQHTTP or not isinstance(event, AiocqhttpMessageEvent):
+        if not isinstance(event, AiocqhttpMessageEvent):
             return None
 
         client = event.bot
@@ -1631,7 +1626,7 @@ async def process_group_notices(
         target_group_id = group_id or event.get_group_id()
         if not target_group_id:
             return json.dumps({"error": "未识别到群聊环境，请提供目标群号。"}, ensure_ascii=False)
-        if not IS_AIOCQHTTP or not isinstance(event, AiocqhttpMessageEvent):
+        if not isinstance(event, AiocqhttpMessageEvent):
             return json.dumps(
                 {"error": f"此功能仅支持QQ群聊(aiocqhttp平台)，当前平台为 {event.get_platform_name()}"},
                 ensure_ascii=False,
@@ -1697,7 +1692,7 @@ async def get_group_essence_internal(event: AstrMessageEvent, group_id: Optional
         target_group_id = group_id or event.get_group_id()
         if not target_group_id:
             return None
-        if not IS_AIOCQHTTP or not isinstance(event, AiocqhttpMessageEvent):
+        if not isinstance(event, AiocqhttpMessageEvent):
             return None
 
         client = event.bot
@@ -1730,7 +1725,7 @@ async def process_group_essence(
         target_group_id = group_id or event.get_group_id()
         if not target_group_id:
             return json.dumps({"error": "未识别到群聊环境，请提供目标群号。"}, ensure_ascii=False)
-        if not IS_AIOCQHTTP or not isinstance(event, AiocqhttpMessageEvent):
+        if not isinstance(event, AiocqhttpMessageEvent):
             return json.dumps(
                 {"error": f"此功能仅支持QQ群聊(aiocqhttp平台)，当前平台为 {event.get_platform_name()}"},
                 ensure_ascii=False,
@@ -1783,7 +1778,7 @@ async def get_group_msg_history_internal(
         target_group_id = group_id or event.get_group_id()
         if not target_group_id:
             return None
-        if not IS_AIOCQHTTP or not isinstance(event, AiocqhttpMessageEvent):
+        if not isinstance(event, AiocqhttpMessageEvent):
             return None
 
         page_size = max(1, min(int(count or 50), 50))
@@ -1814,7 +1809,7 @@ async def get_friend_msg_history_internal(
         target_user_id = str(user_id or "").strip()
         if not target_user_id:
             return None
-        if not IS_AIOCQHTTP or not isinstance(event, AiocqhttpMessageEvent):
+        if not isinstance(event, AiocqhttpMessageEvent):
             return None
 
         page_size = max(1, min(int(count or 50), 50))
@@ -1851,7 +1846,7 @@ async def process_group_msg_history(
         target_group_id = group_id or event.get_group_id()
         if not target_group_id:
             return _json_error("未识别到群聊环境，请提供目标群号。")
-        if not IS_AIOCQHTTP or not isinstance(event, AiocqhttpMessageEvent):
+        if not isinstance(event, AiocqhttpMessageEvent):
             return _json_error(
                 f"此功能仅支持QQ群聊(aiocqhttp平台)，当前平台为 {event.get_platform_name()}"
             )
@@ -2022,7 +2017,7 @@ async def process_friend_msg_history(
     """
     start_time = time.time()
     try:
-        if not IS_AIOCQHTTP or not isinstance(event, AiocqhttpMessageEvent):
+        if not isinstance(event, AiocqhttpMessageEvent):
             return _json_error(
                 f"此功能仅支持 QQ 平台 (aiocqhttp)，当前平台为 {event.get_platform_name()}"
             )
@@ -2530,7 +2525,7 @@ async def set_essence_msg_logic(
     enabled_dangerous_tools: Any = None,
 ) -> str:
     try:
-        if not IS_AIOCQHTTP or not isinstance(event, AiocqhttpMessageEvent):
+        if not isinstance(event, AiocqhttpMessageEvent):
             return _json_error(f"此功能仅支持 QQ 平台 (aiocqhttp)，当前平台为 {event.get_platform_name()}")
         target_group_id = str(event.get_group_id() or "").strip()
         if not target_group_id:
@@ -2567,7 +2562,7 @@ async def delete_essence_msg_logic(
     confirm_token: str = "",
 ) -> str:
     try:
-        if not IS_AIOCQHTTP or not isinstance(event, AiocqhttpMessageEvent):
+        if not isinstance(event, AiocqhttpMessageEvent):
             return _json_error(f"此功能仅支持 QQ 平台 (aiocqhttp)，当前平台为 {event.get_platform_name()}")
         target_group_id = str(event.get_group_id() or "").strip()
         if not target_group_id:
@@ -2626,7 +2621,7 @@ async def delete_msg_logic(
 ) -> str:
     """撤回指定消息，默认优先使用传入 message_id，缺省时尝试从引用(reply)解析。"""
     try:
-        if not IS_AIOCQHTTP or not isinstance(event, AiocqhttpMessageEvent):
+        if not isinstance(event, AiocqhttpMessageEvent):
             return _json_error(f"此功能仅支持 QQ 平台 (aiocqhttp)，当前平台为 {event.get_platform_name()}")
 
         target_message_id = str(message_id or "").strip()

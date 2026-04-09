@@ -7,26 +7,18 @@ import tempfile
 import time
 import math
 import json
+import aiohttp
 from pathlib import Path
 from enum import Enum
 from typing import List, Optional, Any, Dict, Tuple
 
-try:
-    import aiohttp
-except ImportError:
-    aiohttp = None
-
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent
-from astrbot.api.provider import LLMResponse, ProviderRequest
+from astrbot.api.provider import ProviderRequest
 import astrbot.api.message_components as Comp
 from .provider_utils import find_provider
 
-try:
-    from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import AiocqhttpMessageEvent
-    IS_AIOCQHTTP = True
-except ImportError:
-    IS_AIOCQHTTP = False
+from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import AiocqhttpMessageEvent
 
 VIDEO_SUMMARY_CACHE_TTL_SEC = 3600
 VIDEO_SUMMARY_CACHE_MAX_SIZE = 100
@@ -176,7 +168,7 @@ async def napcat_resolve_file_url(event: AstrMessageEvent, file_id: str) -> Opti
     """使用 Napcat 接口将文件/视频的 file_id 解析为可下载 URL 或本地路径。"""
     if not (isinstance(file_id, str) and file_id):
         return None
-    if not (IS_AIOCQHTTP and isinstance(event, AiocqhttpMessageEvent)):
+    if not isinstance(event, AiocqhttpMessageEvent):
         return None
     if not (hasattr(event, "bot") and hasattr(event.bot, "api") and hasattr(event.bot.api, "call_action")):
         return None
@@ -236,47 +228,44 @@ async def download_video_to_temp(url: str, size_mb_limit: int) -> Optional[str]:
     max_bytes = size_mb_limit * 1024 * 1024
     
     try:
-        if aiohttp:
-            async with aiohttp.ClientSession() as sess:
-                async with sess.get(url, timeout=30) as resp:
-                    if resp.status != 200: 
-                        logger.warning(f"[VideoFrameProcessor] 下载失败: HTTP {resp.status} (URL: {url})")
-                        return None
-                    
-                    # 检查内容长度
-                    cl = resp.headers.get("Content-Length")
-                    if cl and cl.isdigit() and int(cl) > max_bytes: 
-                        logger.warning(f"[VideoFrameProcessor] 下载终止: 文件过大 ({int(cl)/(1024*1024):.1f}MB > {size_mb_limit}MB)")
-                        return None
-                    
-                    # 根据 Content-Type 决定后缀
-                    content_type = resp.headers.get("Content-Type", "").lower()
-                    if "image/gif" in content_type:
-                        ext = ".gif"
-                    elif "image/" in content_type:
-                        ext = ".jpg"
-                    elif "video/" in content_type:
-                        ext = ".mp4"
-                    else:
-                        ext = ".mp4" # 默认
-                    
-                    # 创建临时文件
-                    tmp = tempfile.NamedTemporaryFile(prefix="llm_media_", suffix=ext, delete=False)
-                    tmp_path = tmp.name
-                    tmp.close()
-                    
-                    total = 0
-                    with open(tmp_path, "wb") as f:
-                        async for chunk in resp.content.iter_chunked(8192):
-                            total += len(chunk)
-                            if total > max_bytes: 
-                                os.remove(tmp_path)
-                                logger.warning(f"[VideoFrameProcessor] 下载终止: 实际下载数据超过限制")
-                                return None
-                            f.write(chunk)
-                    return tmp_path
-        else:
-            logger.error("[VideoFrameProcessor] download_video_to_temp: aiohttp is not installed")
+        async with aiohttp.ClientSession() as sess:
+            async with sess.get(url, timeout=30) as resp:
+                if resp.status != 200: 
+                    logger.warning(f"[VideoFrameProcessor] 下载失败: HTTP {resp.status} (URL: {url})")
+                    return None
+                
+                # 检查内容长度
+                cl = resp.headers.get("Content-Length")
+                if cl and cl.isdigit() and int(cl) > max_bytes: 
+                    logger.warning(f"[VideoFrameProcessor] 下载终止: 文件过大 ({int(cl)/(1024*1024):.1f}MB > {size_mb_limit}MB)")
+                    return None
+                
+                # 根据 Content-Type 决定后缀
+                content_type = resp.headers.get("Content-Type", "").lower()
+                if "image/gif" in content_type:
+                    ext = ".gif"
+                elif "image/" in content_type:
+                    ext = ".jpg"
+                elif "video/" in content_type:
+                    ext = ".mp4"
+                else:
+                    ext = ".mp4" # 默认
+                
+                # 创建临时文件
+                tmp = tempfile.NamedTemporaryFile(prefix="llm_media_", suffix=ext, delete=False)
+                tmp_path = tmp.name
+                tmp.close()
+                
+                total = 0
+                with open(tmp_path, "wb") as f:
+                    async for chunk in resp.content.iter_chunked(8192):
+                        total += len(chunk)
+                        if total > max_bytes: 
+                            os.remove(tmp_path)
+                            logger.warning(f"[VideoFrameProcessor] 下载终止: 实际下载数据超过限制")
+                            return None
+                        f.write(chunk)
+                return tmp_path
     except Exception as e:
         logger.error(f"[VideoFrameProcessor] 下载异常: {e} (URL: {url})")
     return None
@@ -640,10 +629,17 @@ class VideoFrameProcessor:
                 if status == "too_large":
                     self._inject_summary(req, "用户发送/引用了一个视频消息，但是文件太大了，我懒得看（已跳过解析）。", "系统提示", sender_name=sender_name)
                     return True
-                elif status == "too_long":
+                if status == "too_long":
                     self._inject_summary(req, "用户发送/引用了一个视频消息，但是时间太长了，我没耐心看（已跳过解析）。", "系统提示", sender_name=sender_name)
                     return True
-                return False
+                logger.debug(
+                    "[VideoFrameProcessor] 视频解析跳过: status=%s, sender=%s, msg_id=%s",
+                    status,
+                    sender_name or "",
+                    msg_id or "",
+                )
+                self._inject_summary(req, "用户发送/引用了一个视频消息，但未能成功解析（已跳过解析）。", "系统提示", sender_name=sender_name)
+                return True
             
             # 注册清理路径
             if cleanup_paths:
@@ -1153,7 +1149,7 @@ async def _probe_duration_helper(get_cfg, media_path: str) -> float:
 
 
 async def _extract_videos_via_get_msg(event: AstrMessageEvent, msg_ids: List[str]) -> List[str]:
-    if not IS_AIOCQHTTP or not isinstance(event, AiocqhttpMessageEvent):
+    if not isinstance(event, AiocqhttpMessageEvent):
         return []
     if not msg_ids:
         return []
@@ -1183,7 +1179,7 @@ async def _extract_video_sources_with_msg_ids_via_get_msg(
     event: AstrMessageEvent,
     msg_ids: List[str],
 ) -> List[Tuple[str, str]]:
-    if not IS_AIOCQHTTP or not isinstance(event, AiocqhttpMessageEvent):
+    if not isinstance(event, AiocqhttpMessageEvent):
         return []
     if not msg_ids:
         return []
@@ -1336,7 +1332,7 @@ async def process_media_content(
                 )
 
     if not video_sources and reply_seg:
-        if IS_AIOCQHTTP and isinstance(event, AiocqhttpMessageEvent):
+        if isinstance(event, AiocqhttpMessageEvent):
             try:
                 client = event.bot
                 original_msg = await client.api.call_action("get_msg", message_id=reply_seg.id)

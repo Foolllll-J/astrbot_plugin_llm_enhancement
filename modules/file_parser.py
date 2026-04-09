@@ -288,6 +288,7 @@ async def extract_file_infos_from_chain(
     max_chars: int,
     max_file_size_mb: int = FILE_INJECT_MAX_SIZE_MB_DEFAULT,
     cleanup_paths: Optional[list[str]] = None,
+    failure_details: Optional[list[str]] = None,
 ) -> list[tuple[str, str]]:
     """从消息链提取可读文件内容，返回 [(文件名, 摘录内容)]。"""
     if not isinstance(chain, list):
@@ -306,6 +307,11 @@ async def extract_file_infos_from_chain(
         return []
     max_file_size_bytes = max_file_size_mb * 1024 * 1024 if max_file_size_mb > 0 else 0
 
+    if failure_details is None:
+        failure_details = []
+    if not isinstance(failure_details, list):
+        failure_details = []
+
     results: list[tuple[str, str]] = []
     seen: set[str] = set()
     file_seg_count = 0
@@ -316,17 +322,32 @@ async def extract_file_infos_from_chain(
     skip_duplicate = 0
     error_count = 0
 
+    def _record_failure(file_label: str, reason: str) -> None:
+        if not reason:
+            return
+        reason_text = str(reason).strip()
+        if not reason_text:
+            return
+        if not file_label:
+            file_label = "unknown"
+        failure = f"{file_label}: {reason_text}"
+        if failure not in failure_details:
+            failure_details.append(failure)
+
     for seg in chain:
         file_name = ""
         local_path = ""
         download_path = ""
+        seg_file_name = ""
 
         try:
             if isinstance(seg, Comp.File):
                 file_seg_count += 1
                 file_name = str(getattr(seg, "name", "") or "")
+                seg_file_name = file_name
                 if file_name and (not _is_text_file_name(file_name)) and (not _is_pdf_file_name(file_name)):
                     skip_non_text += 1
+                    _record_failure(file_name, "文件类型不支持文本摘要解析")
                     continue
                 download_path = await seg.get_file()
                 local_path = _normalize_local_path(download_path)
@@ -337,13 +358,16 @@ async def extract_file_infos_from_chain(
                 data = seg.get("data") or {}
                 if not isinstance(data, dict):
                     error_count += 1
+                    _record_failure(seg_file_name, "文件段格式异常，无法解析")
                     continue
 
                 file_name = str(
                     data.get("name") or data.get("file_name") or data.get("file") or ""
                 ).strip()
+                seg_file_name = file_name
                 if file_name and (not _is_text_file_name(file_name)) and (not _is_pdf_file_name(file_name)):
                     skip_non_text += 1
+                    _record_failure(file_name, "文件类型不支持文本摘要解析")
                     continue
 
                 local_path = _normalize_local_path(str(data.get("file") or data.get("path") or ""))
@@ -358,11 +382,16 @@ async def extract_file_infos_from_chain(
                         file_comp = Comp.File(name=file_name or "file.bin", url=file_url)
                         download_path = await file_comp.get_file()
                         local_path = _normalize_local_path(download_path)
+                    else:
+                        skip_path_missing += 1
+                        _record_failure(file_name, "未找到可下载链接或本地路径")
+                        continue
             else:
                 continue
 
             if not local_path or not os.path.isfile(local_path):
                 skip_path_missing += 1
+                _record_failure(file_name or seg_file_name, "文件下载失败或本地文件不存在")
                 continue
 
             effective_name = str(file_name or os.path.basename(local_path) or "")
@@ -374,6 +403,10 @@ async def extract_file_infos_from_chain(
                 too_large = file_size > max_file_size_bytes
                 if too_large:
                     skip_too_large += 1
+                    _record_failure(
+                        effective_name,
+                        f"文件过大（{file_size} 字节，超过 {max_file_size_mb}MB 上限）",
+                    )
                     logger.debug(
                         "[LLMEnhancement] 文件超过注入大小上限，跳过文本提取: "
                         f"file={effective_name or os.path.basename(local_path)}, "
@@ -389,10 +422,12 @@ async def extract_file_infos_from_chain(
                 excerpt = _read_text_excerpt(local_path, max_chars)
             else:
                 skip_non_text += 1
+                _record_failure(effective_name, "文件类型不支持文本摘要解析")
                 continue
 
             if not excerpt:
                 skip_empty_excerpt += 1
+                _record_failure(effective_name, "未提取到可用文本摘要")
                 continue
 
             key = f"{effective_name}::{excerpt}"
@@ -405,8 +440,14 @@ async def extract_file_infos_from_chain(
             if cleanup_paths is not None and download_path and os.path.exists(download_path):
                 if download_path not in cleanup_paths:
                     cleanup_paths.append(download_path)
-        except Exception:
+        except Exception as e:
             error_count += 1
+            logger.debug(
+                "[LLMEnhancement] 文件处理异常: file=%s, err=%r",
+                file_name or seg_file_name or "unknown",
+                e,
+            )
+            _record_failure(file_name or seg_file_name or "unknown", "处理文件失败")
             continue
 
     if file_seg_count > 0:

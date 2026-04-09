@@ -10,13 +10,7 @@ from astrbot.api.event import AstrMessageEvent
 
 from .state_manager import GroupState, MemberState
 
-try:
-    from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import AiocqhttpMessageEvent
-
-    IS_AIOCQHTTP = True
-except ImportError:
-    IS_AIOCQHTTP = False
-
+from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import AiocqhttpMessageEvent
 try:
     from astrbot.core.utils.active_event_registry import active_event_registry
 except Exception:
@@ -1099,7 +1093,7 @@ async def is_msg_still_available(event: AstrMessageEvent, msg_id: str) -> bool:
     """最终阶段通过协议端校验消息是否仍可获取（仅 AIOCQHTTP）。"""
     if not msg_id:
         return True
-    if not (IS_AIOCQHTTP and isinstance(event, AiocqhttpMessageEvent)):
+    if not isinstance(event, AiocqhttpMessageEvent):
         return True
 
     client = getattr(event, "bot", None)

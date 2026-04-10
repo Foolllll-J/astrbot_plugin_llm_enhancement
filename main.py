@@ -69,6 +69,7 @@ from .modules.runtime_helpers import (
     looks_like_error_result,
     apply_discarded_response_fallback,
 )
+from .modules.qq_face import build_message_text_with_qq_faces
 from .modules.wake_logic import (
     normalize_concurrency_limit,
     try_acquire_request_concurrency_slot,
@@ -589,6 +590,16 @@ class LLMEnhancement(Star):
         message_chain = []
         if hasattr(event, "message_obj") and hasattr(event.message_obj, "message"):
             message_chain = event.message_obj.message or []
+        enriched_msg = build_message_text_with_qq_faces(
+            message_chain=message_chain,
+            fallback_text=msg,
+            raw_message=getattr(event.message_obj, "raw_message", None),
+        )
+        if enriched_msg and enriched_msg != msg:
+            msg = enriched_msg
+            event.message_str = msg
+            if hasattr(event, "message_obj") and hasattr(event.message_obj, "message_str"):
+                event.message_obj.message_str = msg
         (
             has_image_component,
             has_video_component,

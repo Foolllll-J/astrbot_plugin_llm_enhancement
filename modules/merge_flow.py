@@ -8,6 +8,7 @@ import astrbot.api.message_components as Comp
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent
 
+from .qq_face import build_qq_face_text
 from .state_manager import GroupState, MemberState
 
 from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import AiocqhttpMessageEvent
@@ -85,11 +86,11 @@ def get_event_msg_id(event: AstrMessageEvent) -> Optional[str]:
 
 
 def is_merge_component(seg: Any) -> bool:
-    if isinstance(seg, (Comp.Image, Comp.Forward, Comp.Reply, Comp.Video, Comp.File, Comp.Json, Comp.Record)):
+    if isinstance(seg, (Comp.Image, Comp.Forward, Comp.Reply, Comp.Video, Comp.File, Comp.Json, Comp.Record, Comp.Face)):
         return True
     if isinstance(seg, dict):
         seg_type = str(seg.get("type") or "").lower()
-        return seg_type in {"image", "forward", "reply", "video", "file", "json", "record"}
+        return seg_type in {"image", "forward", "reply", "video", "file", "json", "record", "face"}
     return False
 
 
@@ -102,11 +103,14 @@ def extract_merge_components(event: AstrMessageEvent) -> list[Any]:
 
 def is_message_payload_component(seg: Any) -> bool:
     """是否属于可视为消息载荷的非文本组件。"""
-    if isinstance(seg, (Comp.Image, Comp.Video, Comp.File, Comp.Forward, Comp.Json, Comp.Record)):
+    if isinstance(seg, (Comp.Image, Comp.Video, Comp.File, Comp.Forward, Comp.Json, Comp.Record, Comp.Face)):
         return True
     if isinstance(seg, dict):
         seg_type = str(seg.get("type") or "").lower()
-        return seg_type in {"image", "video", "file", "forward", "json", "record"}
+        if seg_type in {"image", "video", "file", "forward", "json", "record", "face"}:
+            return True
+        qq_face_text = build_qq_face_text(seg)
+        return bool(qq_face_text)
     return False
 
 

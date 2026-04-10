@@ -17,6 +17,7 @@ from .json_parser import (
 )
 from .url_parser import extract_url_infos_from_chain
 from .runtime_helpers import transcribe_record_segment, transcribe_record_from_chain, cleanup_paths_later
+from .qq_face import build_message_text_with_qq_faces, has_qq_face_segment
 
 from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import AiocqhttpMessageEvent
 
@@ -239,6 +240,42 @@ def _extract_chain_image_datas(event: AstrMessageEvent) -> list[dict[str, Any]]:
         if seg_data:
             image_datas.append(seg_data)
     return image_datas
+
+
+def _build_plain_text_from_message_chain(message_chain: Any) -> str:
+    if not isinstance(message_chain, list):
+        return ""
+
+    parts: list[str] = []
+    for segment in message_chain:
+        if not isinstance(segment, dict):
+            continue
+        if str(segment.get("type") or "").strip().lower() != "text":
+            continue
+        data = segment.get("data") or {}
+        if not isinstance(data, dict):
+            continue
+        text = str(data.get("text") or "").strip()
+        if text:
+            parts.append(text)
+    return "".join(parts).strip()
+
+
+def _build_quoted_face_message_text(original_msg: dict[str, Any]) -> str:
+    if not isinstance(original_msg, dict):
+        return ""
+    message_chain = original_msg.get("message")
+    if not isinstance(message_chain, list):
+        return ""
+    if not has_qq_face_segment(message_chain, raw_message=original_msg):
+        return ""
+
+    fallback_text = _build_plain_text_from_message_chain(message_chain)
+    return build_message_text_with_qq_faces(
+        message_chain=message_chain,
+        fallback_text=fallback_text,
+        raw_message=original_msg,
+    )
 
 
 async def inject_current_message_image_context(
@@ -527,6 +564,7 @@ async def parse_reply_context(
         quoted_json_infos: list[str] = []
         quoted_record_texts: list[str] = []
         quoted_record_count = 0
+        quoted_face_text = _build_quoted_face_message_text(original_msg)
 
         if not hasattr(req, "image_urls") or req.image_urls is None:
             req.image_urls = []
@@ -629,9 +667,18 @@ async def parse_reply_context(
                         f"has_key_info={bool(key_info)}, news_count={len(forward_news_texts)}"
                     )
 
-        if quoted_image_labels or quoted_file_names or quoted_file_infos or quoted_json_infos or quoted_record_count:
+        if (
+            quoted_image_labels
+            or quoted_file_names
+            or quoted_file_infos
+            or quoted_json_infos
+            or quoted_record_count
+            or quoted_face_text
+        ):
             quoted_sender = getattr(req, "_quoted_sender", "未知用户")
             parts: list[str] = []
+            if quoted_face_text:
+                parts.append(f"当前用户引用了 {quoted_sender} 发送的消息：{quoted_face_text}。")
             if quoted_image_labels:
                 image_desc = "和".join(quoted_image_labels)
                 parts.append(f"当前用户引用了 {quoted_sender} 发送的{image_desc}。")

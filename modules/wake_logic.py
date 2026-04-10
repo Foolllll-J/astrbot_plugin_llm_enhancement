@@ -8,6 +8,7 @@ from astrbot.api.event import AstrMessageEvent
 import astrbot.api.message_components as Comp
 from astrbot.core import astrbot_config, db_helper, sp
 
+from .qq_face import build_message_text_with_qq_faces, build_qq_face_text, has_qq_face_segment
 from .state_manager import GroupState, MemberState
 
 
@@ -512,6 +513,9 @@ def _clip_text(text: str, limit: int = 120) -> str:
 def _history_segment_to_text(seg: Any) -> str:
     if isinstance(seg, str):
         return seg
+    face_text = build_qq_face_text(seg)
+    if face_text:
+        return face_text
     if not isinstance(seg, dict):
         return ""
     seg_type = str(seg.get("type") or "").strip().lower()
@@ -538,8 +542,6 @@ def _history_segment_to_text(seg: Any) -> str:
     if seg_type == "file":
         name = str(data.get("name") or "").strip()
         return f"[文件:{name}]" if name else "[文件]"
-    if seg_type == "face":
-        return "[表情]"
     if seg_type == "json":
         return "[JSON]"
     if seg_type == "xml":
@@ -556,6 +558,14 @@ def _history_message_to_text(message: Any, raw_message: Any = "") -> str:
             return text
     if isinstance(message, list):
         content = "".join(_history_segment_to_text(seg) for seg in message).strip()
+        if has_qq_face_segment(message, raw_message=raw_message):
+            enriched = build_message_text_with_qq_faces(
+                message_chain=message,
+                fallback_text=content,
+                raw_message=raw_message,
+            )
+            if enriched:
+                return enriched
         if content:
             return content
     if isinstance(raw_message, str):

@@ -1041,6 +1041,30 @@ async def _call_action(
         raise
 
 
+async def show_private_input_status(event: AstrMessageEvent) -> bool:
+    if not isinstance(event, AiocqhttpMessageEvent):
+        return False
+    if event.get_group_id():
+        return False
+    user_id = str(event.get_sender_id() or "").strip()
+    if not user_id:
+        return False
+    try:
+        await _call_action(
+            event,
+            "set_input_status",
+            user_id=user_id,
+            event_type=1,
+        )
+        return True
+    except Exception:
+        logger.debug(
+            f"[LLMEnhancement] 调用私聊输入状态失败: user_id={user_id}",
+            exc_info=True,
+        )
+        return False
+
+
 def _parse_user_id_list(user_ids: Any) -> List[str]:
     if isinstance(user_ids, (list, tuple, set)):
         raw_items = [str(x or "").strip() for x in user_ids]

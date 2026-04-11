@@ -431,6 +431,8 @@ async def check_self_reply_block(
     """检测引用是否为 Bot 自身消息并按概率拦截。返回 (blocked, reason)。"""
     if not isinstance(event, AiocqhttpMessageEvent):
         return False, ""
+    if not event.get_group_id():
+        return False, ""
     if not isinstance(reply_seg, Comp.Reply):
         return False, ""
 
@@ -509,20 +511,32 @@ async def check_self_reply_block(
     except Exception:
         forward_prob = 0.0
 
-    if enable_video_parse and has_video and video_prob > 0 and random.random() < video_prob:
-        reason = f"引用 Bot 自己的视频，按概率拦截（{video_prob}）"
-        logger.debug(f"[LLMEnhancement] {reason}，msg_id={reply_id}")
-        return True, reason
+    if enable_video_parse and has_video and video_prob > 0:
+        video_roll = random.random()
+        if video_roll < video_prob:
+            reason = (
+                f"引用 Bot 自己的视频，按概率拦截"
+                f"（roll={video_roll:.4f}, prob={video_prob:.4f}）"
+            )
+            return True, reason
 
-    if enable_file_parse and has_file and file_prob > 0 and random.random() < file_prob:
-        reason = f"引用 Bot 自身的文件，按概率拦截（{file_prob}）"
-        logger.debug(f"[LLMEnhancement] {reason}，msg_id={reply_id}")
-        return True, reason
+    if enable_file_parse and has_file and file_prob > 0:
+        file_roll = random.random()
+        if file_roll < file_prob:
+            reason = (
+                f"引用 Bot 自身的文件，按概率拦截"
+                f"（roll={file_roll:.4f}, prob={file_prob:.4f}）"
+            )
+            return True, reason
 
-    if enable_forward_parse and has_forward and forward_prob > 0 and random.random() < forward_prob:
-        reason = f"引用 Bot 自身的转发，按概率拦截（{forward_prob}）"
-        logger.debug(f"[LLMEnhancement] {reason}，msg_id={reply_id}")
-        return True, reason
+    if enable_forward_parse and has_forward and forward_prob > 0:
+        forward_roll = random.random()
+        if forward_roll < forward_prob:
+            reason = (
+                f"引用 Bot 自身的转发，按概率拦截"
+                f"（roll={forward_roll:.4f}, prob={forward_prob:.4f}）"
+            )
+            return True, reason
 
     return False, ""
 

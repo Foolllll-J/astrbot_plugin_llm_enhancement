@@ -35,6 +35,7 @@ from .modules.qq_utils import (
     process_friend_msg_history,
     process_group_members_info,
     process_group_member_info,
+    show_private_input_status,
     inject_perception_context_info,
     inject_sender_group_member_info,
     inject_bot_group_member_info,
@@ -152,6 +153,8 @@ from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import Aioc
 
 RECENT_RECALL_TTL_SEC = 120.0
 DYNAMIC_DISCARDED_RESPONSE_TTL_SEC = 300.0
+PRIVATE_TYPING_INDICATOR_INTERVAL_SEC = 0.5
+PRIVATE_TYPING_INDICATOR_TIMEOUT_SEC = 120.0
 
 def _raw_get(raw: Any, key: str, default: Any = None) -> Any:
     """兼容 dict / aiocqhttp Event 的字段读取。"""
@@ -176,6 +179,7 @@ class LLMEnhancement(Star):
         self._active_request_refs: dict[str, int] = {}
         self._active_request_meta: dict[str, tuple[str, str]] = {}
         self._active_request_ts: dict[str, float] = {}
+        self._private_typing_tasks: dict[str, tuple[asyncio.Task, asyncio.Event]] = {}
         self._effective_dialog_history = EffectiveDialogHistory(max_turns=4)
         self._builtin_cmd_matcher = BuiltinCommandMatcher(cache_ttl_sec=60.0)
         self._refresh_config()
@@ -252,6 +256,91 @@ class LLMEnhancement(Star):
         except Exception:
             value = 90
         return max(10, min(600, value))
+
+    def _get_private_typing_task_key(self, event: AstrMessageEvent) -> str:
+        key = str(getattr(event, "unified_msg_origin", "") or "").strip()
+        if key:
+            return key
+        uid = str(event.get_sender_id() or "").strip()
+        return f"private_{uid}" if uid else ""
+
+    def _should_show_private_typing_indicator(self, event: AstrMessageEvent) -> bool:
+        if not isinstance(event, AiocqhttpMessageEvent):
+            return False
+        if event.get_group_id():
+            return False
+        bot = getattr(event, "bot", None)
+        api = getattr(bot, "api", None)
+        return bool(api and hasattr(api, "call_action"))
+
+    async def _show_private_typing_indicator(self, event: AstrMessageEvent) -> bool:
+        if not self._should_show_private_typing_indicator(event):
+            return False
+        return await show_private_input_status(event)
+
+    async def _run_private_typing_indicator_loop(
+        self,
+        task_key: str,
+        event: AstrMessageEvent,
+    ) -> None:
+        task_pair = self._private_typing_tasks.get(task_key)
+        if not task_pair:
+            return
+        _, stop_event = task_pair
+        try:
+            async def loop() -> None:
+                while not stop_event.is_set():
+                    await self._show_private_typing_indicator(event)
+                    try:
+                        await asyncio.wait_for(
+                            stop_event.wait(),
+                            timeout=PRIVATE_TYPING_INDICATOR_INTERVAL_SEC,
+                        )
+                    except asyncio.TimeoutError:
+                        continue
+
+            await asyncio.wait_for(loop(), timeout=PRIVATE_TYPING_INDICATOR_TIMEOUT_SEC)
+        except asyncio.TimeoutError:
+            logger.debug(
+                f"[LLMEnhancement] Private typing indicator task timed out: task_key={task_key}"
+            )
+        finally:
+            stop_event.set()
+            current = self._private_typing_tasks.get(task_key)
+            if current and current[1] is stop_event:
+                self._private_typing_tasks.pop(task_key, None)
+
+    async def _start_private_typing_indicator(self, event: AstrMessageEvent) -> None:
+        if not self._should_show_private_typing_indicator(event):
+            return
+        task_key = self._get_private_typing_task_key(event)
+        if not task_key:
+            return
+        existing = self._private_typing_tasks.get(task_key)
+        if existing and not existing[0].done():
+            return
+        stop_event = asyncio.Event()
+        task = asyncio.create_task(
+            self._run_private_typing_indicator_loop(task_key, event)
+        )
+        self._private_typing_tasks[task_key] = (task, stop_event)
+
+    async def _stop_private_typing_indicator(self, event: AstrMessageEvent) -> None:
+        task_key = self._get_private_typing_task_key(event)
+        if not task_key:
+            return
+        task_pair = self._private_typing_tasks.get(task_key)
+        if not task_pair:
+            return
+        task, stop_event = task_pair
+        stop_event.set()
+        try:
+            await task
+        except Exception:
+            logger.debug(
+                f"[LLMEnhancement] 私聊输入状态任务异常结束: task_key={task_key}",
+                exc_info=True,
+            )
 
     async def _release_concurrency_slot_if_needed(
         self,
@@ -2550,9 +2639,12 @@ class LLMEnhancement(Star):
                     get_cfg=self._get_cfg,
                 )
             )
+            await self._start_private_typing_indicator(event)
             request_forwarded = True
         
         finally:
+            if event.is_stopped():
+                await self._stop_private_typing_indicator(event)
             if not request_forwarded:
                 await self._release_concurrency_slot_if_needed(
                     event, reason="request_blocked_before_provider"
@@ -2714,6 +2806,7 @@ class LLMEnhancement(Star):
                         g.context_bot_last_replied_to_uid = state_uid
 
         finally:
+            await self._stop_private_typing_indicator(event)
             await self._release_concurrency_slot_if_needed(
                 event, reason="llm_response_finished"
             )
@@ -2721,6 +2814,7 @@ class LLMEnhancement(Star):
     @filter.on_decorating_result(priority=95)
     async def on_decorating_result(self, event: AstrMessageEvent):
         """发送前兜底：若结果为空/报错，尝试回退到动态丢弃缓存。"""
+        await self._show_private_typing_indicator(event)
         if not bool(event.get_extra("_llme_pending_last_response_update", default=False)):
             return
 
@@ -2763,6 +2857,7 @@ class LLMEnhancement(Star):
     @filter.after_message_sent(priority=100)
     async def after_message_sent(self, event: AstrMessageEvent):
         """消息实际发送后再更新唤醒延长时间锚点。"""
+        await self._stop_private_typing_indicator(event)
         if not bool(event.get_extra("_llme_pending_last_response_update", default=False)):
             await self._release_concurrency_slot_if_needed(
                 event, reason="after_message_sent_no_pending"
@@ -2844,5 +2939,18 @@ class LLMEnhancement(Star):
         async with self._request_counter_lock:
             self._active_request_refs.clear()
             self._active_request_meta.clear()
+        for task_key in list(self._private_typing_tasks.keys()):
+            task_pair = self._private_typing_tasks.get(task_key)
+            if not task_pair:
+                continue
+            task, stop_event = task_pair
+            stop_event.set()
+            try:
+                await task
+            except Exception:
+                logger.debug(
+                    f"[LLMEnhancement] 私聊输入状态任务异常结束: task_key={task_key}",
+                    exc_info=True,
+                )
         await self.blacklist.terminate()
         logger.info("[LLMEnhancement] 插件已终止")

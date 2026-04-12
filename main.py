@@ -2807,9 +2807,6 @@ class LLMEnhancement(Star):
 
         finally:
             await self._stop_private_typing_indicator(event)
-            await self._release_concurrency_slot_if_needed(
-                event, reason="llm_response_finished"
-            )
 
     @filter.on_decorating_result(priority=95)
     async def on_decorating_result(self, event: AstrMessageEvent):
@@ -2866,6 +2863,9 @@ class LLMEnhancement(Star):
 
         uid: str = event.get_sender_id()
         if not uid:
+            await self._release_concurrency_slot_if_needed(
+                event, reason="after_message_sent_missing_uid"
+            )
             return
         state_uid = str(event.get_extra("_llme_dynamic_state_uid", default=uid) or uid).strip()
         should_clear_discard_cache = bool(event.get_extra("_llme_discard_cache_clear_after_sent", default=False))
@@ -2933,6 +2933,10 @@ class LLMEnhancement(Star):
             "[LLMEnhancement] 已更新唤醒延长锚点："
             f"uid={uid}, state_uid={state_uid}, group={gid or 'private'}, ts={resp_ts:.3f}, "
             f"clear_discard_cache={should_clear_discard_cache}, cleared_recent_wake_count={cleared_recent_wake_count}"
+        )
+
+        await self._release_concurrency_slot_if_needed(
+            event, reason="after_message_sent_finished"
         )
 
     async def terminate(self):

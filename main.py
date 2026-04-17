@@ -56,7 +56,6 @@ from .modules.qq_utils import (
 )
 from .modules.blacklist import BlacklistManager
 from .modules.runtime_helpers import (
-    BuiltinCommandMatcher,
     EffectiveDialogHistory,
     cleanup_paths_later,
     resolve_provider,
@@ -69,6 +68,9 @@ from .modules.runtime_helpers import (
     is_chain_effectively_empty,
     looks_like_error_result,
     apply_discarded_response_fallback,
+    get_blocked_commands,
+    match_blocked_command,
+    
 )
 from .modules.qq_face import build_message_text_with_qq_faces
 from .modules.wake_logic import (
@@ -181,7 +183,6 @@ class LLMEnhancement(Star):
         self._active_request_ts: dict[str, float] = {}
         self._private_typing_tasks: dict[str, tuple[asyncio.Task, asyncio.Event]] = {}
         self._effective_dialog_history = EffectiveDialogHistory(max_turns=4)
-        self._builtin_cmd_matcher = BuiltinCommandMatcher(cache_ttl_sec=60.0)
         self._refresh_config()
         self.sent = Sentiment()
         self.similarity = Similarity()
@@ -201,7 +202,7 @@ class LLMEnhancement(Star):
 
     async def initialize(self):
         await self.blacklist.initialize()
-        await self._builtin_cmd_matcher.refresh_cache(force=True)
+
 
     def _refresh_config(self):
         """将 object 格式的配置平铺到 self.cfg 中"""
@@ -593,12 +594,14 @@ class LLMEnhancement(Star):
                 return
             
         # 2. 内置指令屏蔽
-        if self._get_cfg("block_builtin"):
-            if not event.is_admin():
-                await self._builtin_cmd_matcher.refresh_cache()
-                if self._builtin_cmd_matcher.is_builtin_trigger_event(event) or self._builtin_cmd_matcher.is_builtin_command_text(msg):
-                    event.stop_event()
-                    return
+        blocked_commands = get_blocked_commands(self._get_cfg)
+        if not event.is_admin() and blocked_commands:
+            matched_cmd = match_blocked_command(msg, blocked_commands)
+            if matched_cmd:
+                event.stop_event()
+                return
+
+
 
         # 2.5 并发预检查（不占位，仅在超限时提前跳过唤醒计算）
         merge_cfg = load_merge_runtime_config(self._get_cfg)
@@ -1145,12 +1148,6 @@ class LLMEnhancement(Star):
                             f"roll={prob_roll:.4f}, chance={trigger_chance:.4f}, "
                             f"no_reply={g.prob_wake_no_reply_count}"
                         )
-                else:
-                    logger.debug(
-                        "[LLMEnhancement] 概率唤醒等待累计消息："
-                        f"group={gid}, uid={uid}, pending={pending_count}, threshold={observe_threshold}, "
-                        f"activity={prob_wake_activity:.2f}"
-                    )
 
         event.set_extra("_llme_direct_wake", direct_wake)
         event.set_extra("_llme_wake_reason", reason)

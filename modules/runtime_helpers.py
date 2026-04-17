@@ -11,128 +11,63 @@ from astrbot.api.event import AstrMessageEvent
 import astrbot.api.message_components as Comp
 from astrbot.api.provider import LLMResponse
 from astrbot.core.message.message_event_result import MessageEventResult
-from astrbot.core.star import command_management
 
 from .provider_utils import find_provider
 
-
-FALLBACK_BUILT_CMDS = {
-    "help",
-    "llm",
-    "plugin",
-    "plugin ls",
-    "plugin off",
-    "plugin on",
-    "plugin get",
-    "plugin help",
-    "t2i",
-    "tts",
-    "sid",
-    "op",
-    "deop",
-    "wl",
-    "dwl",
-    "provider",
-    "reset",
-    "stop",
-    "model",
-    "history",
-    "ls",
-    "new",
-    "groupnew",
-    "switch",
-    "rename",
-    "del",
-    "key",
-    "persona",
-    "dashboard_update",
-    "set",
-    "unset",
-    "alter_cmd",
-    "alter",
-}
 
 _RECORD_ASR_CACHE_TTL_SEC = 10 * 60
 _RECORD_ASR_CACHE_MAX_SIZE = 100
 _record_asr_cache: dict[str, dict[str, Any]] = {}
 
 
-class BuiltinCommandMatcher:
-    def __init__(self, cache_ttl_sec: float = 60.0):
-        self._cache_ttl_sec = max(5.0, float(cache_ttl_sec))
-        self._cache: set[str] = set(FALLBACK_BUILT_CMDS)
-        self._cache_ts: float = 0.0
+def normalize_blocked_command_text(text: str) -> str:
+    """标准化阻断命令文本：去边界空白、折叠多空白、转小写。"""
+    return " ".join(str(text or "").strip().lower().split())
 
-    @staticmethod
-    def normalize_text(text: str) -> str:
-        normalized = " ".join(str(text or "").strip().split())
-        if normalized.startswith("/"):
-            normalized = normalized[1:].strip()
-        return normalized.lower()
-
-    async def refresh_cache(self, force: bool = False) -> None:
-        now_ts = time.time()
-        if (not force) and (now_ts - self._cache_ts < self._cache_ttl_sec):
-            return
-        try:
-            commands = await command_management.list_commands()
-            if not isinstance(commands, list):
-                return
-
-            names: set[str] = set()
-
-            def _collect(items: list[Any]) -> None:
-                for item in items:
-                    if not isinstance(item, dict):
-                        continue
-                    if not item.get("reserved") or not item.get("enabled"):
-                        continue
-
-                    effective = (
-                        item.get("effective_command")
-                        or item.get("original_command")
-                        or ""
-                    )
-                    normalized = BuiltinCommandMatcher.normalize_text(str(effective))
-                    if normalized:
-                        names.add(normalized)
-
-                    sub_commands = item.get("sub_commands")
-                    if isinstance(sub_commands, list) and sub_commands:
-                        _collect(sub_commands)
-
-            _collect(commands)
-            self._cache = names
-            self._cache_ts = now_ts
-        except Exception as e:
-            logger.debug(f"[LLMEnhancement] 获取内置指令动态列表失败，沿用缓存/兜底列表: {e}")
-
-    @staticmethod
-    def is_builtin_trigger_event(event: AstrMessageEvent) -> bool:
-        activated_handlers = event.get_extra("activated_handlers", default=[]) or []
-        for handler in activated_handlers:
-            module_path = str(getattr(handler, "handler_module_path", "") or "").strip()
-            if module_path == "astrbot.builtin_stars.builtin_commands.main":
-                return True
+def is_valid_blocked_command_match(text: str, command: str) -> bool:
+    """严格匹配命令（全文一致或命令后跟空格）。"""
+    if not text.startswith(command):
         return False
+    if len(text) == len(command):
+        return True
+    return text[len(command)] == " "
 
-    def is_builtin_command_text(self, msg: str) -> bool:
-        raw = str(msg or "").strip()
-        if not raw:
-            return False
+def normalize_blocked_command_values(commands: Any) -> list[str]:
+    """标准化并去重（保留原顺序）的阻断命令列表。"""
+    normalized: list[str] = []
+    for raw_cmd in commands or []:
+        if not isinstance(raw_cmd, str):
+            continue
+        normalized_cmd = normalize_blocked_command_text(raw_cmd)
+        if normalized_cmd:
+            normalized.append(normalized_cmd)
 
-        normalized = self.normalize_text(raw)
-        if not normalized:
-            return False
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for cmd in normalized:
+        if cmd in seen:
+            continue
+        seen.add(cmd)
+        deduped.append(cmd)
+    return deduped
 
-        candidates: set[str] = {normalized}
-        if raw.startswith("/"):
-            parts = normalized.split()
-            if parts:
-                candidates.add(parts[0])
-            if len(parts) >= 2:
-                candidates.add(f"{parts[0]} {parts[1]}")
-        return any(candidate in self._cache for candidate in candidates)
+def get_blocked_commands(get_cfg: Callable[[str, Any], Any]) -> list[str]:
+    """读取并标准化阻断命令列表配置。"""
+    blocked_commands = get_cfg("blocked_commands")
+    if isinstance(blocked_commands, (list, tuple, set)):
+        return normalize_blocked_command_values(blocked_commands)
+    return []
+
+def match_blocked_command(msg: str, blocked_commands: list[str]) -> str:
+    """返回命中命令；未命中返回空。"""
+    normalized_msg = normalize_blocked_command_text(msg)
+    if not normalized_msg:
+        return ""
+
+    for normalized_cmd in blocked_commands:
+        if is_valid_blocked_command_match(normalized_msg, normalized_cmd):
+            return normalized_cmd
+    return ""
 
 
 class EffectiveDialogHistory:

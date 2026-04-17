@@ -188,11 +188,21 @@
                     "党"
                 ]
             },
-            "block_builtin": {
-                "description": "屏蔽内置指令",
-                "hint": "屏蔽 Astrbot 自带的命令，如 help, tts, llm 等，内置指令被屏蔽后不再会唤醒 Bot。",
-                "type": "bool",
-                "default": false
+                
+            "blocked_commands": {
+                "description": "屏蔽指令",
+                "hint": "屏蔽内置或插件指令，默认仅屏蔽内置指令。",
+                "type": "list",
+                "default": [
+                    "help",
+                    "new",
+                    "reset",
+                    "sid",
+                    "stop",
+                    "set",
+                    "unset",
+                    "dashboard_update"
+                ]
             },
             "require_at_for_wake_prefix": {
                 "description": "唤醒需 @Bot",

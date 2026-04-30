@@ -21,6 +21,7 @@ from .qq_face import build_message_text_with_qq_faces, has_qq_face_segment
 
 from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import AiocqhttpMessageEvent
 
+
 @dataclass
 class ReplyParseResult:
     forward_id: Optional[str]
@@ -62,6 +63,10 @@ async def _fetch_messages_by_ids(
         if isinstance(original_msg, dict) and isinstance(original_msg.get("message"), list):
             messages.append(original_msg)
     return messages
+
+
+def _is_unavailable_get_msg_payload(payload: Any) -> bool:
+    return isinstance(payload, dict) and payload.get("status") == "deleted"
 
 
 def _build_chain(event: AstrMessageEvent, all_components: list[Any]) -> list[Any]:
@@ -455,6 +460,9 @@ async def check_self_reply_block(
         )
         return False, "get_msg_failed"
 
+    if _is_unavailable_get_msg_payload(original_msg):
+        return False, "recalled_original_msg"
+
     if not original_msg or "message" not in original_msg:
         return False, "invalid_original_msg"
 
@@ -555,6 +563,8 @@ async def parse_reply_context(
     try:
         client = event.bot
         original_msg = await client.api.call_action("get_msg", message_id=reply_seg.id)
+        if _is_unavailable_get_msg_payload(original_msg):
+            return result
         if not (original_msg and "message" in original_msg):
             return result
 

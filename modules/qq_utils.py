@@ -33,12 +33,59 @@ INJECTABLE_MEMBER_FIELDS: Dict[str, str] = {
     "role": "群身份",
     "title": "群头衔",
     "area": "地区",
+    "remark": "备注",
+    "signature": "签名",
+    "birthday": "生日",
+    "labels": "标签",
+    "qq_age": "Q龄",
+    "vip_info": "会员信息",
+}
+
+MEMBER_INJECTION_FIELD_WHITELIST = {
+    "user_id",
+    "nickname",
+    "card",
+    "sex",
+    "age",
+    "join_time",
+    "level",
+    "qq_level",
+    "role",
+    "title",
+    "area",
+    "remark",
+    "signature",
+    "birthday",
+    "labels",
+    "qq_age",
+    "vip_info",
+}
+MEMBER_INJECTION_OPTION_ORDER = [
+    "user_id",
+    "nickname",
+    "card",
+    "remark",
+    "sex",
+    "age",
+    "level",
+    "role",
+    "title",
+    "join_time",
+    "birthday",
+    "area",
+    "signature",
+    "labels",
+    "qq_age",
+    "qq_level",
+    "vip_info",
+]
+MEMBER_INJECTION_ORDER_INDEX = {
+    field: idx for idx, field in enumerate(MEMBER_INJECTION_OPTION_ORDER)
 }
 INJECTABLE_PERCEPTION_FIELDS: Dict[str, str] = {
-    "send_time": "发送时间",
+    "send_time": "时间",
     "weekday": "星期",
     "holiday": "节假日",
-    "time_period": "时间段",
     "platform": "平台",
     "chat_type": "会话类型",
     "group_name": "群名",
@@ -379,10 +426,9 @@ def _normalize_perception_injection_fields(raw_fields: Any) -> List[str]:
 
     normalized: List[str] = []
     alias_map = {
-        "发送时间": "send_time",
+        "时间": "send_time",
         "星期": "weekday",
         "节假日": "holiday",
-        "时间段": "time_period",
         "平台": "platform",
         "会话类型": "chat_type",
         "群名": "group_name",
@@ -497,7 +543,8 @@ async def inject_perception_context_info(
     payload: Dict[str, Any] = {}
 
     if "send_time" in selected_fields:
-        payload["send_time"] = now_dt.strftime("%Y-%m-%d %H:%M:%S")
+        time_period = _resolve_time_period_label(now_dt)
+        payload["send_time"] = f"{now_dt.strftime('%Y-%m-%d %H:%M:%S')}({time_period})"
     if "weekday" in selected_fields:
         value = _resolve_weekday_label(now_dt)
         if value:
@@ -506,8 +553,6 @@ async def inject_perception_context_info(
         value = _resolve_holiday_label(now_dt, holiday_country=holiday_country)
         if value:
             payload["holiday"] = value
-    if "time_period" in selected_fields:
-        payload["time_period"] = _resolve_time_period_label(now_dt)
     if "platform" in selected_fields:
         platform_name = str(getattr(event, "get_platform_name", lambda: "")() or "").strip()
         if platform_name:
@@ -525,8 +570,9 @@ async def inject_perception_context_info(
     if not payload:
         return False
 
+    display_order = ["platform", "chat_type", "group_name", "group_id", "send_time", "weekday", "holiday"]
     display_payload: Dict[str, Any] = {}
-    for field in selected_fields:
+    for field in display_order:
         if field in payload:
             display_payload[INJECTABLE_PERCEPTION_FIELDS.get(field, field)] = payload[field]
 
@@ -564,6 +610,13 @@ def _normalize_member_injection_fields(raw_fields: Any) -> List[str]:
         "群头衔": "title",
         "头衔": "title",
         "地区": "area",
+        "备注": "remark",
+        "签名": "signature",
+        "生日": "birthday",
+        "标签": "labels",
+        "q龄": "qq_age",
+        "qq龄": "qq_age",
+        "会员信息": "vip_info",
     }
 
     for item in raw_fields:
@@ -591,7 +644,7 @@ def _is_meaningful_member_value(field: str, value: Any) -> bool:
 
 
 def _format_member_injection_value(field: str, value: Any) -> Any:
-    if field not in {"join_time", "last_sent_time"}:
+    if field not in {"join_time", "last_sent_time", "shut_up_timestamp"}:
         return value
 
     number = _safe_int(value)
@@ -602,6 +655,132 @@ def _format_member_injection_value(field: str, value: Any) -> Any:
         return datetime.fromtimestamp(number).strftime("%Y-%m-%d %H:%M:%S")
     except Exception:
         return value
+
+
+def _format_unix_timestamp(value: Any) -> str:
+    number = _safe_int(value)
+    if number is None or number <= 0:
+        return ""
+    try:
+        return datetime.fromtimestamp(number).strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return ""
+
+
+
+
+def _format_qq_level_badges(level: Any) -> str:
+    """将 QQ 数字等级换算为 皇冠/太阳/月亮/星星 计数。"""
+    n = _safe_int(level)
+    if n is None or n <= 0:
+        return ""
+
+    crowns, rem = divmod(n, 64)
+    suns, rem = divmod(rem, 16)
+    moons, stars = divmod(rem, 4)
+    parts: List[str] = []
+    if crowns > 0:
+        parts.append(f"{crowns}皇冠")
+    if suns > 0:
+        parts.append(f"{suns}太阳")
+    if moons > 0:
+        parts.append(f"{moons}月亮")
+    if stars > 0:
+        parts.append(f"{stars}星星")
+    return "".join(parts)
+
+
+def _compose_member_area(stranger_info: Dict[str, Any]) -> str:
+    country = str(stranger_info.get("country") or "").strip()
+    city = str(stranger_info.get("city") or "").strip()
+    if country and city:
+        return f"{country}-{city}"
+    return country or city
+
+
+def _compose_member_birthday(stranger_info: Dict[str, Any]) -> str:
+    year = _safe_int(stranger_info.get("birthday_year"))
+    month = _safe_int(stranger_info.get("birthday_month"))
+    day = _safe_int(stranger_info.get("birthday_day"))
+    if not year or not month or not day:
+        return ""
+    if year <= 0 or month <= 0 or day <= 0:
+        return ""
+    return f"{year:04d}-{month:02d}-{day:02d}"
+
+
+def _calc_qq_age_from_reg_time(reg_time: Any) -> Optional[int]:
+    ts = _safe_int(reg_time)
+    if ts is None or ts <= 0:
+        return None
+    try:
+        reg_year = datetime.fromtimestamp(ts).year
+        current_year = datetime.now().year
+        if reg_year <= 0 or reg_year > current_year:
+            return None
+        return current_year - reg_year
+    except Exception:
+        return None
+
+
+def _compose_vip_info(stranger_info: Dict[str, Any]) -> str:
+    is_vip = stranger_info.get("is_vip")
+    is_years_vip = stranger_info.get("is_years_vip")
+    vip_level = _safe_int(stranger_info.get("vip_level"))
+    parts: List[str] = []
+    if isinstance(is_vip, bool):
+        parts.append("会员" if is_vip else "非会员")
+    if isinstance(is_years_vip, bool) and is_years_vip:
+        parts.append("年费会员")
+    if vip_level is not None and vip_level > 0:
+        parts.append(f"VIP{vip_level}")
+    return " ".join(parts).strip()
+
+
+def _build_injectable_member_info(member_info: Dict[str, Any], stranger_info: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    merged: Dict[str, Any] = dict(member_info or {})
+    stranger = stranger_info or {}
+
+    qq_level_value = _safe_int(stranger.get("level"))
+    if qq_level_value is None:
+        qq_level_value = _safe_int(stranger.get("qqLevel"))
+    if qq_level_value is None:
+        qq_level_value = _safe_int(merged.get("qq_level"))
+    if qq_level_value is not None and qq_level_value > 0:
+        badges = _format_qq_level_badges(qq_level_value)
+        merged["qq_level"] = f"{qq_level_value}级" + (f"({badges})" if badges else "")
+
+    area = _compose_member_area(stranger)
+    if area:
+        merged["area"] = area
+
+    remark = str(stranger.get("remark") or "").strip()
+    if remark:
+        merged["remark"] = remark
+
+    signature = str(stranger.get("long_nick") or "").strip()
+    if signature:
+        merged["signature"] = signature
+
+    birthday = _compose_member_birthday(stranger)
+    if birthday:
+        merged["birthday"] = birthday
+
+    labels = stranger.get("labels")
+    if isinstance(labels, list):
+        label_text = "、".join(str(x).strip() for x in labels if str(x).strip())
+        if label_text:
+            merged["labels"] = label_text
+
+    qq_age = _calc_qq_age_from_reg_time(stranger.get("reg_time"))
+    if qq_age is not None and qq_age >= 0:
+        merged["qq_age"] = f"{qq_age}年"
+
+    vip_info = _compose_vip_info(stranger)
+    if vip_info:
+        merged["vip_info"] = vip_info
+
+    return merged
 
 
 async def inject_sender_group_member_info(
@@ -680,10 +859,22 @@ async def _inject_group_member_info(
         )
         return False
 
+    stranger_info = await get_stranger_info_internal(
+        event,
+        user_id=target_user_id,
+        no_cache=no_cache,
+    )
+    merged_member_info = _build_injectable_member_info(member_info, stranger_info)
+
+    ordered_fields = sorted(
+        [field for field in selected_fields if field in MEMBER_INJECTION_FIELD_WHITELIST],
+        key=lambda field: MEMBER_INJECTION_ORDER_INDEX.get(field, 10**9),
+    )
+
     payload: Dict[str, Any] = {}
-    for field in selected_fields:
-        if field in member_info:
-            value = member_info[field]
+    for field in ordered_fields:
+        if field in merged_member_info:
+            value = merged_member_info[field]
             if field in {"user_id"}:
                 value = str(value)
             if not _is_meaningful_member_value(field, value):
@@ -765,6 +956,37 @@ async def get_group_member_info_internal(
         return None
     except Exception as e:
         logger.info(f"API调用失败: {e}")
+        return None
+
+
+
+async def get_stranger_info_internal(
+    event: AstrMessageEvent,
+    user_id: Optional[str] = None,
+    no_cache: bool = False,
+) -> Optional[Dict[str, Any]]:
+    """调用 API 获取陌生人信息。"""
+    try:
+        target_user_id = user_id or event.get_sender_id()
+        if not target_user_id:
+            return None
+        if not isinstance(event, AiocqhttpMessageEvent):
+            return None
+
+        client = event.bot
+        params = {
+            "user_id": int(target_user_id),
+            "no_cache": bool(no_cache),
+        }
+        raw_result = await client.api.call_action("get_stranger_info", **params)
+        data = _unwrap_action_data(raw_result)
+        if isinstance(data, dict):
+            return data
+        if isinstance(raw_result, dict) and raw_result.get("user_id") is not None:
+            return raw_result
+        return None
+    except Exception as e:
+        logger.debug(f"get_stranger_info 调用失败: user_id={user_id}, error={e}")
         return None
 
 async def process_group_members_info(event: AstrMessageEvent, group_id: Optional[str] = None) -> str:
@@ -853,16 +1075,36 @@ async def process_group_member_info(
                 ensure_ascii=False,
             )
 
-        if "group_id" in member_info:
-            member_info["group_id"] = str(member_info.get("group_id"))
-        if "user_id" in member_info:
-            member_info["user_id"] = str(member_info.get("user_id"))
+        stranger_info = await get_stranger_info_internal(
+            event,
+            user_id=target_user_id,
+            no_cache=no_cache,
+        )
+        merged_member_info = _build_injectable_member_info(member_info, stranger_info)
+
+        if "group_id" in merged_member_info:
+            merged_member_info["group_id"] = str(merged_member_info.get("group_id"))
+        if "user_id" in merged_member_info:
+            merged_member_info["user_id"] = str(merged_member_info.get("user_id"))
+
+        last_sent_time_raw = _safe_int(member_info.get("last_sent_time"))
+        shut_up_timestamp_raw = _safe_int(member_info.get("shut_up_timestamp"))
+        merged_member_info["last_sent_time"] = (
+            _format_unix_timestamp(last_sent_time_raw) if last_sent_time_raw and last_sent_time_raw > 0 else ""
+        )
+        merged_member_info["shut_up_timestamp"] = (
+            _format_unix_timestamp(shut_up_timestamp_raw) if shut_up_timestamp_raw and shut_up_timestamp_raw > 0 else ""
+        )
 
         result = {
             "group_id": str(target_group_id),
             "user_id": str(target_user_id),
             "no_cache": bool(no_cache),
-            "member": member_info,
+            "member": merged_member_info,
+            "member_timestamps": {
+                "last_sent_time_text": _format_unix_timestamp(last_sent_time_raw),
+                "shut_up_timestamp_text": _format_unix_timestamp(shut_up_timestamp_raw),
+            },
         }
         elapsed_time = time.time() - start_time
         logger.info(f"成功获取群 {target_group_id} 用户 {target_user_id} 的成员详情，耗时 {elapsed_time:.2f}s")
@@ -1039,6 +1281,37 @@ async def _call_action(
         if fallback_method and hasattr(client, fallback_method):
             return await getattr(client, fallback_method)(**params)
         raise
+
+
+async def _is_llbot_backend(event: AstrMessageEvent) -> bool:
+    if not isinstance(event, AiocqhttpMessageEvent):
+        return False
+    client = getattr(event, "bot", None)
+    api = getattr(client, "api", None) if client else None
+    if api is None or not hasattr(api, "call_action"):
+        return False
+
+    cached = getattr(client, "_llm_enhancement_is_llbot", None)
+    if isinstance(cached, bool):
+        return cached
+
+    is_llbot = False
+    try:
+        version_info = await api.call_action("get_version_info")
+        app_name = None
+        if isinstance(version_info, dict):
+            app_name = version_info.get("app_name")
+            if app_name is None and isinstance(version_info.get("data"), dict):
+                app_name = version_info["data"].get("app_name")
+        is_llbot = app_name == "LLOneBot"
+    except Exception:
+        is_llbot = False
+
+    try:
+        setattr(client, "_llm_enhancement_is_llbot", is_llbot)
+    except Exception:
+        pass
+    return is_llbot
 
 
 async def show_private_input_status(event: AstrMessageEvent) -> bool:
@@ -2819,10 +3092,11 @@ async def delete_group_notice_logic(
         if confirm_resp:
             return confirm_resp
 
+        is_llbot = await _is_llbot_backend(event)
         await _call_action(
             event,
-            "_del_group_notice",
-            fallback_method="_del_group_notice",
+            "_delete_group_notice" if is_llbot else "_del_group_notice",
+            fallback_method="_delete_group_notice" if is_llbot else "_del_group_notice",
             group_id=int(target_group_id),
             notice_id=target_notice_id,
         )
@@ -2930,13 +3204,25 @@ async def set_group_kick_members_logic(
         if confirm_resp:
             return confirm_resp
 
-        await _call_action(
-            event,
-            "set_group_kick_members",
-            group_id=str(target_group_id),
-            user_id=users,
-            reject_add_request=_to_bool(reject_add_request, False),
-        )
+        is_llbot = await _is_llbot_backend(event)
+        if is_llbot:
+            llbot_user_ids = [int(uid) for uid in users if str(uid).strip().isdigit()]
+            if not llbot_user_ids:
+                return _json_error("LLBot 批量踢人需要纯数字 user_ids。")
+            await _call_action(
+                event,
+                "batch_delete_group_member",
+                group_id=int(target_group_id),
+                user_ids=llbot_user_ids,
+            )
+        else:
+            await _call_action(
+                event,
+                "set_group_kick_members",
+                group_id=str(target_group_id),
+                user_id=users,
+                reject_add_request=_to_bool(reject_add_request, False),
+            )
         return _json_success(
             "批量踢出群成员操作已执行。",
             group_id=str(target_group_id),

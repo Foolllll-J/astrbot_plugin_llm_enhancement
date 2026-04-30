@@ -508,7 +508,7 @@ def prepare_initial_merge_snapshots(
         deduped_snapshots.append(item)
     preselected_snapshots = deduped_snapshots
     if len(preselected_snapshots) > merge_max_count:
-        preselected_snapshots = preselected_snapshots[-merge_max_count:]
+        preselected_snapshots = preselected_snapshots[:merge_max_count]
 
     for item in preselected_snapshots:
         msg_id = str(item.get("msg_id") or "")
@@ -574,6 +574,8 @@ def remove_recalled_msg_from_member(
         "trigger_replaced": None,
         "marked_cancel": False,
         "inflight_seq": int(member.dynamic_inflight_seq or 0),
+        "remaining_pending": 0,
+        "remaining_dynamic_unresolved": 0,
     }
     if not msg_id:
         return summary
@@ -602,6 +604,8 @@ def remove_recalled_msg_from_member(
         0,
         before_dynamic - len(member.dynamic_unresolved_msgs),
     )
+    summary["remaining_pending"] = len(member.pending_msg_ids)
+    summary["remaining_dynamic_unresolved"] = len(member.dynamic_unresolved_msgs)
 
     summary["trigger_recalled"] = str(member.trigger_msg_id or "") == msg_id
     if summary["trigger_recalled"]:
@@ -617,9 +621,8 @@ def remove_recalled_msg_from_member(
     if (
         member.dynamic_inflight_seq > 0
         and (
-            summary["removed_pending"]
-            or summary["removed_dynamic_unresolved"] > 0
-            or summary["trigger_recalled"]
+            summary["remaining_pending"] <= 0
+            and summary["remaining_dynamic_unresolved"] <= 0
         )
     ):
         member.cancel_merge = True
@@ -682,7 +685,7 @@ def prepare_dynamic_merge_batch(
         selected_snapshots = [current_snapshot]
 
     if len(selected_snapshots) > merge_max_count:
-        selected_snapshots = selected_snapshots[-merge_max_count:]
+        selected_snapshots = selected_snapshots[:merge_max_count]
 
     clear_pending_msg_ids(group_state, member)
     selected_keys: list[str] = []
@@ -847,7 +850,7 @@ def _has_active_follow_up_runner(umo: str) -> bool:
 
 
 def schedule_dynamic_recompute_requeue(
-    event: AstrMessageEvent,
+    source_event: AstrMessageEvent,
     *,
     event_queue: Any,
     owner_uid: str,
@@ -855,15 +858,15 @@ def schedule_dynamic_recompute_requeue(
     delay_sec: float = 0.35,
     max_attempts: int = 2,
 ) -> bool:
-    """Requeue current message event as a fresh event after stop request."""
+    """Requeue a saved message event as a fresh event after stop request."""
     try:
-        attempt = int(event.get_extra("_llme_dynamic_requeue_attempt") or 0)
+        attempt = int(source_event.get_extra("_llme_dynamic_requeue_attempt") or 0)
     except Exception:
         attempt = 0
     if attempt >= max_attempts:
         logger.warning(
             "[LLMEnhancement] 动态软重算重排已达上限，放弃再次入队："
-            f"umo={event.unified_msg_origin}, owner_uid={owner_uid}, inflight_seq={inflight_seq}, "
+            f"umo={source_event.unified_msg_origin}, owner_uid={owner_uid}, inflight_seq={inflight_seq}, "
             f"attempt={attempt}, max_attempts={max_attempts}"
         )
         return False
@@ -871,20 +874,21 @@ def schedule_dynamic_recompute_requeue(
     if event_queue is None or not hasattr(event_queue, "put_nowait"):
         logger.warning(
             "[LLMEnhancement] 动态软重算重排入队失败：事件队列不可用，"
-            f"umo={event.unified_msg_origin}, owner_uid={owner_uid}, inflight_seq={inflight_seq}"
+            f"umo={source_event.unified_msg_origin}, owner_uid={owner_uid}, inflight_seq={inflight_seq}"
         )
         return False
 
     try:
-        replay_event = copy.copy(event)
+        replay_event = copy.copy(source_event)
         # copy.copy(event) 会共享 _result / _extras 等运行态；若原事件随后 stop_event，
         # 重排事件会继承已停止状态，导致框架跳过默认 LLM 请求。
         replay_event._result = None
-        replay_event._extras = dict(event.get_extra(None) or {})
+        replay_event._extras = dict(source_event.get_extra(None) or {})
         replay_event._has_send_oper = False
         replay_event.call_llm = False
         replay_event.is_wake = False
         replay_event.is_at_or_wake_command = False
+        replay_event.set_extra("agent_stop_requested", False)
         replay_event.set_extra("_llme_dynamic_requeue_attempt", attempt + 1)
         replay_event.set_extra("_llme_dynamic_requeued", True)
         replay_event.set_extra("_llme_dynamic_requeue_from_seq", int(inflight_seq))
@@ -895,12 +899,12 @@ def schedule_dynamic_recompute_requeue(
             await asyncio.sleep(max(0.0, float(delay_sec)))
             wait_start = time.time()
             waited_sec = 0.0
-            while _has_active_follow_up_runner(event.unified_msg_origin):
+            while _has_active_follow_up_runner(source_event.unified_msg_origin):
                 waited_sec = time.time() - wait_start
                 if waited_sec >= 2.0:
                     logger.warning(
                         "[LLMEnhancement] 动态软重算重排等待 active runner 退出超时，继续强制入队："
-                        f"umo={event.unified_msg_origin}, owner_uid={owner_uid}, inflight_seq={inflight_seq}, "
+                        f"umo={source_event.unified_msg_origin}, owner_uid={owner_uid}, inflight_seq={inflight_seq}, "
                         f"attempt={attempt + 1}, waited_sec={waited_sec:.2f}"
                     )
                     break
@@ -908,7 +912,7 @@ def schedule_dynamic_recompute_requeue(
             event_queue.put_nowait(replay_event)
             logger.debug(
                 "[LLMEnhancement] 动态软重算消息已重排入队："
-                f"umo={event.unified_msg_origin}, owner_uid={owner_uid}, inflight_seq={inflight_seq}, "
+                f"umo={source_event.unified_msg_origin}, owner_uid={owner_uid}, inflight_seq={inflight_seq}, "
                 f"attempt={attempt + 1}, delay_sec={delay_sec:.2f}, waited_active_runner={waited_sec:.2f}"
             )
 
@@ -980,6 +984,8 @@ async def execute_dynamic_merge(
                 merge_delay=merge_delay,
                 merged_skip_ttl=merged_skip_ttl,
             )
+            member.dynamic_source_event = event
+            member.dynamic_source_event_seq = int(request_seq or 0)
 
             if is_recent_recalled and selected_snapshots:
                 filtered_snapshots: list[Dict[str, Any]] = []
@@ -1057,7 +1063,11 @@ async def execute_dynamic_merge(
     )
 
     if not selected_snapshots:
-        member.cancel_merge = True
+        async with member.lock:
+            member.cancel_merge = True
+            if member.dynamic_source_event_seq == int(request_seq or 0):
+                member.dynamic_source_event = None
+                member.dynamic_source_event_seq = 0
         event.stop_event()
         return {
             "cancelled": True,
@@ -1121,6 +1131,12 @@ async def is_msg_still_available(event: AstrMessageEvent, msg_id: str) -> bool:
             return False
         logger.debug(f"[LLMEnhancement] get_msg 调用异常但按可用处理: msg_id={msg_id}, err={e}")
         return True
+
+    if isinstance(detail, dict):
+        msg_status = detail.get("status")
+        if msg_status == "deleted":
+            logger.debug(f"[LLMEnhancement] get_msg status=deleted，判定消息已撤回: msg_id={msg_id}")
+            return False
 
     if isinstance(detail, dict) and isinstance(detail.get("data"), dict):
         detail = detail["data"]

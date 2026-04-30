@@ -188,7 +188,6 @@
                     "党"
                 ]
             },
-                
             "blocked_commands": {
                 "description": "屏蔽指令",
                 "hint": "屏蔽内置或插件指令，默认仅屏蔽内置指令。",
@@ -199,9 +198,11 @@
                     "reset",
                     "sid",
                     "stop",
+                    "stats",
                     "set",
                     "unset",
-                    "dashboard_update"
+                    "dashboard_update",
+                    "provider"
                 ]
             },
             "require_at_for_wake_prefix": {
@@ -603,17 +604,16 @@
             "perception_injection_fields": {
                 "type": "list",
                 "default": [
-                    "发送时间"
+                    "时间"
                 ],
                 "options": [
-                    "发送时间",
-                    "星期",
-                    "节假日",
-                    "时间段",
                     "平台",
                     "会话类型",
                     "群名",
-                    "群号"
+                    "群号",
+                    "时间",
+                    "星期",
+                    "节假日"
                 ],
                 "description": "环境感知注入字段",
                 "hint": "按需勾选注入给 LLM 的环境信息。留空表示关闭该注入；节假日字段在非节假日时会自动跳过。"
@@ -621,24 +621,29 @@
             "extra_info_injection_fields": {
                 "type": "list",
                 "default": [
+                    "用户ID",
                     "昵称",
                     "群名片",
-                    "群身份",
-                    "群头衔"
+                    "群身份"
                 ],
                 "options": [
                     "用户ID",
                     "昵称",
                     "群名片",
+                    "备注",
                     "性别",
                     "年龄",
-                    "入群时间",
-                    "最后发言时间",
                     "群等级",
-                    "QQ等级",
                     "群身份",
                     "群头衔",
-                    "地区"
+                    "入群时间",
+                    "生日",
+                    "地区",
+                    "签名",
+                    "标签",
+                    "Q龄",
+                    "QQ等级",
+                    "会员信息"
                 ],
                 "description": "发送者信息注入字段",
                 "hint": "按需勾选要注入给 LLM 的字段。留空表示关闭该注入。仅 (aiocqhttp) 群聊生效。"

@@ -22,6 +22,10 @@ _context_image_caption_cache: dict[str, dict[str, Any]] = {}
 _context_image_caption_semaphore = asyncio.Semaphore(3)
 
 
+def _is_unavailable_get_msg_payload(payload: Any) -> bool:
+    return isinstance(payload, dict) and payload.get("status") == "deleted"
+
+
 def is_context_injection_enabled(get_cfg: Any) -> bool:
     mode = str(get_cfg("context_injection_mode", "off") or "off").strip().lower()
     return mode in {"before_active_only", "before_all_wake"}
@@ -733,6 +737,8 @@ async def try_build_reply_preview(event: Any, reply_msg_id: str) -> str:
         if api is None:
             return ""
         original_msg = await api.call_action("get_msg", message_id=rid)
+        if _is_unavailable_get_msg_payload(original_msg):
+            return ""
         if not isinstance(original_msg, dict):
             return ""
         sender = original_msg.get("sender", {}) or {}
@@ -1097,6 +1103,68 @@ def _is_active_wake_reason(wake_reason: str) -> bool:
         "动态重排跟进",
     )
     return any(m in reason for m in active_markers)
+
+
+def _classify_active_wake_reason(wake_reason: str) -> str:
+    reason = str(wake_reason or "").strip()
+    if reason.startswith("提及唤醒"):
+        return "mention"
+    if "话题相关" in reason:
+        return "relevant"
+    if reason.startswith("答疑唤醒"):
+        return "ask"
+    if reason.startswith("无聊唤醒"):
+        return "bored"
+    if reason.startswith("概率唤醒"):
+        return "prob"
+    return ""
+
+
+def build_active_wake_prompt_note(
+    *,
+    direct_wake: bool,
+    wake_reason: str,
+) -> str:
+    if direct_wake:
+        return ""
+    wake_type = _classify_active_wake_reason(wake_reason)
+    if not wake_type:
+        return ""
+
+    reason_map = {
+        "mention": "当前内容属于对你的间接提及，提及了你的代称或与你相关的内容。",
+        "relevant": "当前用户所发内容与当前话题相关，你基于话题相关性主动接话；请自然承接上下文。",
+        "ask": "有用户在求解答，你决定主动为其解答或回复。",
+        "bored": "有用户表示无聊，你决定活跃下气氛。",
+        "prob": "你作为对话的旁听者，决定自然地参与他人正在进行中的对话。",
+    }
+    note_body = reason_map.get(wake_type, "").strip()
+    if not note_body:
+        return ""
+
+    return (
+        "\n\n[主动唤醒说明]\n"
+        "本次回复属于主动参与，用户未显式@你。\n"
+        f"{note_body}"
+    )
+
+
+def inject_active_wake_note_into_request(
+    *,
+    req: Any,
+    direct_wake: bool,
+    wake_reason: str,
+) -> tuple[bool, str, str]:
+    block = build_active_wake_prompt_note(
+        direct_wake=direct_wake,
+        wake_reason=wake_reason,
+    ).strip()
+    if not block:
+        return False, "skip:not_active_wake", ""
+
+    wake_type = _classify_active_wake_reason(wake_reason) or "other"
+    req.prompt = f"{(req.prompt or '').strip()}\n\n{block}".strip()
+    return True, f"active_wake:{wake_type}", block
 
 
 def should_inject_context(

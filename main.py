@@ -147,6 +147,7 @@ from .modules.dialogue_context import (
     build_context_text,
     append_group_context_message,
     append_notice_context_from_raw,
+    inject_active_wake_note_into_request,
     inject_context_into_request,
     clear_context_records_for_group,
 )
@@ -422,6 +423,7 @@ class LLMEnhancement(Star):
 
     async def _apply_recall_to_group_state(
         self,
+        notice_event: AstrMessageEvent,
         group_state: GroupState,
         recalled_msg_id: str,
         group_scope: str,
@@ -442,6 +444,7 @@ class LLMEnhancement(Star):
                     candidate_members.append(m)
 
         for m in candidate_members:
+            requeue_plan: dict[str, Any] | None = None
             async with m.lock:
                 if not member_contains_msg_id(m, recalled_msg_id):
                     continue
@@ -455,6 +458,30 @@ class LLMEnhancement(Star):
                         m.dynamic_discard_before_seq,
                         int(m.dynamic_inflight_seq),
                     )
+                elif (
+                    int(m.dynamic_inflight_seq or 0) > 0
+                    and (
+                        bool(summary.get("removed_pending"))
+                        or int(summary.get("removed_dynamic_unresolved") or 0) > 0
+                        or bool(summary.get("trigger_recalled"))
+                    )
+                    and (
+                        int(summary.get("remaining_pending") or 0) > 0
+                        or int(summary.get("remaining_dynamic_unresolved") or 0) > 0
+                    )
+                ):
+                    inflight_seq = int(m.dynamic_inflight_seq or 0)
+                    source_event = (
+                        m.dynamic_source_event
+                        if int(m.dynamic_source_event_seq or 0) == inflight_seq
+                        else None
+                    )
+                    if source_event is not None:
+                        requeue_plan = {
+                            "uid": str(m.uid),
+                            "inflight_seq": inflight_seq,
+                            "source_event": source_event,
+                        }
                 hit = True
                 logger.info(
                     "[LLMEnhancement] 撤回命中动态/合并状态："
@@ -463,6 +490,40 @@ class LLMEnhancement(Star):
                     f"removed_dynamic={summary.get('removed_dynamic_unresolved')}, "
                     f"marked_cancel={summary.get('marked_cancel')}, inflight_seq={summary.get('inflight_seq')}"
                 )
+            if requeue_plan:
+                stop_requested = request_dynamic_recompute_stop(
+                    notice_event,
+                    inflight_seq=int(requeue_plan["inflight_seq"]),
+                    owner_uid=str(requeue_plan["uid"]),
+                )
+                event_queue = self.context.get_event_queue() if hasattr(self.context, "get_event_queue") else None
+                requeued = schedule_dynamic_recompute_requeue(
+                    source_event=requeue_plan["source_event"],
+                    event_queue=event_queue,
+                    owner_uid=str(requeue_plan["uid"]),
+                    inflight_seq=int(requeue_plan["inflight_seq"]),
+                )
+                if requeued:
+                    async with m.lock:
+                        m.dynamic_discard_before_seq = max(
+                            int(m.dynamic_discard_before_seq or 0),
+                            int(requeue_plan["inflight_seq"]),
+                        )
+                        m.dynamic_requeue_pending_seq = max(
+                            int(m.dynamic_requeue_pending_seq or 0),
+                            int(requeue_plan["inflight_seq"]),
+                        )
+                    logger.info(
+                        "[LLMEnhancement] 撤回命中后已安排动态重算："
+                        f"group={group_scope}, uid={requeue_plan['uid']}, msg_id={recalled_msg_id}, "
+                        f"inflight_seq={int(requeue_plan['inflight_seq'])}, stop_requested={stop_requested}"
+                    )
+                else:
+                    logger.warning(
+                        "[LLMEnhancement] 撤回命中但动态重算重排失败，将退回旧响应兜底逻辑："
+                        f"group={group_scope}, uid={requeue_plan['uid']}, msg_id={recalled_msg_id}, "
+                        f"inflight_seq={int(requeue_plan['inflight_seq'])}, stop_requested={stop_requested}"
+                    )
         return hit
 
     async def _handle_recall_notice(
@@ -488,12 +549,12 @@ class LLMEnhancement(Star):
             gs = StateManager.get_group_if_exists(scope)
             if not gs:
                 continue
-            if await self._apply_recall_to_group_state(gs, recalled_msg_id, scope, notice_type):
+            if await self._apply_recall_to_group_state(event, gs, recalled_msg_id, scope, notice_type):
                 processed = True
 
         if not processed:
             for scope, gs in list(StateManager.iter_groups_items()):
-                if await self._apply_recall_to_group_state(gs, recalled_msg_id, scope, notice_type):
+                if await self._apply_recall_to_group_state(event, gs, recalled_msg_id, scope, notice_type):
                     processed = True
                     break
 
@@ -1007,6 +1068,11 @@ class LLMEnhancement(Star):
                             "max_count_reached",
                         }
                     ):
+                        logger.debug(
+                            "[LLMEnhancement] 动态软重算忽略后续消息："
+                            f"group={gid or 'private'}, owner_uid={target_uid}, incoming_uid={uid}, "
+                            f"reason={recompute_decision.reason}, max_count={merge_cfg.max_count}"
+                        )
                         return
                     inflight_seq = int(recompute_decision.inflight_seq or 0)
                     if recompute_decision.accepted and inflight_seq > 0:
@@ -1017,7 +1083,7 @@ class LLMEnhancement(Star):
                         )
                         if stop_requested > 0:
                             requeued = schedule_dynamic_recompute_requeue(
-                                event,
+                                source_event=event,
                                 event_queue=self.context.get_event_queue(),
                                 owner_uid=str(target_uid),
                                 inflight_seq=inflight_seq,
@@ -1180,6 +1246,11 @@ class LLMEnhancement(Star):
                             "max_count_reached",
                         }
                     ):
+                        logger.debug(
+                            "[LLMEnhancement] 动态软重算忽略后续消息："
+                            f"group={gid or 'private'}, owner_uid={target_uid}, incoming_uid={uid}, "
+                            f"reason={recompute_decision.reason}, max_count={merge_cfg.max_count}"
+                        )
                         return
                     inflight_seq = int(recompute_decision.inflight_seq or 0)
                     if recompute_decision.accepted and inflight_seq > 0:
@@ -1190,7 +1261,7 @@ class LLMEnhancement(Star):
                         )
                         if stop_requested > 0:
                             requeued = schedule_dynamic_recompute_requeue(
-                                event,
+                                source_event=event,
                                 event_queue=self.context.get_event_queue(),
                                 owner_uid=str(target_uid),
                                 inflight_seq=inflight_seq,
@@ -1528,7 +1599,8 @@ class LLMEnhancement(Star):
         logger.debug(
             "[LLMEnhancement] 动态合并批次详情："
             f"uid={uid}, group={gid or 'private'}, request_seq={int(result.get('request_seq') or 0)}, "
-            f"batch_keys={result.get('selected_keys', [])}"
+            f"batch_keys={result.get('selected_keys', [])}, "
+            f"selected_msg_ids={result.get('selected_msg_ids', [])}"
         )
         return result.get("additional_components", [])
 
@@ -1608,8 +1680,7 @@ class LLMEnhancement(Star):
     @filter.llm_tool(name="get_user_avatar")
     async def get_user_avatar(self, event: AstrMessageEvent, user_id: str = "") -> Any:
         """
-        获取指定 QQ 用户的头像并将其作为图片附件注入到当前对话中。
-        当你需要识别、描述某个人头像特征，或者用户明确要求“看看某人的头像”时使用。
+        获取指定 QQ 用户的头像。
 
         Args:
             user_id (str, optional): 目标用户的 QQ 号。若目标就是当前对话者，可不提供；留空时默认使用当前消息发送者的 ID。
@@ -1620,12 +1691,6 @@ class LLMEnhancement(Star):
     async def get_group_members(self, event: AstrMessageEvent, group_id: str = None) -> str:
         """
         获取指定 QQ 群的成员列表。
-        当需要了解群成员构成、获取成员昵称/ID、统计人数或确认某人是否在群内时调用。
-        返回数据包含：
-        - user_id: QQ 号
-        - nickname: 账户昵称
-        - card: 群名片/备注
-        - role: 权限角色 (owner/admin/member)
 
         Args:
             group_id (str, optional): 目标 QQ 群号。在私聊使用时必填，在群聊使用时可选（默认当前群）。
@@ -1642,7 +1707,6 @@ class LLMEnhancement(Star):
     ) -> str:
         """
         获取指定 QQ 群成员详情。
-        适合用于确认某个成员的身份信息、群身份、群头衔、群名片等。
 
         Args:
             group_id (str, optional): 目标群号。在私聊使用时必填，在群聊使用时可选（默认当前群）。
@@ -1659,7 +1723,7 @@ class LLMEnhancement(Star):
     @filter.llm_tool(name="get_group_info")
     async def get_group_info(self, event: AstrMessageEvent, group_id: str = None, no_cache: bool = False) -> str:
         """
-        获取指定 QQ 群的群信息（群名、人数等）。
+        获取指定 QQ 群的群信息。
 
         Args:
             group_id (str, optional): 目标群号。在私聊使用时必填，在群聊使用时可选（默认当前群）。
@@ -1692,7 +1756,7 @@ class LLMEnhancement(Star):
     @filter.llm_tool(name="get_contact_list")
     async def get_contact_list(self, event: AstrMessageEvent, limit_each: int = 200) -> str:
         """
-        查看通讯录：同时返回群列表与好友列表。
+        查看自身 QQ 的通讯录。
 
         Args:
             limit_each (int, optional): 群列表和好友列表各自返回上限，默认 200，最大 1000。
@@ -1742,8 +1806,7 @@ class LLMEnhancement(Star):
         time_range: str = "",
     ) -> str:
         """
-        获取历史消息（群聊/私聊），支持关键词搜索与时间范围过滤。
-        仅在用户明确要求需查历史消息时调用，避免无关上下文扩张。
+        获取指定会话的历史消息，支持关键词搜索与时间范围过滤。
 
         Args:
             chat_type (str): 查询类型。仅支持 group 或 private。
@@ -1790,8 +1853,7 @@ class LLMEnhancement(Star):
         group_id: str = None,
     ) -> str:
         """
-        在群聊中禁言或解除禁言某位成员。
-        支持在群聊中直接使用，或在私聊中指定 group_id 使用，由你根据请求者身份与上下文判断是否应执行。
+        禁言或解除禁言某位群成员。
         
         Args:
             user_id (str, optional): 目标用户的 QQ 号。若操作对象就是当前对话者，可不提供；留空时默认使用当前消息发送者的 ID。
@@ -2068,7 +2130,7 @@ class LLMEnhancement(Star):
     @filter.llm_tool(name="dismiss_group")
     async def dismiss_group(self, event: AstrMessageEvent, group_id: str = None, confirm_token: str = "") -> str:
         """
-        解散群聊（高风险操作）。
+        解散群聊。
 
         Args:
             group_id (str, optional): 目标群号。在私聊使用时必填，在群聊使用时可选（默认当前群）。
@@ -2124,9 +2186,8 @@ class LLMEnhancement(Star):
         reason: str = "",
     ) -> str:
         """
-        将指定用户加入黑名单，加入后将忽略对方消息，由你根据请求者身份与上下文判断是否应执行。
+        将指定用户加入黑名单，加入后将忽略对方消息。
         该工具既可用于拉黑，也可用于“未来一段时间不再与该用户对话”的短时策略。
-        这是黑名单语义，不是禁言/解禁语义；请避免使用“解封/解禁”等措辞。
 
         Args:
             user_id (str, optional): 目标用户 ID。若拉黑对象就是当前对话者，可不提供；留空时会默认使用当前消息发送者的 ID。
@@ -2145,8 +2206,7 @@ class LLMEnhancement(Star):
     @filter.llm_tool(name="unblock_user")
     async def unblock_user(self, event: AstrMessageEvent, user_id: str) -> str:
         """
-        将指定用户从黑名单中移除，即将其解除拉黑可重新与其对话，由你根据请求者身份与上下文判断是否应执行。
-        请将结果表述为“解除拉黑”，不要使用“解封/解禁”。
+        将指定用户从黑名单中移除，即将其解除拉黑可重新与其对话。
 
         Args:
             user_id (str): 目标用户 ID。
@@ -2158,7 +2218,6 @@ class LLMEnhancement(Star):
         """
         获取黑名单列表（分页）。
         返回中的 expire_time 表示该用户黑名单失效时间，失效后会自动移出黑名单，可重新与其进行对话。
-        这是黑名单语义，不是封禁语义。
 
         Args:
             page (int, optional): 页码，从 1 开始。
@@ -2171,7 +2230,6 @@ class LLMEnhancement(Star):
         """
         查询用户是否在黑名单中，即是否被拉黑。
         若返回 expire_time，表示黑名单失效时间，失效后会自动移出黑名单，可重新与其进行对话。
-        这是黑名单语义，不是封禁语义。
 
         Args:
             user_id (str): 目标用户 ID。
@@ -2542,6 +2600,11 @@ class LLMEnhancement(Star):
                 direct_wake=direct_wake,
                 wake_reason=wake_reason,
             )
+            active_wake_note_injected, active_wake_note_detail, _active_wake_note_block = inject_active_wake_note_into_request(
+                req=req,
+                direct_wake=direct_wake,
+                wake_reason=wake_reason,
+            )
             if injected_context:
                 logger.debug(
                     "[LLMEnhancement][ContextInjection] 已注入上下文："
@@ -2655,6 +2718,9 @@ class LLMEnhancement(Star):
                         if merge_member.dynamic_inflight_seq == dynamic_req_seq:
                             merge_member.dynamic_inflight_seq = 0
                             reset_dynamic_capture_session(merge_member)
+                        if int(merge_member.dynamic_source_event_seq or 0) == dynamic_req_seq:
+                            merge_member.dynamic_source_event = None
+                            merge_member.dynamic_source_event_seq = 0
                         if g.dynamic_owner_uid == state_uid:
                             g.dynamic_owner_uid = None
                     clear_pending_msg_ids(g, merge_member)
@@ -2699,6 +2765,7 @@ class LLMEnhancement(Star):
                     should_drop = False
                     cache_stored = False
                     next_inflight_seq = 0
+                    pending_requeue_seq = 0
                     async with member.lock:
                         if dynamic_req_seq <= member.dynamic_discard_before_seq:
                             should_drop = True
@@ -2708,18 +2775,23 @@ class LLMEnhancement(Star):
                         if member.dynamic_inflight_seq == dynamic_req_seq:
                             member.dynamic_inflight_seq = 0
                             reset_dynamic_capture_session(member)
+                        if int(member.dynamic_source_event_seq or 0) == dynamic_req_seq:
+                            member.dynamic_source_event = None
+                            member.dynamic_source_event_seq = 0
                         if g.dynamic_owner_uid == state_uid:
                             g.dynamic_owner_uid = None
                         next_inflight_seq = int(member.dynamic_inflight_seq or 0)
+                        pending_requeue_seq = int(member.dynamic_requeue_pending_seq or 0)
 
                     if should_drop:
                         has_newer_inflight = next_inflight_seq > dynamic_req_seq
-                        if has_newer_inflight:
+                        has_pending_requeue = pending_requeue_seq >= dynamic_req_seq
+                        if has_newer_inflight or has_pending_requeue:
                             logger.debug(
                                 "[LLMEnhancement] 动态合并放弃上次请求响应："
                                 f"uid={state_uid}, sender_uid={uid}, group={gid or 'private'}, response_seq={dynamic_req_seq}, "
                                 f"discard_before_seq={member.dynamic_discard_before_seq}, cache_stored={cache_stored}, "
-                                f"next_inflight_seq={next_inflight_seq}"
+                                f"next_inflight_seq={next_inflight_seq}, pending_requeue_seq={pending_requeue_seq}"
                             )
                             clear_pending_msg_ids(g, member)
                             member.cancel_merge = False

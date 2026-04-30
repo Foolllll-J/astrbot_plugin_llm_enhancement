@@ -84,6 +84,11 @@ def is_gif_file(path: str) -> bool:
         
     return False
 
+
+def _is_unavailable_get_msg_payload(payload: Any) -> bool:
+    return isinstance(payload, dict) and payload.get("status") == "deleted"
+
+
 def extract_videos_from_chain(chain: List[object]) -> List[str]:
     """从消息链中递归提取视频相关 URL / 路径。"""
     videos: List[str] = []
@@ -1162,6 +1167,8 @@ async def _extract_videos_via_get_msg(event: AstrMessageEvent, msg_ids: List[str
     for msg_id in msg_ids:
         try:
             original_msg = await client.api.call_action("get_msg", message_id=msg_id)
+            if _is_unavailable_get_msg_payload(original_msg):
+                continue
             if original_msg and "message" in original_msg:
                 extracted = extract_videos_from_chain(original_msg["message"])
                 if extracted:
@@ -1196,6 +1203,8 @@ async def _extract_video_sources_with_msg_ids_via_get_msg(
             continue
         try:
             original_msg = await client.api.call_action("get_msg", message_id=normalized_msg_id)
+            if _is_unavailable_get_msg_payload(original_msg):
+                continue
             if original_msg and "message" in original_msg:
                 extracted = extract_videos_from_chain(original_msg["message"])
                 for source in extracted:
@@ -1336,6 +1345,8 @@ async def process_media_content(
             try:
                 client = event.bot
                 original_msg = await client.api.call_action("get_msg", message_id=reply_seg.id)
+                if _is_unavailable_get_msg_payload(original_msg):
+                    original_msg = None
                 if original_msg and "message" in original_msg:
                     video_sources = extract_videos_from_chain(original_msg["message"])
             except Exception:

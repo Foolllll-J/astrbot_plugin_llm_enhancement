@@ -23,6 +23,10 @@ class MemberState(BaseModel):
     dynamic_discarded_response_cache: dict[str, Any] = Field(default_factory=dict)  # 动态合并被丢弃响应缓存
     dynamic_capture_count: int = 0                          # 动态会话已接收（去重后）消息数量
 
+    dynamic_source_event: Any = None
+    dynamic_source_event_seq: int = 0
+    dynamic_requeue_pending_seq: int = 0
+
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
 

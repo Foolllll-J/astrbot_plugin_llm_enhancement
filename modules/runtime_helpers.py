@@ -10,6 +10,8 @@ from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent
 import astrbot.api.message_components as Comp
 from astrbot.api.provider import LLMResponse
+from astrbot.core.agent.message import TextPart
+from astrbot.core.config.default import VERSION as ASTRBOT_VERSION
 from astrbot.core.message.message_event_result import MessageEventResult
 
 from .provider_utils import find_provider
@@ -18,6 +20,66 @@ from .provider_utils import find_provider
 _RECORD_ASR_CACHE_TTL_SEC = 10 * 60
 _RECORD_ASR_CACHE_MAX_SIZE = 100
 _record_asr_cache: dict[str, dict[str, Any]] = {}
+
+
+def _parse_version_tuple(version_text: str) -> tuple[int, ...]:
+    normalized = str(version_text or "").strip().lower()
+    if normalized.startswith("v"):
+        normalized = normalized[1:]
+    parts: list[int] = []
+    for chunk in normalized.split("."):
+        digits = ""
+        for ch in chunk:
+            if ch.isdigit():
+                digits += ch
+            else:
+                break
+        if not digits:
+            break
+        parts.append(int(digits))
+    return tuple(parts)
+
+
+def is_astrbot_version_at_least(version_text: str) -> bool:
+    current = _parse_version_tuple(ASTRBOT_VERSION)
+    target = _parse_version_tuple(version_text)
+    if not target:
+        return False
+    max_len = max(len(current), len(target))
+    current_padded = current + (0,) * (max_len - len(current))
+    target_padded = target + (0,) * (max_len - len(target))
+    return current_padded >= target_padded
+
+
+def supports_extra_user_content_parts() -> bool:
+    return is_astrbot_version_at_least("4.24.0")
+
+
+def append_text_part_to_request(
+    req: Any,
+    text: str,
+    *,
+    mark_temp: bool = False,
+) -> bool:
+    if not supports_extra_user_content_parts():
+        return False
+
+    normalized = str(text or "").strip()
+    if not normalized:
+        return False
+
+    parts = getattr(req, "extra_user_content_parts", None)
+    if parts is None:
+        parts = []
+        setattr(req, "extra_user_content_parts", parts)
+    if not isinstance(parts, list):
+        return False
+
+    part = TextPart(text=normalized)
+    if mark_temp:
+        part = part.mark_as_temp()
+    parts.append(part)
+    return True
 
 
 def normalize_blocked_command_text(text: str) -> str:

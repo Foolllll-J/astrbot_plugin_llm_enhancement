@@ -14,7 +14,7 @@ import aiosqlite
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent
 import astrbot.api.message_components as Comp
-from .qq_utils import validate_write_permission, is_tool_admin_required
+from .qq_utils import validate_write_permission, is_tool_admin_required, _parse_user_id_list
 
 try:
     from PIL import Image, ImageDraw, ImageFont
@@ -750,55 +750,49 @@ class BlacklistManager:
     async def tool_block_user(
         self,
         event: AstrMessageEvent,
-        user_id: str = "",
+        user_ids: str = "",
         user_name: str = "",
         duration: int = 0,
         reason: str = "",
     ) -> str:
         await self._cleanup_expired_on_query()
 
+        user_id_list = _parse_user_id_list(user_ids)
+        if not user_id_list:
+            return json.dumps(
+                {"success": False, "message": "请提供要拉黑的目标用户 ID。"},
+                ensure_ascii=False,
+            )
+
         sender_id = str(event.get_sender_id() or "")
-        target_user_id = str(user_id or "").strip() or sender_id
-        if not target_user_id:
-            return json.dumps(
-                {"success": False, "message": "无法确定要拉黑的目标用户 ID。"},
-                ensure_ascii=False,
-            )
-        is_self_defense = target_user_id == sender_id
 
-        permission_error = validate_write_permission(
-            event,
-            target_user_id=target_user_id,
-            strict=self.tool_write_require_admin("block_user"),
-            policy="admin_or_self",
-            action="拉黑",
-        )
-        if permission_error:
-            return json.dumps(
-                {
-                    "success": False,
-                    "message": permission_error,
-                },
-                ensure_ascii=False,
-            )
+        # 权限检查：单目标时支持 self-action 旁路；多目标时跳过旁路
+        strict_permission_check = self.tool_write_require_admin("block_user")
+        if strict_permission_check:
+            if len(user_id_list) == 1:
+                target_user_id = str(user_id_list[0] or "").strip()
+                permission_error = validate_write_permission(
+                    event,
+                    target_user_id=target_user_id,
+                    strict=True,
+                    policy="admin_or_self",
+                    action="拉黑",
+                )
+            else:
+                permission_error = validate_write_permission(
+                    event,
+                    target_user_id="",
+                    strict=True,
+                    policy="admin_or_self",
+                    action="拉黑",
+                )
+            if permission_error:
+                return json.dumps(
+                    {"success": False, "message": permission_error},
+                    ensure_ascii=False,
+                )
 
-        if (not self.allow_blacklist_bot_admin()) and self._is_target_bot_admin(event, target_user_id):
-            return json.dumps(
-                {"success": False, "message": BOT_ADMIN_BLOCK_MESSAGE},
-                ensure_ascii=False,
-            )
-
-        if await self._db.get_user_info(target_user_id):
-            return json.dumps(
-                {
-                    "success": True,
-                    "message": f"用户 {target_user_id} 已在黑名单中，无需重复添加。",
-                    "user_id": target_user_id,
-                    "wording_hint": BLACKLIST_WORDING_HINT,
-                },
-                ensure_ascii=False,
-            )
-
+        # 解析 duration
         parsed_duration, err = self._parse_duration_seconds(duration)
         if err:
             return json.dumps(
@@ -819,98 +813,167 @@ class BlacklistManager:
             expire_time = (datetime.now() + timedelta(seconds=actual_duration)).isoformat()
 
         target_name = str(user_name or "").strip()
-        if not target_name and target_user_id == sender_id:
+        if not target_name:
             target_name = str(event.get_sender_name() or "")
-        ok = await self._db.add_user(
-            user_id=target_user_id,
-            user_name=target_name,
-            ban_time=ban_time,
-            expire_time=expire_time,
-            reason=reason or "",
-        )
-        if not ok:
-            return json.dumps(
-                {"success": False, "message": "拉黑失败，数据库写入异常。"},
-                ensure_ascii=False,
-            )
 
-        self._invalidate_cache(target_user_id)
-        logger.info(f"[LLMEnhancement] 用户 {target_user_id} 已由 {sender_id} 通过 LLM 工具拉黑。")
-        return json.dumps(
-            {
+        results = []
+        success_count = 0
+        fail_count = 0
+
+        for target_user_id in user_id_list:
+            target_user_id = str(target_user_id or "").strip()
+            if not target_user_id:
+                fail_count += 1
+                results.append({"user_id": target_user_id, "success": False, "error": "empty user_id"})
+                continue
+
+            is_self_defense = target_user_id == sender_id
+
+            # Bot 管理员检查
+            if (not self.allow_blacklist_bot_admin()) and self._is_target_bot_admin(event, target_user_id):
+                fail_count += 1
+                results.append({"user_id": target_user_id, "success": False, "error": BOT_ADMIN_BLOCK_MESSAGE})
+                continue
+
+            # 检查是否已在黑名单
+            if await self._db.get_user_info(target_user_id):
+                results.append({
+                    "success": True,
+                    "message": f"用户 {target_user_id} 已在黑名单中，无需重复添加。",
+                    "user_id": target_user_id,
+                    "wording_hint": BLACKLIST_WORDING_HINT,
+                })
+                success_count += 1
+                continue
+
+            # 写入数据库
+            current_target_name = target_name if target_user_id != sender_id else (str(event.get_sender_name() or "") or target_name)
+            ok = await self._db.add_user(
+                user_id=target_user_id,
+                user_name=current_target_name,
+                ban_time=ban_time,
+                expire_time=expire_time,
+                reason=reason or "",
+            )
+            if not ok:
+                fail_count += 1
+                results.append({"user_id": target_user_id, "success": False, "error": "数据库写入异常"})
+                continue
+
+            self._invalidate_cache(target_user_id)
+            logger.info(f"[LLMEnhancement] 用户 {target_user_id} 已由 {sender_id} 通过 LLM 工具拉黑。")
+            results.append({
                 "success": True,
                 "message": f"用户 {target_user_id} 已拉黑。",
                 "user_id": target_user_id,
-                "user_name": target_name,
+                "user_name": current_target_name,
                 "duration": actual_duration if actual_duration > 0 else "永久",
                 "reason": reason,
-                "hint": (
-                    "操作已生效，将来这段时间内对方向你发送的消息将被屏蔽。"
-                    if is_self_defense
-                    else "操作已生效。"
-                ),
+                "hint": "操作已生效。" if not is_self_defense else "操作已生效，将来这段时间内对方向你发送的消息将被屏蔽。",
                 "wording_hint": BLACKLIST_WORDING_HINT,
-            },
-            ensure_ascii=False,
-        )
+            })
+            success_count += 1
 
-    async def tool_unblock_user(self, event: AstrMessageEvent, user_id: str) -> str:
+        if len(user_id_list) == 1:
+            if results and results[0].get("success"):
+                return json.dumps(results[0], ensure_ascii=False)
+            return json.dumps(results[0] if results else {"success": False, "message": "操作失败"}, ensure_ascii=False)
+
+        return json.dumps({
+            "success_count": success_count,
+            "fail_count": fail_count,
+            "results": results
+        }, ensure_ascii=False, indent=2)
+
+    async def tool_unblock_user(self, event: AstrMessageEvent, user_ids: str) -> str:
         await self._cleanup_expired_on_query()
 
-        target_user_id = str(user_id or "").strip()
-        if not target_user_id:
+        user_id_list = _parse_user_id_list(user_ids)
+        if not user_id_list:
             return json.dumps(
                 {"success": False, "message": "请提供要解除拉黑的用户 ID。"},
                 ensure_ascii=False,
             )
 
         sender_id = str(event.get_sender_id() or "")
-        permission_error = validate_write_permission(
-            event,
-            target_user_id=target_user_id,
-            strict=self.tool_write_require_admin("unblock_user"),
-            policy="admin_only",
-            action="解除拉黑",
-        )
-        if permission_error:
-            return json.dumps(
-                {"success": False, "message": permission_error},
-                ensure_ascii=False,
-            )
 
-        user = await self._db.get_user_info(target_user_id)
-        if not user:
-            return json.dumps(
-                {
+        # 权限检查：单目标时支持 self-action 旁路；多目标时跳过旁路
+        strict_permission_check = self.tool_write_require_admin("unblock_user")
+        if strict_permission_check:
+            if len(user_id_list) == 1:
+                target_user_id = str(user_id_list[0] or "").strip()
+                permission_error = validate_write_permission(
+                    event,
+                    target_user_id=target_user_id,
+                    strict=True,
+                    policy="admin_or_self",
+                    action="解除拉黑",
+                )
+            else:
+                permission_error = validate_write_permission(
+                    event,
+                    target_user_id="",
+                    strict=True,
+                    policy="admin_or_self",
+                    action="解除拉黑",
+                )
+            if permission_error:
+                return json.dumps(
+                    {"success": False, "message": permission_error},
+                    ensure_ascii=False,
+                )
+
+        results = []
+        success_count = 0
+        fail_count = 0
+
+        for target_user_id in user_id_list:
+            target_user_id = str(target_user_id or "").strip()
+            if not target_user_id:
+                fail_count += 1
+                results.append({"user_id": target_user_id, "success": False, "error": "empty user_id"})
+                continue
+
+            user = await self._db.get_user_info(target_user_id)
+            if not user:
+                results.append({
                     "success": True,
                     "message": f"用户 {target_user_id} 不在黑名单中。",
                     "user_id": target_user_id,
                     "user_name": "",
                     "wording_hint": BLACKLIST_WORDING_HINT,
-                },
-                ensure_ascii=False,
-            )
+                })
+                success_count += 1
+                continue
 
-        _uid, user_name, _ban_time, _expire_time, _reason = user
-        ok = await self._db.remove_user(target_user_id)
-        if not ok:
-            return json.dumps(
-                {"success": False, "message": "解除拉黑用户时失败。"},
-                ensure_ascii=False,
-            )
+            _uid, user_name, _ban_time, _expire_time, _reason = user
+            ok = await self._db.remove_user(target_user_id)
+            if not ok:
+                fail_count += 1
+                results.append({"user_id": target_user_id, "success": False, "error": "数据库删除失败"})
+                continue
 
-        self._invalidate_cache(target_user_id)
-        logger.info(f"[LLMEnhancement] 用户 {target_user_id} 已由 {sender_id} 通过 LLM 工具解除拉黑。")
-        return json.dumps(
-            {
+            self._invalidate_cache(target_user_id)
+            logger.info(f"[LLMEnhancement] 用户 {target_user_id} 已由 {sender_id} 通过 LLM 工具解除拉黑。")
+            results.append({
                 "success": True,
                 "message": f"用户 {target_user_id} 已解除拉黑。",
                 "user_id": target_user_id,
                 "user_name": user_name or "",
                 "wording_hint": BLACKLIST_WORDING_HINT,
-            },
-            ensure_ascii=False,
-        )
+            })
+            success_count += 1
+
+        if len(user_id_list) == 1:
+            if results and results[0].get("success"):
+                return json.dumps(results[0], ensure_ascii=False)
+            return json.dumps(results[0] if results else {"success": False, "message": "操作失败"}, ensure_ascii=False)
+
+        return json.dumps({
+            "success_count": success_count,
+            "fail_count": fail_count,
+            "results": results
+        }, ensure_ascii=False, indent=2)
 
     async def tool_list_blacklist(self, event: AstrMessageEvent, page: int = 1, page_size: int = 20) -> str:
         await self._cleanup_expired_on_query()
@@ -967,11 +1030,11 @@ class BlacklistManager:
             ensure_ascii=False,
         )
 
-    async def tool_get_blacklist_status(self, event: AstrMessageEvent, user_id: str) -> str:
+    async def tool_get_blacklist_status(self, event: AstrMessageEvent, user_ids: str) -> str:
         await self._cleanup_expired_on_query()
 
-        target_id = str(user_id or "").strip()
-        if not target_id:
+        user_id_list = _parse_user_id_list(user_ids)
+        if not user_id_list:
             return json.dumps(
                 {
                     "is_blacklisted": False,
@@ -981,11 +1044,22 @@ class BlacklistManager:
                 },
                 ensure_ascii=False,
             )
-        user_info = await self._db.get_user_info(target_id)
-        if user_info:
-            uid, user_name, ban_time, expire_time, reason = user_info
-            return json.dumps(
-                {
+
+        results = []
+        success_count = 0
+        fail_count = 0
+
+        for target_id in user_id_list:
+            target_id = str(target_id or "").strip()
+            if not target_id:
+                fail_count += 1
+                results.append({"user_id": target_id, "is_blacklisted": False, "error": "empty user_id"})
+                continue
+
+            user_info = await self._db.get_user_info(target_id)
+            if user_info:
+                uid, user_name, ban_time, expire_time, reason = user_info
+                results.append({
                     "is_blacklisted": True,
                     "user_id": uid,
                     "user_name": user_name or "",
@@ -994,14 +1068,21 @@ class BlacklistManager:
                     "reason": reason if reason else "无",
                     "expire_time_hint": "expire_time 表示黑名单失效时间，失效后意味着你将其移出黑名单。",
                     "wording_hint": BLACKLIST_WORDING_HINT,
-                },
-                ensure_ascii=False,
-            )
-        return json.dumps(
-            {
-                "is_blacklisted": False,
-                "user_id": target_id,
-                "wording_hint": BLACKLIST_WORDING_HINT,
-            },
-            ensure_ascii=False,
-        )
+                })
+                success_count += 1
+            else:
+                results.append({
+                    "is_blacklisted": False,
+                    "user_id": target_id,
+                    "wording_hint": BLACKLIST_WORDING_HINT,
+                })
+                success_count += 1
+
+        if len(user_id_list) == 1:
+            return json.dumps(results[0] if results else {"is_blacklisted": False, "message": "查询失败"}, ensure_ascii=False)
+
+        return json.dumps({
+            "success_count": success_count,
+            "fail_count": fail_count,
+            "results": results
+        }, ensure_ascii=False, indent=2)

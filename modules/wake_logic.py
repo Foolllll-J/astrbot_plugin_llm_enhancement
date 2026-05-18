@@ -103,6 +103,25 @@ def is_wake_prefix_triggered(
     return False
 
 
+def is_wake_prefix_only_message(
+    *,
+    original_message: Any,
+    wake_prefixes: Any,
+) -> bool:
+    text = str(original_message or "").strip()
+    if not text:
+        return False
+    if isinstance(wake_prefixes, (list, tuple, set)):
+        candidates = wake_prefixes
+    else:
+        candidates = [wake_prefixes]
+    for item in candidates:
+        prefix = str(item or "").strip()
+        if prefix and text == prefix:
+            return True
+    return False
+
+
 def build_request_concurrency_key(
     *,
     dynamic_merge_mode: bool,

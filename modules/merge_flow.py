@@ -340,7 +340,7 @@ def ensure_snapshot_merge_key(snapshot: Dict[str, Any]) -> str:
         key = f"id:{msg_id}"
     else:
         uid = str(snapshot.get("uid") or "")
-        ts = int(float(snapshot.get("ts", time.time())) * 1000)
+        ts = int(float(snapshot.get("ts") or 0.0) * 1000)
         text_len = len(str(snapshot.get("text") or ""))
         key = f"noid:{uid}:{ts}:{text_len}"
     snapshot["_merge_key"] = key
@@ -355,8 +355,8 @@ def upsert_dynamic_unresolved_snapshot(
     key = ensure_snapshot_merge_key(snapshot)
     for idx, item in enumerate(member.dynamic_unresolved_msgs):
         if ensure_snapshot_merge_key(item) == key:
-            old_ts = float(item.get("ts", snapshot.get("ts", time.time())))
-            snapshot["ts"] = min(old_ts, float(snapshot.get("ts", old_ts)))
+            old_ts = float(item.get("ts") or 0.0)
+            snapshot["ts"] = min(old_ts, float(snapshot.get("ts") or old_ts))
             member.dynamic_unresolved_msgs[idx] = snapshot
             inserted_new = False
             break
@@ -364,7 +364,7 @@ def upsert_dynamic_unresolved_snapshot(
         member.dynamic_unresolved_msgs.append(snapshot)
         inserted_new = True
 
-    member.dynamic_unresolved_msgs.sort(key=lambda x: float(x.get("ts", 0.0)))
+    member.dynamic_unresolved_msgs.sort(key=lambda x: float(x.get("ts") or 0.0))
     if len(member.dynamic_unresolved_msgs) > max_keep:
         member.dynamic_unresolved_msgs = member.dynamic_unresolved_msgs[-max_keep:]
     return inserted_new
@@ -375,48 +375,77 @@ def reset_dynamic_capture_session(member: MemberState) -> None:
     member.dynamic_capture_count = 0
 
 
-def init_dynamic_capture_session(
-    member: MemberState,
-    selected_snapshots: list[Dict[str, Any]],
-) -> None:
-    reset_dynamic_capture_session(member)
-    now_ts = time.time()
-    if selected_snapshots:
-        member.merge_start_ts = min(
-            float(item.get("ts", now_ts) or now_ts)
-            for item in selected_snapshots
-        )
-        member.dynamic_capture_count = len(
-            {ensure_snapshot_merge_key(item) for item in selected_snapshots}
-        )
-    else:
-        member.merge_start_ts = now_ts
+def reset_member_state(member: MemberState) -> None:
+    """重置成员的所有动态合并/唤醒状态，相当于该成员刚加入群时的状态"""
+    member.in_merging = False
+    member.pending_msg_ids.clear()
+    member.cancel_merge = False
+    member.trigger_msg_id = None
+    member.recent_wake_msgs.clear()
+    member.premerge_msgs.clear()
+    member.last_wake_ts = 0.0
+    member.merge_start_ts = 0.0
+    member.merged_msg_ids.clear()
+    member.dynamic_unresolved_msgs.clear()
+    member.dynamic_request_seq = 0
+    member.dynamic_inflight_seq = 0
+    member.dynamic_discard_before_seq = 0
+    member.dynamic_discarded_response_cache.clear()
+    member.dynamic_capture_count = 0
+    member.dynamic_source_event = None
+    member.dynamic_source_event_seq = 0
+    member.dynamic_requeue_pending_seq = 0
+    member.last_response = 0.0
 
 
-def prune_member_msg_cache(member: MemberState, keep_sec: float) -> None:
-    now_ts = time.time()
+def reset_group_state(group_state: GroupState) -> None:
+    """重置群组的所有状态"""
+    group_state.dynamic_owner_uid = None
+    group_state.wake_extend_consumed_ref_ts = 0.0
+    group_state.active_wake_new_msg_count = 0
+    group_state.prob_wake_pending_count = 0
+    group_state.prob_wake_no_reply_count = 0
+    group_state.prob_wake_last_check_ts = 0.0
+    group_state.wake_extend_batch_count = 0
+    group_state.last_response_uid = None
+    group_state.last_response_ts = 0.0
+    group_state.pending_msg_index.clear()
+    group_state.last_user_interaction.clear()
+    group_state.context_bot_last_replied_to_uid = ""
+
+
+def prune_member_msg_cache(member: MemberState, keep_sec: float, ref_ts: float = 0.0) -> None:
+    """清理过期的消息缓存。ref_ts 用于判断消息列表的相对过期，merged_msg_ids 使用真实时间判断。"""
+    # 消息列表用 ref_ts（消息发送时间）判断，避免处理延迟导致历史消息被误删
     member.recent_wake_msgs = [
         item for item in member.recent_wake_msgs
-        if now_ts - float(item.get("ts", 0.0)) <= keep_sec
+        if ref_ts - float(item.get("ts") or 0.0) <= keep_sec
+    ]
+    member.premerge_msgs = [
+        item for item in member.premerge_msgs
+        if ref_ts - float(item.get("ts") or 0.0) <= keep_sec
     ]
     member.dynamic_unresolved_msgs = [
         item
         for item in member.dynamic_unresolved_msgs
-        if now_ts - float(item.get("ts", 0.0)) <= keep_sec
+        if ref_ts - float(item.get("ts") or 0.0) <= keep_sec
     ]
+    # merged_msg_ids 存储的是绝对过期时间，必须用真实时间判断
+    now_ts = time.time()
     expired_ids = [mid for mid, exp_ts in member.merged_msg_ids.items() if exp_ts <= now_ts]
     for mid in expired_ids:
         member.merged_msg_ids.pop(mid, None)
 
 
-def build_event_snapshot(event: AstrMessageEvent, gid: str, uid: str) -> Dict[str, Any]:
+def build_event_snapshot(event: AstrMessageEvent, gid: str, uid: str, ts: Optional[float] = None) -> Dict[str, Any]:
+    """构建事件快照。ts 参数用于传入消息的实际发送时间，避免用处理时间替代。"""
     chain = []
     if hasattr(event, "message_obj") and hasattr(event.message_obj, "message") and event.message_obj.message:
         chain = event.message_obj.message
     components = [seg for seg in chain if is_merge_component(seg)]
     return {
         "msg_id": get_event_msg_id(event),
-        "ts": time.time(),
+        "ts": ts if ts is not None else time.time(),
         "gid": gid or f"private_{uid}",
         "uid": uid,
         "sender_name": event.get_sender_name(),
@@ -432,11 +461,66 @@ def upsert_recent_wake_snapshot(member: MemberState, snapshot: Dict[str, Any]) -
     for idx, item in enumerate(member.recent_wake_msgs):
         if str(item.get("msg_id") or "") == msg_id:
             # 保留更早的时间戳，避免并发事件重排导致窗口错位
-            old_ts = float(item.get("ts", snapshot["ts"]))
-            snapshot["ts"] = min(old_ts, float(snapshot["ts"]))
+            old_ts = float(item.get("ts") or 0.0)
+            snapshot["ts"] = min(old_ts, float(snapshot.get("ts") or 0.0))
             member.recent_wake_msgs[idx] = snapshot
             return
     member.recent_wake_msgs.append(snapshot)
+
+
+def upsert_premerge_snapshot(
+    member: MemberState,
+    snapshot: Dict[str, Any],
+    max_keep: int,
+) -> bool:
+    """记录唤醒前的非唤醒消息，按时间排序并保留最近候选。"""
+    if max_keep <= 0:
+        return False
+    key = ensure_snapshot_merge_key(snapshot)
+    for idx, item in enumerate(member.premerge_msgs):
+        if ensure_snapshot_merge_key(item) == key:
+            old_ts = float(item.get("ts") or 0.0)
+            snapshot["ts"] = min(old_ts, float(snapshot.get("ts") or old_ts))
+            member.premerge_msgs[idx] = snapshot
+            inserted_new = False
+            break
+    else:
+        member.premerge_msgs.append(snapshot)
+        inserted_new = True
+
+    member.premerge_msgs.sort(key=lambda x: float(x.get("ts") or 0.0))
+    if len(member.premerge_msgs) > max_keep:
+        member.premerge_msgs = member.premerge_msgs[-max_keep:]
+    return inserted_new
+
+
+def consume_premerge_snapshots_for_trigger(
+    member: MemberState,
+    *,
+    trigger_ts: float,
+    window_sec: float,
+    max_items: int,
+) -> list[Dict[str, Any]]:
+    """取出触发消息之前、窗口内、距离最近的预合并消息。"""
+    if max_items <= 0 or window_sec <= 0:
+        return []
+
+    eligible = [
+        item
+        for item in member.premerge_msgs
+        if 0.0 <= (trigger_ts - float(item.get("ts") or 0.0)) <= window_sec
+    ]
+    if not eligible:
+        return []
+
+    selected = eligible[-max_items:]
+    selected_keys = {ensure_snapshot_merge_key(item) for item in selected}
+    member.premerge_msgs = [
+        item
+        for item in member.premerge_msgs
+        if ensure_snapshot_merge_key(item) not in selected_keys
+    ]
+    return selected
 
 
 def prepare_initial_merge_snapshots(
@@ -449,27 +533,28 @@ def prepare_initial_merge_snapshots(
     merged_skip_ttl: float,
     merge_max_count: int,
     add_pending_msg_id: Callable[[str], None],
+    event_ts: float = 0.0,
 ) -> tuple[list[Dict[str, Any]], Optional[str]]:
-    """预选本次合并窗口内的消息快照，并更新 member 的已并入索引。"""
-    current_snapshot = build_event_snapshot(event, gid, uid)
+    """预选本次合并窗口内的消息快照，并更新 member 的已并入索引。event_ts 用于传入消息发送时间。"""
+    current_snapshot = build_event_snapshot(event, gid, uid, ts=event_ts or None)
     current_msg_id = str(current_snapshot.get("msg_id") or "")
     if current_msg_id:
         upsert_recent_wake_snapshot(member, current_snapshot)
 
     merge_start_ts = float(getattr(member, "merge_start_ts", 0.0) or 0.0)
-    current_ts = float(current_snapshot.get("ts", time.time()))
+    current_ts = float(current_snapshot.get("ts") or 0.0)
     if current_msg_id:
         for item in member.recent_wake_msgs:
             if str(item.get("msg_id") or "") == current_msg_id:
-                current_ts = float(item.get("ts", current_ts))
+                current_ts = float(item.get("ts") or 0.0) or current_ts
                 break
 
     nearby_ts_list = [
-        float(item.get("ts", current_ts))
+        float(item.get("ts") or 0.0)
         for item in member.recent_wake_msgs
         if (
-            (merge_start_ts <= 0.0 or float(item.get("ts", current_ts)) >= merge_start_ts)
-            and abs(float(item.get("ts", current_ts)) - current_ts) <= merge_delay
+            (merge_start_ts <= 0.0 or float(item.get("ts") or 0.0) >= merge_start_ts)
+            and abs(float(item.get("ts") or 0.0) - current_ts) <= merge_delay
         )
     ]
     window_start_ts = min(nearby_ts_list) if nearby_ts_list else current_ts
@@ -554,6 +639,8 @@ def member_contains_msg_id(member: MemberState, msg_id: str) -> bool:
         return True
     if any(str(item.get("msg_id") or "") == msg_id for item in member.recent_wake_msgs):
         return True
+    if any(str(item.get("msg_id") or "") == msg_id for item in member.premerge_msgs):
+        return True
     if any(str(item.get("msg_id") or "") == msg_id for item in member.dynamic_unresolved_msgs):
         return True
     return False
@@ -569,6 +656,7 @@ def remove_recalled_msg_from_member(
         "removed_pending": False,
         "removed_merged": False,
         "removed_recent": 0,
+        "removed_premerge": 0,
         "removed_dynamic_unresolved": 0,
         "trigger_recalled": False,
         "trigger_replaced": None,
@@ -593,6 +681,12 @@ def remove_recalled_msg_from_member(
         item for item in member.recent_wake_msgs if str(item.get("msg_id") or "") != msg_id
     ]
     summary["removed_recent"] = max(0, before_recent - len(member.recent_wake_msgs))
+
+    before_premerge = len(member.premerge_msgs)
+    member.premerge_msgs = [
+        item for item in member.premerge_msgs if str(item.get("msg_id") or "") != msg_id
+    ]
+    summary["removed_premerge"] = max(0, before_premerge - len(member.premerge_msgs))
 
     before_dynamic = len(member.dynamic_unresolved_msgs)
     member.dynamic_unresolved_msgs = [
@@ -635,6 +729,7 @@ def prepare_dynamic_merge_batch(
     member: MemberState,
     group_state: GroupState,
     current_snapshot: Dict[str, Any],
+    premerge_snapshots: Optional[list[Dict[str, Any]]],
     uid: str,
     allow_multi_user: bool,
     merge_max_count: int,
@@ -655,21 +750,34 @@ def prepare_dynamic_merge_batch(
         member.dynamic_unresolved_msgs = [
             item
             for item in member.dynamic_unresolved_msgs
-            if float(item.get("ts", time.time())) >= merge_start_ts
+            if float(item.get("ts") or 0.0) >= merge_start_ts
         ]
 
-    selected_snapshots: list[Dict[str, Any]] = []
-    current_ts = float(current_snapshot.get("ts", time.time()) or time.time())
+    # 判定当前触发消息是否已经跨越了时间断层
+    current_ts = float(current_snapshot.get("ts") or 0.0)
+    if merge_start_ts > 0.0 and (current_ts - merge_start_ts) > merge_delay:
+        # 既然已经超过 merge_delay，说明旧池子里的全是"僵尸消息"
+        logger.debug(
+            f"[LLMEnhancement] 检测到时间断层 ({(current_ts - merge_start_ts):.1f}s > {merge_delay}s)，重置动态池"
+        )
+        member.dynamic_unresolved_msgs = [current_snapshot]  # 只保留当前消息
+        member.merge_start_ts = current_ts  # 重置起点
+        member.dynamic_capture_count = 1
+        # 同步清理全局索引
+        clear_pending_msg_ids(group_state, member)
+
+    selected_snapshots: list[Dict[str, Any]] = list(premerge_snapshots or [])
     current_key = ensure_snapshot_merge_key(current_snapshot)
     for item in member.dynamic_unresolved_msgs:
         item_uid = str(item.get("uid") or "")
         if not allow_multi_user and item_uid and item_uid != uid:
             continue
-        ts = float(item.get("ts", current_ts) or current_ts)
+        ts = float(item.get("ts") or 0.0)
         if merge_start_ts > 0.0 and ts < merge_start_ts:
             continue
-        if merge_delay > 0:
-            if (current_ts - ts) > merge_delay:
+        is_current_trigger = ensure_snapshot_merge_key(item) == current_key
+        if not is_current_trigger and merge_delay > 0:
+            if (ts - merge_start_ts) > merge_delay:
                 continue
         elif ensure_snapshot_merge_key(item) != current_key:
             continue
@@ -684,8 +792,20 @@ def prepare_dynamic_merge_batch(
         # 兜底：至少保留当前触发快照，避免动态合并把整批请求误判为空而取消。
         selected_snapshots = [current_snapshot]
 
+    selected_snapshots.sort(key=lambda x: float(x.get("ts") or 0.0))
+
+    deduped_snapshots: list[Dict[str, Any]] = []
+    seen_keys: set[str] = set()
+    for item in selected_snapshots:
+        key = ensure_snapshot_merge_key(item)
+        if key in seen_keys:
+            continue
+        seen_keys.add(key)
+        deduped_snapshots.append(item)
+    selected_snapshots = deduped_snapshots
+
     if len(selected_snapshots) > merge_max_count:
-        selected_snapshots = selected_snapshots[:merge_max_count]
+        selected_snapshots = selected_snapshots[-merge_max_count:]
 
     clear_pending_msg_ids(group_state, member)
     selected_keys: list[str] = []
@@ -697,14 +817,13 @@ def prepare_dynamic_merge_batch(
         selected_keys.append(ensure_snapshot_merge_key(item))
 
     trigger_msg_id = str(current_snapshot.get("msg_id") or "").strip() or (
-        str(selected_snapshots[0].get("msg_id") or "").strip() if selected_snapshots else None
+        str(selected_snapshots[-1].get("msg_id") or "").strip() if selected_snapshots else None
     )
 
     if not had_inflight:
-        init_dynamic_capture_session(
-            member=member,
-            selected_snapshots=selected_snapshots,
-        )
+        # 首轮触发：用触发消息的 ts 作为合并起点
+        member.merge_start_ts = float(current_snapshot.get("ts") or 0.0) or 0.0
+        member.dynamic_capture_count = 1
 
     unresolved_count = len(member.dynamic_unresolved_msgs)
     return selected_snapshots, selected_keys, request_seq, unresolved_count, trigger_msg_id
@@ -738,15 +857,16 @@ async def mark_dynamic_soft_recompute(
                 accepted=False,
                 reason="no_inflight",
             )
-        now_ts = time.time()
+        snapshot_ts = float(snapshot.get("ts") or 0.0)
         if target_member.merge_start_ts <= 0.0:
             if target_member.dynamic_unresolved_msgs:
                 target_member.merge_start_ts = min(
-                    float(item.get("ts", now_ts) or now_ts)
+                    float(item.get("ts") or 0.0)
                     for item in target_member.dynamic_unresolved_msgs
                 )
             else:
-                target_member.merge_start_ts = now_ts
+                # 【修改】：直接用快照时间初始化 merge_start_ts，避免依赖系统时间
+                target_member.merge_start_ts = snapshot_ts
         if target_member.dynamic_capture_count <= 0:
             target_member.dynamic_capture_count = len(
                 {
@@ -756,14 +876,15 @@ async def mark_dynamic_soft_recompute(
             )
 
         if merge_delay > 0.0 and (
-            now_ts - float(target_member.merge_start_ts)
+            snapshot_ts - float(target_member.merge_start_ts)
         ) >= float(merge_delay):
             return DynamicSoftRecomputeDecision(
                 inflight_seq=inflight_seq,
                 accepted=False,
                 reason="deadline_reached",
             )
-        if merge_max_count > 0 and target_member.dynamic_capture_count >= merge_max_count:
+        current_unresolved_count = len(target_member.dynamic_unresolved_msgs)
+        if merge_max_count > 0 and current_unresolved_count >= merge_max_count:
             return DynamicSoftRecomputeDecision(
                 inflight_seq=inflight_seq,
                 accepted=False,
@@ -950,12 +1071,19 @@ async def execute_dynamic_merge(
     merge_delay: float,
     merge_max_count: int,
     is_recent_recalled: Optional[Callable[[str], bool]] = None,
+    event_ts: Optional[float] = None,
 ) -> dict[str, Any]:
     ttl_base = max(merge_delay, 10.0)
     cache_keep_sec = max(ttl_base * 6, 60.0)
     merged_skip_ttl = max(ttl_base * 6, 120.0)
-    current_snapshot = build_event_snapshot(event, gid, uid)
+    current_snapshot = build_event_snapshot(event, gid, uid, ts=event_ts)
     ensure_snapshot_merge_key(current_snapshot)
+    raw_premerge_snapshots = event.get_extra("_llme_premerge_snapshots", default=[]) or []
+    premerge_snapshots = [
+        item for item in raw_premerge_snapshots
+        if isinstance(item, dict)
+    ]
+    event.set_extra("_llme_premerge_snapshots", [])
 
     selected_snapshots: list[Dict[str, Any]] = []
     selected_keys: list[str] = []
@@ -965,7 +1093,7 @@ async def execute_dynamic_merge(
     unresolved_count = 0
     try:
         async with member.lock:
-            prune_member_msg_cache(member, keep_sec=cache_keep_sec)
+            prune_member_msg_cache(member, keep_sec=cache_keep_sec, ref_ts=event_ts or 0.0)
             member.cancel_merge = False
             member.in_merging = True
             (
@@ -978,6 +1106,7 @@ async def execute_dynamic_merge(
                 member=member,
                 group_state=group_state,
                 current_snapshot=current_snapshot,
+                premerge_snapshots=premerge_snapshots,
                 uid=uid,
                 allow_multi_user=allow_multi_user,
                 merge_max_count=merge_max_count,

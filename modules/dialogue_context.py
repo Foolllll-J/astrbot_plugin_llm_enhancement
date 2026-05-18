@@ -8,9 +8,16 @@ from typing import Any, Optional
 
 from astrbot.api import logger
 import astrbot.api.message_components as Comp
+from astrbot.api.provider import ProviderRequest
+from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import AiocqhttpMessageEvent
 
 from .state_manager import GroupState
-from .runtime_helpers import cleanup_paths_later, transcribe_record_from_chain, clear_effective_dialog_history
+from .runtime_helpers import (
+    cleanup_paths_later,
+    transcribe_record_from_chain,
+    clear_effective_dialog_history,
+    append_text_part_to_request,
+)
 from .wake_logic import build_media_trigger_message
 
 _CONTEXT_IMAGE_CAPTION_PROMPT = "请用中文简洁描述这张图片，包含主体、关键动作和可能场景，不超过50字。"
@@ -760,6 +767,8 @@ async def try_get_image_caption(
     provider_by_id_resolver: Any,
     default_provider_resolver: Any,
     timeout_sec: float = 20.0,
+    preferred_provider_id: str = "",
+    allow_default_provider: bool = True,
 ) -> str:
     emoji_summary = get_emoji_summary_from_sources(message_chain, raw_image_datas=raw_image_datas)
     image_file, image_url = _extract_first_image_file_and_url(message_chain)
@@ -771,13 +780,16 @@ async def try_get_image_caption(
         return _merge_image_caption_and_emoji_summary(cached_caption, emoji_summary)
 
     provider_id = str(
-        get_cfg(
+        preferred_provider_id
+        or get_cfg(
             "context_injection_image_caption_provider_id",
             "",
         )
         or ""
     ).strip()
-    provider = provider_by_id_resolver(provider_id) if provider_id else default_provider_resolver()
+    provider = provider_by_id_resolver(provider_id) if provider_id else None
+    if provider is None and allow_default_provider:
+        provider = default_provider_resolver()
     if not provider or (not hasattr(provider, "text_chat")):
         return emoji_summary or ""
 
@@ -852,6 +864,189 @@ async def try_get_image_caption(
                     os.remove(temp_image_path)
             except Exception:
                 pass
+
+
+async def _fetch_messages_by_ids(
+    event: Any,
+    msg_ids: list[str],
+) -> list[dict[str, Any]]:
+    if not isinstance(event, AiocqhttpMessageEvent):
+        return []
+    if not msg_ids:
+        return []
+    bot = getattr(event, "bot", None)
+    api = getattr(bot, "api", None) if bot else None
+    if api is None or not hasattr(api, "call_action"):
+        return []
+
+    messages: list[dict[str, Any]] = []
+    for msg_id in msg_ids:
+        sid = str(msg_id or "").strip()
+        if not sid:
+            continue
+        try:
+            original_msg = await api.call_action("get_msg", message_id=sid)
+        except Exception:
+            continue
+        if isinstance(original_msg, dict) and isinstance(original_msg.get("message"), list):
+            messages.append(original_msg)
+    return messages
+
+
+async def _resolve_image_input_from_segment_data(
+    event: Any,
+    seg_data: dict[str, Any],
+) -> str:
+    file_val = str(seg_data.get("file") or "").strip()
+    url_val = str(seg_data.get("url") or "").strip()
+
+    for candidate in (file_val, url_val):
+        if not candidate:
+            continue
+        if candidate.startswith(("file:///", "http://", "https://", "base64://")):
+            return candidate
+        if os.path.exists(candidate):
+            return os.path.abspath(candidate)
+
+    if file_val and isinstance(event, AiocqhttpMessageEvent):
+        bot = getattr(event, "bot", None)
+        api = getattr(bot, "api", None) if bot else None
+        if api is not None and hasattr(api, "call_action"):
+            try:
+                image_resp = await api.call_action("get_image", file=file_val)
+            except Exception:
+                image_resp = None
+            if isinstance(image_resp, dict):
+                for key in ("file", "path", "url"):
+                    candidate = str(image_resp.get(key) or "").strip()
+                    if not candidate:
+                        continue
+                    if candidate.startswith(("file:///", "http://", "https://", "base64://")):
+                        return candidate
+                    if os.path.exists(candidate):
+                        return os.path.abspath(candidate)
+    return ""
+
+
+def _provider_supports_image_input(provider: Any) -> bool:
+    provider_cfg = getattr(provider, "provider_config", None)
+    if not isinstance(provider_cfg, dict):
+        return False
+    modalities = provider_cfg.get("modalities", [])
+    if not isinstance(modalities, list):
+        return False
+    return "image" in modalities
+
+
+async def inject_merged_images_by_provider(
+    *,
+    event: Any,
+    req: ProviderRequest,
+    merged_msg_ids: list[str],
+    current_provider: Any,
+    get_cfg: Any,
+    framework_provider_settings: Optional[dict[str, Any]] = None,
+    provider_by_id_resolver: Any,
+    default_provider_resolver: Any,
+) -> dict[str, Any]:
+    batch_msg_ids = [str(mid).strip() for mid in (merged_msg_ids or []) if str(mid or "").strip()]
+    if not batch_msg_ids:
+        return {"mode": "none", "image_count": 0, "caption_count": 0}
+
+    original_msgs = await _fetch_messages_by_ids(event, batch_msg_ids)
+    if not original_msgs:
+        return {"mode": "none", "image_count": 0, "caption_count": 0}
+
+    image_segments: list[dict[str, Any]] = []
+    for original_msg in original_msgs:
+        for segment in original_msg.get("message") or []:
+            if not isinstance(segment, dict):
+                continue
+            if str(segment.get("type") or "").strip().lower() != "image":
+                continue
+            seg_data = segment.get("data") or {}
+            if not isinstance(seg_data, dict):
+                continue
+            image_segments.append(segment)
+
+    if not image_segments:
+        return {"mode": "none", "image_count": 0, "caption_count": 0}
+
+    if _provider_supports_image_input(current_provider):
+        if not hasattr(req, "image_urls") or req.image_urls is None:
+            req.image_urls = []
+        existing_urls = {
+            str(item).strip() for item in list(req.image_urls or []) if str(item).strip()
+        }
+        injected_count = 0
+        for segment in image_segments:
+            seg_data = segment.get("data") or {}
+            image_input = await _resolve_image_input_from_segment_data(event, seg_data)
+            if not image_input or image_input in existing_urls:
+                continue
+            req.image_urls.append(image_input)
+            existing_urls.add(image_input)
+            injected_count += 1
+        if injected_count > 0:
+            logger.debug(
+                "[LLMEnhancement] 已将合并消息中的图片补入 req.image_urls："
+                f"group={getattr(event, 'get_group_id', lambda: None)() or 'private'}, "
+                f"uid={getattr(event, 'get_sender_id', lambda: None)()}, count={injected_count}"
+            )
+        return {"mode": "image", "image_count": injected_count, "caption_count": 0}
+
+    provider_settings = (
+        framework_provider_settings
+        if isinstance(framework_provider_settings, dict)
+        else {}
+    )
+    caption_provider_id = str(
+        provider_settings.get("default_image_caption_provider_id", "") or ""
+    ).strip()
+    if not caption_provider_id:
+        logger.debug(
+            "[LLMEnhancement] 当前 Provider 不支持视觉，且未配置图像转述模型，跳过合并图片注入："
+            f"group={getattr(event, 'get_group_id', lambda: None)() or 'private'}, "
+            f"uid={getattr(event, 'get_sender_id', lambda: None)()}, image_count={len(image_segments)}"
+        )
+        return {"mode": "skip", "image_count": len(image_segments), "caption_count": 0}
+
+    caption_count = 0
+    for segment in image_segments:
+        caption = await try_get_image_caption(
+            event=event,
+            message_chain=[segment],
+            raw_image_datas=None,
+            get_cfg=get_cfg,
+            provider_by_id_resolver=provider_by_id_resolver,
+            default_provider_resolver=default_provider_resolver,
+            preferred_provider_id=caption_provider_id,
+            allow_default_provider=False,
+        )
+        if not caption:
+            continue
+        caption_text = f"<image_caption>{caption}</image_caption>"
+        if not append_text_part_to_request(req, caption_text, mark_temp=False):
+            req.prompt = f"{(req.prompt or '').strip()}\n\n{caption_text}".strip()
+        caption_count += 1
+
+    if caption_count > 0:
+        logger.debug(
+            "[LLMEnhancement] 当前 Provider 不支持视觉，已改为注入合并图片转述："
+            f"group={getattr(event, 'get_group_id', lambda: None)() or 'private'}, "
+            f"uid={getattr(event, 'get_sender_id', lambda: None)()}, "
+            f"image_count={len(image_segments)}, caption_count={caption_count}, "
+            f"caption_provider={caption_provider_id}"
+        )
+        return {"mode": "caption", "image_count": len(image_segments), "caption_count": caption_count}
+
+    logger.debug(
+        "[LLMEnhancement] 当前 Provider 不支持视觉，但合并图片转述未产出内容："
+        f"group={getattr(event, 'get_group_id', lambda: None)() or 'private'}, "
+        f"uid={getattr(event, 'get_sender_id', lambda: None)()}, "
+        f"image_count={len(image_segments)}, caption_provider={caption_provider_id}"
+    )
+    return {"mode": "caption", "image_count": len(image_segments), "caption_count": 0}
 
 
 def _extract_forward_id_from_chain(message_chain: Any) -> str:
@@ -1163,7 +1358,8 @@ def inject_active_wake_note_into_request(
         return False, "skip:not_active_wake", ""
 
     wake_type = _classify_active_wake_reason(wake_reason) or "other"
-    req.prompt = f"{(req.prompt or '').strip()}\n\n{block}".strip()
+    if not append_text_part_to_request(req, block, mark_temp=True):
+        req.prompt = f"{(req.prompt or '').strip()}\n\n{block}".strip()
     return True, f"active_wake:{wake_type}", block
 
 
@@ -1586,7 +1782,8 @@ def inject_context_into_request(
         + "\n".join(lines)
         + "\n[说明] 以上为最近对话片段，请结合其连续性理解当前消息。"
     )
-    req.prompt = f"{(req.prompt or '').strip()}{block}".strip()
+    if not append_text_part_to_request(req, block, mark_temp=True):
+        req.prompt = f"{(req.prompt or '').strip()}{block}".strip()
     return True, f"injected:{len(lines)}", block.strip()
 
 

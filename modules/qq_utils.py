@@ -12,6 +12,7 @@ from astrbot.api.event import AstrMessageEvent
 import astrbot.api.message_components as Comp
 
 from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import AiocqhttpMessageEvent
+from .runtime_helpers import append_text_part_to_request
 
 try:
     import chinese_calendar as calendar_cn
@@ -580,8 +581,9 @@ async def inject_perception_context_info(
         return False
 
     context_prompt = f"\n\n[环境感知]{json.dumps(display_payload, ensure_ascii=False, separators=(',', ':'))}"
-    user_question = str(getattr(req, "prompt", "") or "").strip()
-    req.prompt = (user_question + context_prompt) if user_question else context_prompt.strip()
+    if not append_text_part_to_request(req, context_prompt, mark_temp=True):
+        user_question = str(getattr(req, "prompt", "") or "").strip()
+        req.prompt = (user_question + context_prompt) if user_question else context_prompt.strip()
     logger.debug(
         "[LLMEnhancement] 环境感知注入完成："
         f"injected={context_prompt.strip()}"
@@ -886,8 +888,9 @@ async def _inject_group_member_info(
 
     compact_payload = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
     context_prompt = f"\n\n[成员信息:{subject_label}]{compact_payload}"
-    user_question = str(getattr(req, "prompt", "") or "").strip()
-    req.prompt = (user_question + context_prompt) if user_question else context_prompt.strip()
+    if not append_text_part_to_request(req, context_prompt, mark_temp=True):
+        user_question = str(getattr(req, "prompt", "") or "").strip()
+        req.prompt = (user_question + context_prompt) if user_question else context_prompt.strip()
     logger.debug(
         "[LLMEnhancement] 群成员信息注入完成："
         f"injected={context_prompt.strip()}"
@@ -1039,76 +1042,103 @@ async def process_group_members_info(event: AstrMessageEvent, group_id: Optional
 
 async def process_group_member_info(
     event: AstrMessageEvent,
-    user_id: Optional[str] = None,
+    user_ids: Optional[str] = None,
     group_id: Optional[str] = None,
     no_cache: bool = False,
 ) -> str:
-    """获取并处理单个QQ群成员信息。"""
+    """
+    获取并处理单个或多个QQ群成员信息。支持批量获取。
+    """
     start_time = time.time()
 
     try:
         target_group_id = group_id or event.get_group_id()
-        target_user_id = user_id or event.get_sender_id()
         if not target_group_id:
             logger.info("用户在非群聊环境中调用群成员详情工具且未提供群号")
             return json.dumps({"error": "未识别到群聊环境，请提供目标群号。"}, ensure_ascii=False)
-        if not target_user_id:
-            return json.dumps({"error": "请提供目标用户ID(user_id)。"}, ensure_ascii=False)
 
-        if not isinstance(event, AiocqhttpMessageEvent):
-            logger.info(f"不支持的平台: {event.get_platform_name()}")
-            return json.dumps(
-                {"error": f"此功能仅支持QQ群聊(aiocqhttp平台)，当前平台为 {event.get_platform_name()}"},
-                ensure_ascii=False,
+        user_id_list = _parse_user_id_list(user_ids) if user_ids else []
+        if not user_id_list:
+            return json.dumps({"error": "请提供目标用户ID列表（user_ids）。"}, ensure_ascii=False)
+
+        results = []
+        success_count = 0
+        fail_count = 0
+
+        for target_user_id in user_id_list:
+            target_user_id = str(target_user_id or "").strip()
+            if not target_user_id:
+                fail_count += 1
+                results.append({"user_id": target_user_id, "success": False, "error": "empty user_id"})
+                continue
+
+            if not isinstance(event, AiocqhttpMessageEvent):
+                logger.info(f"不支持的平台: {event.get_platform_name()}")
+                fail_count += 1
+                results.append({"user_id": target_user_id, "success": False, "error": f"此功能仅支持QQ群聊(aiocqhttp平台)，当前平台为 {event.get_platform_name()}"})
+                continue
+
+            member_info = await get_group_member_info_internal(
+                event,
+                group_id=target_group_id,
+                user_id=target_user_id,
+                no_cache=no_cache,
+            )
+            if not member_info:
+                logger.info(f"无法获取群 {target_group_id} 用户 {target_user_id} 的成员信息")
+                fail_count += 1
+                results.append({"user_id": target_user_id, "success": False, "error": f"无法获取群 {target_group_id} 用户 {target_user_id} 的成员信息。"})
+                continue
+
+            stranger_info = await get_stranger_info_internal(
+                event,
+                user_id=target_user_id,
+                no_cache=no_cache,
+            )
+            merged_member_info = _build_injectable_member_info(member_info, stranger_info)
+
+            if "group_id" in merged_member_info:
+                merged_member_info["group_id"] = str(merged_member_info.get("group_id"))
+            if "user_id" in merged_member_info:
+                merged_member_info["user_id"] = str(merged_member_info.get("user_id"))
+
+            last_sent_time_raw = _safe_int(member_info.get("last_sent_time"))
+            shut_up_timestamp_raw = _safe_int(member_info.get("shut_up_timestamp"))
+            merged_member_info["last_sent_time"] = (
+                _format_unix_timestamp(last_sent_time_raw) if last_sent_time_raw and last_sent_time_raw > 0 else ""
+            )
+            merged_member_info["shut_up_timestamp"] = (
+                _format_unix_timestamp(shut_up_timestamp_raw) if shut_up_timestamp_raw and shut_up_timestamp_raw > 0 else ""
             )
 
-        member_info = await get_group_member_info_internal(
-            event,
-            group_id=target_group_id,
-            user_id=target_user_id,
-            no_cache=no_cache,
-        )
-        if not member_info:
-            logger.info(f"无法获取群 {target_group_id} 用户 {target_user_id} 的成员信息")
-            return json.dumps(
-                {"error": f"无法获取群 {target_group_id} 用户 {target_user_id} 的成员信息。"},
-                ensure_ascii=False,
-            )
+            result = {
+                "group_id": str(target_group_id),
+                "user_id": str(target_user_id),
+                "no_cache": bool(no_cache),
+                "member": merged_member_info,
+                "member_timestamps": {
+                    "last_sent_time_text": _format_unix_timestamp(last_sent_time_raw),
+                    "shut_up_timestamp_text": _format_unix_timestamp(shut_up_timestamp_raw),
+                },
+            }
+            results.append(result)
+            success_count += 1
 
-        stranger_info = await get_stranger_info_internal(
-            event,
-            user_id=target_user_id,
-            no_cache=no_cache,
-        )
-        merged_member_info = _build_injectable_member_info(member_info, stranger_info)
-
-        if "group_id" in merged_member_info:
-            merged_member_info["group_id"] = str(merged_member_info.get("group_id"))
-        if "user_id" in merged_member_info:
-            merged_member_info["user_id"] = str(merged_member_info.get("user_id"))
-
-        last_sent_time_raw = _safe_int(member_info.get("last_sent_time"))
-        shut_up_timestamp_raw = _safe_int(member_info.get("shut_up_timestamp"))
-        merged_member_info["last_sent_time"] = (
-            _format_unix_timestamp(last_sent_time_raw) if last_sent_time_raw and last_sent_time_raw > 0 else ""
-        )
-        merged_member_info["shut_up_timestamp"] = (
-            _format_unix_timestamp(shut_up_timestamp_raw) if shut_up_timestamp_raw and shut_up_timestamp_raw > 0 else ""
-        )
-
-        result = {
-            "group_id": str(target_group_id),
-            "user_id": str(target_user_id),
-            "no_cache": bool(no_cache),
-            "member": merged_member_info,
-            "member_timestamps": {
-                "last_sent_time_text": _format_unix_timestamp(last_sent_time_raw),
-                "shut_up_timestamp_text": _format_unix_timestamp(shut_up_timestamp_raw),
-            },
-        }
         elapsed_time = time.time() - start_time
-        logger.info(f"成功获取群 {target_group_id} 用户 {target_user_id} 的成员详情，耗时 {elapsed_time:.2f}s")
-        return json.dumps(result, ensure_ascii=False, indent=2)
+
+        if len(user_id_list) == 1:
+            if results and results[0].get("success") != False:
+                logger.info(f"成功获取群 {target_group_id} 用户 {user_id_list[0]} 的成员详情，耗时 {elapsed_time:.2f}s")
+                return json.dumps(results[0], ensure_ascii=False, indent=2)
+            return json.dumps(results[0] if results else {"error": "未知错误"}, ensure_ascii=False)
+
+        logger.info(f"批量获取群成员详情完成： success={success_count}, fail={fail_count}, elapsed={elapsed_time:.2f}s")
+        return json.dumps({
+            "success_count": success_count,
+            "fail_count": fail_count,
+            "group_id": str(target_group_id),
+            "results": results
+        }, ensure_ascii=False, indent=2)
     except Exception as e:
         elapsed_time = time.time() - start_time
         logger.info(f"获取群成员详情时发生错误: {e}，耗时 {elapsed_time:.2f}s")
@@ -1135,85 +1165,115 @@ def _json_success(message: str, **extra: Any) -> str:
     return json.dumps(payload, ensure_ascii=False, indent=2)
 
 
-async def process_user_avatar(event: AstrMessageEvent, user_id: str) -> Any:
+async def process_user_avatar(event: AstrMessageEvent, user_ids: str) -> Any:
     """
-    获取指定 QQ 用户头像，并作为 Tool 的图片结果返回给 LLM。
+    获取指定 QQ 用户头像，并作为 Tool 的图片结果返回给 LLM。支持批量获取。
     """
     start_time = time.time()
     try:
         if not isinstance(event, AiocqhttpMessageEvent):
             return _json_error(f"此功能仅支持 QQ 平台 (aiocqhttp)，当前平台为 {event.get_platform_name()}")
 
-        target_user_id = str(user_id or "").strip() or str(event.get_sender_id() or "").strip()
-        if not target_user_id:
-            return _json_error("无法确定目标 QQ 号。")
+        user_id_list = _parse_user_id_list(user_ids)
+        if not user_id_list:
+            return _json_error("无效的用户 ID 列表。")
 
-        avatar_url = f"https://q1.qlogo.cn/g?b=qq&nk={target_user_id}&s=640"
+        results = []
+        success_count = 0
+        fail_count = 0
 
-        from .video_parser import download_video_to_temp
+        for target_user_id in user_id_list:
+            target_user_id = str(target_user_id or "").strip()
+            if not target_user_id:
+                fail_count += 1
+                results.append({"user_id": target_user_id, "success": False, "error": "empty user_id"})
+                continue
 
-        local_avatar_path = str(await download_video_to_temp(avatar_url, 5) or "").strip()
-        if not local_avatar_path:
-            logger.info(
-                "[LLMEnhancement] 头像注入失败："
-                f"uid={target_user_id}, reason=download_failed, avatar_url={avatar_url}"
+            avatar_url = f"https://q1.qlogo.cn/g?b=qq&nk={target_user_id}&s=640"
+
+            from .video_parser import download_video_to_temp
+
+            local_avatar_path = str(await download_video_to_temp(avatar_url, 5) or "").strip()
+            if not local_avatar_path:
+                logger.info(
+                    "[LLMEnhancement] 头像下载失败："
+                    f"uid={target_user_id}, reason=download_failed, avatar_url={avatar_url}"
+                )
+                fail_count += 1
+                results.append({"user_id": target_user_id, "success": False, "error": "头像下载失败"})
+                continue
+
+            req = getattr(event, "_provider_req", None) or getattr(event, "request", None)
+            cleanup_registered = False
+            cleanup_count = 0
+            if req is not None:
+                cleanup_paths = getattr(req, "_cleanup_paths", None)
+                if cleanup_paths is None:
+                    cleanup_paths = []
+                    setattr(req, "_cleanup_paths", cleanup_paths)
+                elif not isinstance(cleanup_paths, list):
+                    try:
+                        cleanup_paths = [str(p).strip() for p in list(cleanup_paths) if str(p).strip()]
+                    except Exception:
+                        single = str(cleanup_paths).strip()
+                        cleanup_paths = [single] if single else []
+                    setattr(req, "_cleanup_paths", cleanup_paths)
+                if local_avatar_path not in cleanup_paths:
+                    cleanup_paths.append(local_avatar_path)
+                    cleanup_registered = True
+                cleanup_count = len(cleanup_paths)
+
+            lower_path = local_avatar_path.lower()
+            mime_type = "image/jpeg"
+            if lower_path.endswith(".png"):
+                mime_type = "image/png"
+            elif lower_path.endswith(".gif"):
+                mime_type = "image/gif"
+            elif lower_path.endswith(".webp"):
+                mime_type = "image/webp"
+
+            with open(local_avatar_path, "rb") as f:
+                avatar_bs64 = base64.b64encode(f.read()).decode("utf-8")
+
+            import mcp
+
+            elapsed = time.time() - start_time
+            logger.debug(
+                "[LLMEnhancement] 头像下载完成："
+                f"uid={target_user_id}, avatar_url={avatar_url}, local_path={local_avatar_path}, "
+                f"mime_type={mime_type}, cleanup_registered={cleanup_registered}, cleanup_count={cleanup_count}, elapsed={elapsed:.2f}s"
             )
-            return _json_error("头像下载失败，未能完成注入。", user_id=target_user_id)
 
-        req = getattr(event, "_provider_req", None) or getattr(event, "request", None)
-        cleanup_registered = False
-        cleanup_count = 0
-        if req is not None:
-            cleanup_paths = getattr(req, "_cleanup_paths", None)
-            if cleanup_paths is None:
-                cleanup_paths = []
-                setattr(req, "_cleanup_paths", cleanup_paths)
-            elif not isinstance(cleanup_paths, list):
-                try:
-                    cleanup_paths = [str(p).strip() for p in list(cleanup_paths) if str(p).strip()]
-                except Exception:
-                    single = str(cleanup_paths).strip()
-                    cleanup_paths = [single] if single else []
-                setattr(req, "_cleanup_paths", cleanup_paths)
-            if local_avatar_path not in cleanup_paths:
-                cleanup_paths.append(local_avatar_path)
-                cleanup_registered = True
-            cleanup_count = len(cleanup_paths)
-
-        lower_path = local_avatar_path.lower()
-        mime_type = "image/jpeg"
-        if lower_path.endswith(".png"):
-            mime_type = "image/png"
-        elif lower_path.endswith(".gif"):
-            mime_type = "image/gif"
-        elif lower_path.endswith(".webp"):
-            mime_type = "image/webp"
-
-        with open(local_avatar_path, "rb") as f:
-            avatar_bs64 = base64.b64encode(f.read()).decode("utf-8")
-
-        import mcp
+            results.append({
+                "user_id": target_user_id,
+                "success": True,
+                "avatar_url": avatar_url,
+                "local_path": local_avatar_path,
+                "mime_type": mime_type
+            })
+            success_count += 1
 
         elapsed = time.time() - start_time
-        logger.debug(
-            "[LLMEnhancement] 头像工具图片已准备："
-            f"uid={target_user_id}, avatar_url={avatar_url}, local_path={local_avatar_path}, "
-            f"mime_type={mime_type}, cleanup_registered={cleanup_registered}, cleanup_count={cleanup_count}, elapsed={elapsed:.2f}s"
-        )
+        logger.info(f"头像批量获取完成： success={success_count}, fail={fail_count}, elapsed={elapsed:.2f}s")
+
+        if len(user_id_list) == 1:
+            if results and results[0].get("success"):
+                with open(results[0]["local_path"], "rb") as f:
+                    avatar_bs64 = base64.b64encode(f.read()).decode("utf-8")
+                return mcp.types.CallToolResult(
+                    content=[mcp.types.ImageContent(type="image", data=avatar_bs64, mimeType=results[0]["mime_type"])]
+                )
+            else:
+                return _json_error(results[0].get("error", "头像获取失败"), user_id=results[0].get("user_id"))
+            return _json_error("未知错误")
 
         return mcp.types.CallToolResult(
-            content=[
-                mcp.types.ImageContent(
-                    type="image",
-                    data=avatar_bs64,
-                    mimeType=mime_type,
-                )
-            ]
+            content=[mcp.types.TextContent(type="text", text=json.dumps({"success_count": success_count, "fail_count": fail_count, "results": results}, ensure_ascii=False))]
         )
     except Exception as e:
         elapsed = time.time() - start_time
-        logger.info(f"头像注入时发生错误: {e}，耗时 {elapsed:.2f}s")
-        return _json_error("头像注入失败。", error=str(e))
+        logger.info(f"头像获取时出现异常： {e}，耗时 {elapsed:.2f}s")
+        return _json_error("头像获取失败。", error=str(e))
 
 def _ensure_group_write_context(
     event: AstrMessageEvent,
@@ -1295,7 +1355,6 @@ async def _is_llbot_backend(event: AstrMessageEvent) -> bool:
     if isinstance(cached, bool):
         return cached
 
-    is_llbot = False
     try:
         version_info = await api.call_action("get_version_info")
         app_name = None
@@ -1305,12 +1364,19 @@ async def _is_llbot_backend(event: AstrMessageEvent) -> bool:
                 app_name = version_info["data"].get("app_name")
         is_llbot = app_name == "LLOneBot"
     except Exception:
-        is_llbot = False
+        logger.debug(
+            "[LLMEnhancement] 懒检测调用 get_version_info 失败。",
+            exc_info=True,
+        )
+        return False
 
     try:
         setattr(client, "_llm_enhancement_is_llbot", is_llbot)
     except Exception:
-        pass
+        logger.debug(
+            "[LLMEnhancement] 缓存懒检测结果失败。",
+            exc_info=True,
+        )
     return is_llbot
 
 
@@ -1751,14 +1817,14 @@ async def send_message_logic(
     event: AstrMessageEvent,
     chat_type: str,
     message: str,
-    group_id: Optional[str] = None,
-    user_id: Optional[str] = None,
+    group_ids: Optional[str] = None,
+    user_ids: Optional[str] = None,
     auto_escape: bool = False,
 ) -> str:
     """
     统一消息发送逻辑：
-    - chat_type=group 时调用 send_group_msg
-    - chat_type=private 时调用 send_private_msg
+    - chat_type=group 时调用 send_group_msg，支持批量发送
+    - chat_type=private 时调用 send_private_msg，支持批量发送
     """
     try:
         if not isinstance(event, AiocqhttpMessageEvent):
@@ -1770,42 +1836,116 @@ async def send_message_logic(
             return _json_error("请提供要发送的消息内容(message)。")
 
         if normalized_type in {"group", "群", "group_chat"}:
-            target_group_id = str(group_id or event.get_group_id() or "").strip()
-            if not target_group_id:
-                return _json_error("chat_type=group 时请提供 group_id，或在群聊环境中调用。")
-            raw_result = await _call_action(
-                event,
-                "send_group_msg",
-                fallback_method="send_group_msg",
-                group_id=_coerce_numeric_id(target_group_id),
-                message=msg_text,
-                auto_escape=_to_bool(auto_escape, False),
-            )
-            return _json_success(
-                "群消息发送成功。",
-                chat_type="group",
-                group_id=target_group_id,
-                message_id=_extract_sent_message_id(raw_result),
-            )
+            group_id_list = _parse_user_id_list(group_ids) if group_ids else []
+            if not group_id_list:
+                gid = event.get_group_id()
+                if gid:
+                    group_id_list = [gid]
+            if not group_id_list:
+                return _json_error("chat_type=group 时请提供 group_ids，或在群聊环境中调用。")
+
+            results = []
+            success_count = 0
+            fail_count = 0
+
+            for target_group_id in group_id_list:
+                target_group_id = str(target_group_id or "").strip()
+                if not target_group_id:
+                    fail_count += 1
+                    results.append({"group_id": target_group_id, "success": False, "error": "empty group_id"})
+                    continue
+
+                try:
+                    raw_result = await _call_action(
+                        event,
+                        "send_group_msg",
+                        fallback_method="send_group_msg",
+                        group_id=_coerce_numeric_id(target_group_id),
+                        message=msg_text,
+                        auto_escape=_to_bool(auto_escape, False),
+                    )
+                    results.append({
+                        "group_id": target_group_id,
+                        "success": True,
+                        "message_id": _extract_sent_message_id(raw_result)
+                    })
+                    success_count += 1
+                except Exception as e:
+                    fail_count += 1
+                    results.append({"group_id": target_group_id, "success": False, "error": str(e)})
+
+            if len(group_id_list) == 1:
+                if results and results[0].get("success"):
+                    return _json_success(
+                        "群消息发送成功。",
+                        chat_type="group",
+                        group_id=group_id_list[0],
+                        message_id=results[0].get("message_id"),
+                    )
+                return _json_error(results[0].get("error", "发送失败"), group_id=group_id_list[0])
+
+            return json.dumps({
+                "success_count": success_count,
+                "fail_count": fail_count,
+                "chat_type": "group",
+                "results": results
+            }, ensure_ascii=False)
 
         if normalized_type in {"private", "好友", "friend", "private_chat"}:
-            target_user_id = str(user_id or event.get_sender_id() or "").strip()
-            if not target_user_id:
-                return _json_error("chat_type=private 时请提供 user_id。")
-            raw_result = await _call_action(
-                event,
-                "send_private_msg",
-                fallback_method="send_private_msg",
-                user_id=_coerce_numeric_id(target_user_id),
-                message=msg_text,
-                auto_escape=_to_bool(auto_escape, False),
-            )
-            return _json_success(
-                "私聊消息发送成功。",
-                chat_type="private",
-                user_id=target_user_id,
-                message_id=_extract_sent_message_id(raw_result),
-            )
+            user_id_list = _parse_user_id_list(user_ids) if user_ids else []
+            if not user_id_list:
+                uid = event.get_sender_id()
+                if uid:
+                    user_id_list = [uid]
+            if not user_id_list:
+                return _json_error("chat_type=private 时请提供 user_ids。")
+
+            results = []
+            success_count = 0
+            fail_count = 0
+
+            for target_user_id in user_id_list:
+                target_user_id = str(target_user_id or "").strip()
+                if not target_user_id:
+                    fail_count += 1
+                    results.append({"user_id": target_user_id, "success": False, "error": "empty user_id"})
+                    continue
+
+                try:
+                    raw_result = await _call_action(
+                        event,
+                        "send_private_msg",
+                        fallback_method="send_private_msg",
+                        user_id=_coerce_numeric_id(target_user_id),
+                        message=msg_text,
+                        auto_escape=_to_bool(auto_escape, False),
+                    )
+                    results.append({
+                        "user_id": target_user_id,
+                        "success": True,
+                        "message_id": _extract_sent_message_id(raw_result)
+                    })
+                    success_count += 1
+                except Exception as e:
+                    fail_count += 1
+                    results.append({"user_id": target_user_id, "success": False, "error": str(e)})
+
+            if len(user_id_list) == 1:
+                if results and results[0].get("success"):
+                    return _json_success(
+                        "私聊消息发送成功。",
+                        chat_type="private",
+                        user_id=user_id_list[0],
+                        message_id=results[0].get("message_id"),
+                    )
+                return _json_error(results[0].get("error", "发送失败"), user_id=user_id_list[0])
+
+            return json.dumps({
+                "success_count": success_count,
+                "fail_count": fail_count,
+                "chat_type": "private",
+                "results": results
+            }, ensure_ascii=False)
 
         return _json_error("chat_type 仅支持 group 或 private。")
     except Exception as e:
@@ -2128,7 +2268,7 @@ async def get_friend_msg_history_internal(
 
 async def process_group_msg_history(
     event: AstrMessageEvent,
-    group_id: Optional[str] = None,
+    group_ids: str = "",
     count: int = 50,
     search_keywords: str = "",
     time_range: str = "",
@@ -2137,11 +2277,16 @@ async def process_group_msg_history(
     获取并处理群历史消息，支持:
     - 关键词包含匹配(多个关键词)
     - 时间范围过滤
+    - 批量查询多个群
     """
     start_time = time.time()
     try:
-        target_group_id = group_id or event.get_group_id()
-        if not target_group_id:
+        group_id_list = _parse_user_id_list(group_ids) if group_ids else []
+        if not group_id_list:
+            gid = event.get_group_id()
+            if gid:
+                group_id_list = [gid]
+        if not group_id_list:
             return _json_error("未识别到群聊环境，请提供目标群号。")
         if not isinstance(event, AiocqhttpMessageEvent):
             return _json_error(
@@ -2154,146 +2299,184 @@ async def process_group_msg_history(
         if range_err:
             return _json_error(range_err)
 
-        # 50 为接口单页上限，按页向前翻，直到满足返回条件或达到扫描上限。
-        page_size = 50
-        scan_limit = max(200, min(5000, safe_count * 20))
-        # message_seq=0 表示从“最新窗口”开始拉取，避免命中陈旧缓存窗口。
-        cursor_seq = "0"
-        scanned = 0
-        matched: List[Dict[str, Any]] = []
-        seen_msg_keys: set[str] = set()
-        seen_seq: set[str] = set()
-        content_total_chars = 0
-        content_truncated_count = 0
-        content_budget_reached = False
+        all_results = []
+        total_scanned = 0
+        total_matched = 0
 
-        while scanned < scan_limit and len(matched) < safe_count:
-            page = await get_group_msg_history_internal(
-                event=event,
-                group_id=str(target_group_id),
-                count=page_size,
-                message_seq=cursor_seq,
-            )
-            if not page:
-                break
+        for target_group_id in group_id_list:
+            target_group_id = str(target_group_id or "").strip()
+            if not target_group_id:
+                all_results.append({"group_id": target_group_id, "success": False, "error": "empty group_id"})
+                continue
 
-            oldest_ts_in_page: Optional[int] = None
-            stop_by_time_window = False
-            page_old_to_new = _is_page_old_to_new(page)
-            iter_page = list(reversed(page)) if page_old_to_new else page
-            for item in iter_page:
-                if not isinstance(item, dict):
-                    continue
-                scanned += 1
+            # 50 为接口单页上限，按页向前翻，直到满足返回条件或达到扫描上限。
+            page_size = 50
+            scan_limit = max(200, min(5000, safe_count * 20))
+            cursor_seq = "0"
+            scanned = 0
+            matched: List[Dict[str, Any]] = []
+            seen_msg_keys: set[str] = set()
+            seen_seq: set[str] = set()
+            content_total_chars = 0
+            content_truncated_count = 0
+            content_budget_reached = False
 
-                msg_id = _extract_msg_id(item)
-                msg_seq = _extract_msg_seq(item)
-                uniq_key = msg_id or f"seq:{msg_seq}" or f"scan:{scanned}"
-                if uniq_key in seen_msg_keys:
-                    continue
-                seen_msg_keys.add(uniq_key)
-
-                msg_ts = _extract_msg_time(item)
-                if msg_ts is not None:
-                    if oldest_ts_in_page is None or msg_ts < oldest_ts_in_page:
-                        oldest_ts_in_page = msg_ts
-                    if end_ts is not None and msg_ts > end_ts:
-                        continue
-                    if start_ts is not None and msg_ts < start_ts:
-                        # 通常消息按时间倒序分页，命中后可提前结束当前页后续扫描。
-                        stop_by_time_window = True
-                        continue
-
-                sender = item.get("sender")
-                text = _message_to_text(item.get("message"), str(item.get("raw_message") or ""))
-                if not text:
-                    text = "[空消息]"
-
-                if keywords and not any(k in text for k in keywords):
-                    continue
-
-                text, truncated, content_total_chars, reached_budget = _trim_history_content(
-                    text,
-                    content_total_chars,
+            while scanned < scan_limit and len(matched) < safe_count:
+                page = await get_group_msg_history_internal(
+                    event=event,
+                    group_id=str(target_group_id),
+                    count=page_size,
+                    message_seq=cursor_seq,
                 )
-                if reached_budget:
-                    content_budget_reached = True
-                if not text:
-                    if reached_budget:
-                        break
-                    continue
-                if truncated:
-                    content_truncated_count += 1
-
-                item_payload: Dict[str, Any] = {
-                    "message_id": msg_id,
-                    "time": msg_ts,
-                    "time_text": (
-                        datetime.fromtimestamp(msg_ts).strftime("%Y-%m-%d %H:%M:%S")
-                        if isinstance(msg_ts, int) and msg_ts > 0
-                        else ""
-                    ),
-                    "user_id": str((sender or {}).get("user_id") or item.get("user_id") or ""),
-                    "sender_name": _sender_to_name(sender),
-                    "content": text,
-                }
-                # message_seq 在大多数平台实现里常与 message_id 一致，冗余时不返回以节省 token。
-                if msg_seq and (not msg_id or msg_seq != msg_id):
-                    item_payload["message_seq"] = msg_seq
-                if truncated:
-                    item_payload["content_truncated"] = True
-                matched.append(item_payload)
-                if len(matched) >= safe_count:
+                if not page:
                     break
 
-            if len(matched) >= safe_count:
-                break
-            if content_budget_reached:
-                break
-            if stop_by_time_window and start_ts is not None:
-                break
+                oldest_ts_in_page: Optional[int] = None
+                stop_by_time_window = False
+                page_old_to_new = _is_page_old_to_new(page)
+                iter_page = list(reversed(page)) if page_old_to_new else page
+                for item in iter_page:
+                    if not isinstance(item, dict):
+                        continue
+                    scanned += 1
 
-            # 翻页锚点始终取“本页最旧消息”的 seq/id，向更早历史继续翻。
-            oldest_item = page[0] if page_old_to_new else page[-1]
-            next_seq = _extract_msg_seq(oldest_item) or _extract_msg_id(oldest_item)
-            next_seq = str(next_seq or "").strip()
-            if not next_seq:
-                break
-            if next_seq == cursor_seq or next_seq in seen_seq:
-                break
-            seen_seq.add(next_seq)
-            cursor_seq = next_seq
+                    msg_id = _extract_msg_id(item)
+                    msg_seq = _extract_msg_seq(item)
+                    uniq_key = msg_id or f"seq:{msg_seq}" or f"scan:{scanned}"
+                    if uniq_key in seen_msg_keys:
+                        continue
+                    seen_msg_keys.add(uniq_key)
 
-            if oldest_ts_in_page is not None and start_ts is not None and oldest_ts_in_page < start_ts:
-                break
+                    msg_ts = _extract_msg_time(item)
+                    if msg_ts is not None:
+                        if oldest_ts_in_page is None or msg_ts < oldest_ts_in_page:
+                            oldest_ts_in_page = msg_ts
+                        if end_ts is not None and msg_ts > end_ts:
+                            continue
+                        if start_ts is not None and msg_ts < start_ts:
+                            stop_by_time_window = True
+                            continue
 
-        # 兜底统一排序，确保返回结果始终按“最新 -> 最旧”。
-        matched.sort(key=_history_item_sort_key, reverse=True)
-        if len(matched) > safe_count:
-            matched = matched[:safe_count]
+                    sender = item.get("sender")
+                    text = _message_to_text(item.get("message"), str(item.get("raw_message") or ""))
+                    if not text:
+                        text = "[空消息]"
 
-        result = {
+                    if keywords and not any(k in text for k in keywords):
+                        continue
+
+                    text, truncated, content_total_chars, reached_budget = _trim_history_content(
+                        text,
+                        content_total_chars,
+                    )
+                    if reached_budget:
+                        content_budget_reached = True
+                    if not text:
+                        if reached_budget:
+                            break
+                        continue
+                    if truncated:
+                        content_truncated_count += 1
+
+                    item_payload: Dict[str, Any] = {
+                        "message_id": msg_id,
+                        "time": msg_ts,
+                        "time_text": (
+                            datetime.fromtimestamp(msg_ts).strftime("%Y-%m-%d %H:%M:%S")
+                            if isinstance(msg_ts, int) and msg_ts > 0
+                            else ""
+                        ),
+                        "user_id": str((sender or {}).get("user_id") or item.get("user_id") or ""),
+                        "sender_name": _sender_to_name(sender),
+                        "content": text,
+                    }
+                    if msg_seq and (not msg_id or msg_seq != msg_id):
+                        item_payload["message_seq"] = msg_seq
+                    if truncated:
+                        item_payload["content_truncated"] = True
+                    matched.append(item_payload)
+                    if len(matched) >= safe_count:
+                        break
+
+                if len(matched) >= safe_count:
+                    break
+                if content_budget_reached:
+                    break
+                if stop_by_time_window and start_ts is not None:
+                    break
+
+                oldest_item = page[0] if page_old_to_new else page[-1]
+                next_seq = _extract_msg_seq(oldest_item) or _extract_msg_id(oldest_item)
+                next_seq = str(next_seq or "").strip()
+                if not next_seq:
+                    break
+                if next_seq == cursor_seq or next_seq in seen_seq:
+                    break
+                seen_seq.add(next_seq)
+                cursor_seq = next_seq
+
+                if oldest_ts_in_page is not None and start_ts is not None and oldest_ts_in_page < start_ts:
+                    break
+
+            matched.sort(key=_history_item_sort_key, reverse=True)
+            if len(matched) > safe_count:
+                matched = matched[:safe_count]
+
+            total_scanned += scanned
+            total_matched += len(matched)
+            all_results.append({
+                "group_id": str(target_group_id),
+                "success": True,
+                "requested_count": safe_count,
+                "returned_count": len(matched),
+                "scanned_count": scanned,
+                "scan_limit": scan_limit,
+                "content_total_chars": content_total_chars,
+                "content_truncated_count": content_truncated_count,
+                "content_budget_reached": content_budget_reached,
+                "messages": matched,
+            })
+
+        elapsed_time = time.time() - start_time
+
+        if len(group_id_list) == 1:
+            if all_results and all_results[0].get("success"):
+                logger.info(f"成功获取群 {group_id_list[0]} 历史消息，返回 {total_matched} 条，耗时 {elapsed_time:.2f}s")
+                result = {
+                    "chat_type": "group",
+                    "group_id": str(group_id_list[0]),
+                    "requested_count": safe_count,
+                    "returned_count": total_matched,
+                    "scanned_count": total_scanned,
+                    "scan_limit": max(200, min(5000, safe_count * 20)),
+                    "sort_order": "time_desc",
+                    "content_char_limit_per_message": HISTORY_CONTENT_MAX_CHARS_PER_MESSAGE,
+                    "content_char_limit_total": HISTORY_CONTENT_MAX_CHARS_TOTAL,
+                    "search_keywords": keywords,
+                    "time_range": str(time_range or "").strip(),
+                    "start_ts": start_ts,
+                    "end_ts": end_ts,
+                    "messages": all_results[0].get("messages", []),
+                }
+                return json.dumps(result, ensure_ascii=False, indent=2)
+            return json.dumps(all_results[0] if all_results else {"error": "未知错误"}, ensure_ascii=False)
+
+        logger.info(f"批量获取群历史消息完成：groups={len(group_id_list)}, total_returned={total_matched}, elapsed={elapsed_time:.2f}s")
+        return json.dumps({
             "chat_type": "group",
-            "group_id": str(target_group_id),
-            "requested_count": safe_count,
-            "returned_count": len(matched),
-            "scanned_count": scanned,
-            "scan_limit": scan_limit,
+            "group_count": len(group_id_list),
+            "total_returned_count": total_matched,
+            "total_scanned_count": total_scanned,
+            "requested_count_per_group": safe_count,
             "sort_order": "time_desc",
             "content_char_limit_per_message": HISTORY_CONTENT_MAX_CHARS_PER_MESSAGE,
             "content_char_limit_total": HISTORY_CONTENT_MAX_CHARS_TOTAL,
-            "content_total_chars": content_total_chars,
-            "content_truncated_count": content_truncated_count,
-            "content_budget_reached": content_budget_reached,
             "search_keywords": keywords,
             "time_range": str(time_range or "").strip(),
             "start_ts": start_ts,
             "end_ts": end_ts,
-            "messages": matched,
-        }
-        elapsed_time = time.time() - start_time
-        logger.info(f"成功获取群 {target_group_id} 历史消息，返回 {len(matched)} 条，耗时 {elapsed_time:.2f}s")
-        return json.dumps(result, ensure_ascii=False, indent=2)
+            "results": all_results,
+        }, ensure_ascii=False, indent=2)
     except Exception as e:
         elapsed_time = time.time() - start_time
         logger.info(f"获取群历史消息时发生错误: {e}，耗时 {elapsed_time:.2f}s")
@@ -2302,7 +2485,7 @@ async def process_group_msg_history(
 
 async def process_friend_msg_history(
     event: AstrMessageEvent,
-    user_id: Optional[str] = None,
+    user_ids: str = "",
     count: int = 50,
     search_keywords: str = "",
     time_range: str = "",
@@ -2311,6 +2494,7 @@ async def process_friend_msg_history(
     获取并处理好友历史消息，支持:
     - 关键词包含匹配(多个关键词)
     - 时间范围过滤
+    - 批量查询多个好友
     """
     start_time = time.time()
     try:
@@ -2319,11 +2503,13 @@ async def process_friend_msg_history(
                 f"此功能仅支持 QQ 平台 (aiocqhttp)，当前平台为 {event.get_platform_name()}"
             )
 
-        target_user_id = str(user_id or "").strip()
-        if not target_user_id and not event.get_group_id():
-            target_user_id = str(event.get_sender_id() or "").strip()
-        if not target_user_id:
-            return _json_error("未识别到私聊目标，请提供 user_id。")
+        user_id_list = _parse_user_id_list(user_ids) if user_ids else []
+        if not user_id_list:
+            uid = event.get_sender_id()
+            if uid:
+                user_id_list = [uid]
+        if not user_id_list:
+            return _json_error("未识别到私聊目标，请提供 user_ids。")
 
         safe_count = max(1, min(int(count or 50), 300))
         keywords = _parse_search_keywords(search_keywords)
@@ -2331,140 +2517,183 @@ async def process_friend_msg_history(
         if range_err:
             return _json_error(range_err)
 
-        page_size = 50
-        scan_limit = max(200, min(5000, safe_count * 20))
-        cursor_seq = "0"
-        scanned = 0
-        matched: List[Dict[str, Any]] = []
-        seen_msg_keys: set[str] = set()
-        seen_seq: set[str] = set()
-        content_total_chars = 0
-        content_truncated_count = 0
-        content_budget_reached = False
+        all_results = []
+        total_scanned = 0
+        total_matched = 0
 
-        while scanned < scan_limit and len(matched) < safe_count:
-            page = await get_friend_msg_history_internal(
-                event=event,
-                user_id=target_user_id,
-                count=page_size,
-                message_seq=cursor_seq,
-            )
-            if not page:
-                break
+        for target_user_id in user_id_list:
+            target_user_id = str(target_user_id or "").strip()
+            if not target_user_id:
+                all_results.append({"user_id": target_user_id, "success": False, "error": "empty user_id"})
+                continue
 
-            oldest_ts_in_page: Optional[int] = None
-            stop_by_time_window = False
-            page_old_to_new = _is_page_old_to_new(page)
-            iter_page = list(reversed(page)) if page_old_to_new else page
-            for item in iter_page:
-                if not isinstance(item, dict):
-                    continue
-                scanned += 1
+            page_size = 50
+            scan_limit = max(200, min(5000, safe_count * 20))
+            cursor_seq = "0"
+            scanned = 0
+            matched: List[Dict[str, Any]] = []
+            seen_msg_keys: set[str] = set()
+            seen_seq: set[str] = set()
+            content_total_chars = 0
+            content_truncated_count = 0
+            content_budget_reached = False
 
-                msg_id = _extract_msg_id(item)
-                msg_seq = _extract_msg_seq(item)
-                uniq_key = msg_id or f"seq:{msg_seq}" or f"scan:{scanned}"
-                if uniq_key in seen_msg_keys:
-                    continue
-                seen_msg_keys.add(uniq_key)
-
-                msg_ts = _extract_msg_time(item)
-                if msg_ts is not None:
-                    if oldest_ts_in_page is None or msg_ts < oldest_ts_in_page:
-                        oldest_ts_in_page = msg_ts
-                    if end_ts is not None and msg_ts > end_ts:
-                        continue
-                    if start_ts is not None and msg_ts < start_ts:
-                        stop_by_time_window = True
-                        continue
-
-                sender = item.get("sender")
-                text = _message_to_text(item.get("message"), str(item.get("raw_message") or ""))
-                if not text:
-                    text = "[空消息]"
-
-                if keywords and not any(k in text for k in keywords):
-                    continue
-
-                text, truncated, content_total_chars, reached_budget = _trim_history_content(
-                    text,
-                    content_total_chars,
+            while scanned < scan_limit and len(matched) < safe_count:
+                page = await get_friend_msg_history_internal(
+                    event=event,
+                    user_id=target_user_id,
+                    count=page_size,
+                    message_seq=cursor_seq,
                 )
-                if reached_budget:
-                    content_budget_reached = True
-                if not text:
-                    if reached_budget:
-                        break
-                    continue
-                if truncated:
-                    content_truncated_count += 1
-
-                item_payload: Dict[str, Any] = {
-                    "message_id": msg_id,
-                    "time": msg_ts,
-                    "time_text": (
-                        datetime.fromtimestamp(msg_ts).strftime("%Y-%m-%d %H:%M:%S")
-                        if isinstance(msg_ts, int) and msg_ts > 0
-                        else ""
-                    ),
-                    "user_id": str((sender or {}).get("user_id") or item.get("user_id") or ""),
-                    "sender_name": _sender_to_name(sender),
-                    "content": text,
-                }
-                if msg_seq and (not msg_id or msg_seq != msg_id):
-                    item_payload["message_seq"] = msg_seq
-                if truncated:
-                    item_payload["content_truncated"] = True
-                matched.append(item_payload)
-                if len(matched) >= safe_count:
+                if not page:
                     break
 
-            if len(matched) >= safe_count:
-                break
-            if content_budget_reached:
-                break
-            if stop_by_time_window and start_ts is not None:
-                break
+                oldest_ts_in_page: Optional[int] = None
+                stop_by_time_window = False
+                page_old_to_new = _is_page_old_to_new(page)
+                iter_page = list(reversed(page)) if page_old_to_new else page
+                for item in iter_page:
+                    if not isinstance(item, dict):
+                        continue
+                    scanned += 1
 
-            oldest_item = page[0] if page_old_to_new else page[-1]
-            next_seq = _extract_msg_seq(oldest_item) or _extract_msg_id(oldest_item)
-            next_seq = str(next_seq or "").strip()
-            if not next_seq:
-                break
-            if next_seq == cursor_seq or next_seq in seen_seq:
-                break
-            seen_seq.add(next_seq)
-            cursor_seq = next_seq
+                    msg_id = _extract_msg_id(item)
+                    msg_seq = _extract_msg_seq(item)
+                    uniq_key = msg_id or f"seq:{msg_seq}" or f"scan:{scanned}"
+                    if uniq_key in seen_msg_keys:
+                        continue
+                    seen_msg_keys.add(uniq_key)
 
-            if oldest_ts_in_page is not None and start_ts is not None and oldest_ts_in_page < start_ts:
-                break
+                    msg_ts = _extract_msg_time(item)
+                    if msg_ts is not None:
+                        if oldest_ts_in_page is None or msg_ts < oldest_ts_in_page:
+                            oldest_ts_in_page = msg_ts
+                        if end_ts is not None and msg_ts > end_ts:
+                            continue
+                        if start_ts is not None and msg_ts < start_ts:
+                            stop_by_time_window = True
+                            continue
 
-        matched.sort(key=_history_item_sort_key, reverse=True)
-        if len(matched) > safe_count:
-            matched = matched[:safe_count]
+                    sender = item.get("sender")
+                    text = _message_to_text(item.get("message"), str(item.get("raw_message") or ""))
+                    if not text:
+                        text = "[空消息]"
 
-        result = {
+                    if keywords and not any(k in text for k in keywords):
+                        continue
+
+                    text, truncated, content_total_chars, reached_budget = _trim_history_content(
+                        text,
+                        content_total_chars,
+                    )
+                    if reached_budget:
+                        content_budget_reached = True
+                    if not text:
+                        if reached_budget:
+                            break
+                        continue
+                    if truncated:
+                        content_truncated_count += 1
+
+                    item_payload: Dict[str, Any] = {
+                        "message_id": msg_id,
+                        "time": msg_ts,
+                        "time_text": (
+                            datetime.fromtimestamp(msg_ts).strftime("%Y-%m-%d %H:%M:%S")
+                            if isinstance(msg_ts, int) and msg_ts > 0
+                            else ""
+                        ),
+                        "user_id": str((sender or {}).get("user_id") or item.get("user_id") or ""),
+                        "sender_name": _sender_to_name(sender),
+                        "content": text,
+                    }
+                    if msg_seq and (not msg_id or msg_seq != msg_id):
+                        item_payload["message_seq"] = msg_seq
+                    if truncated:
+                        item_payload["content_truncated"] = True
+                    matched.append(item_payload)
+                    if len(matched) >= safe_count:
+                        break
+
+                if len(matched) >= safe_count:
+                    break
+                if content_budget_reached:
+                    break
+                if stop_by_time_window and start_ts is not None:
+                    break
+
+                oldest_item = page[0] if page_old_to_new else page[-1]
+                next_seq = _extract_msg_seq(oldest_item) or _extract_msg_id(oldest_item)
+                next_seq = str(next_seq or "").strip()
+                if not next_seq:
+                    break
+                if next_seq == cursor_seq or next_seq in seen_seq:
+                    break
+                seen_seq.add(next_seq)
+                cursor_seq = next_seq
+
+                if oldest_ts_in_page is not None and start_ts is not None and oldest_ts_in_page < start_ts:
+                    break
+
+            matched.sort(key=_history_item_sort_key, reverse=True)
+            if len(matched) > safe_count:
+                matched = matched[:safe_count]
+
+            total_scanned += scanned
+            total_matched += len(matched)
+            all_results.append({
+                "user_id": str(target_user_id),
+                "success": True,
+                "requested_count": safe_count,
+                "returned_count": len(matched),
+                "scanned_count": scanned,
+                "scan_limit": scan_limit,
+                "content_total_chars": content_total_chars,
+                "content_truncated_count": content_truncated_count,
+                "content_budget_reached": content_budget_reached,
+                "messages": matched,
+            })
+
+        elapsed_time = time.time() - start_time
+
+        if len(user_id_list) == 1:
+            if all_results and all_results[0].get("success"):
+                logger.info(f"成功获取好友 {user_id_list[0]} 历史消息，返回 {total_matched} 条，耗时 {elapsed_time:.2f}s")
+                result = {
+                    "chat_type": "friend",
+                    "user_id": str(user_id_list[0]),
+                    "requested_count": safe_count,
+                    "returned_count": total_matched,
+                    "scanned_count": total_scanned,
+                    "scan_limit": max(200, min(5000, safe_count * 20)),
+                    "sort_order": "time_desc",
+                    "content_char_limit_per_message": HISTORY_CONTENT_MAX_CHARS_PER_MESSAGE,
+                    "content_char_limit_total": HISTORY_CONTENT_MAX_CHARS_TOTAL,
+                    "search_keywords": keywords,
+                    "time_range": str(time_range or "").strip(),
+                    "start_ts": start_ts,
+                    "end_ts": end_ts,
+                    "messages": all_results[0].get("messages", []),
+                }
+                return json.dumps(result, ensure_ascii=False, indent=2)
+            return json.dumps(all_results[0] if all_results else {"error": "未知错误"}, ensure_ascii=False)
+
+        logger.info(f"批量获取好友历史消息完成：users={len(user_id_list)}, total_returned={total_matched}, elapsed={elapsed_time:.2f}s")
+        return json.dumps({
             "chat_type": "friend",
-            "user_id": target_user_id,
-            "requested_count": safe_count,
-            "returned_count": len(matched),
-            "scanned_count": scanned,
-            "scan_limit": scan_limit,
+            "user_count": len(user_id_list),
+            "total_returned_count": total_matched,
+            "total_scanned_count": total_scanned,
+            "requested_count_per_user": safe_count,
             "sort_order": "time_desc",
             "content_char_limit_per_message": HISTORY_CONTENT_MAX_CHARS_PER_MESSAGE,
             "content_char_limit_total": HISTORY_CONTENT_MAX_CHARS_TOTAL,
-            "content_total_chars": content_total_chars,
-            "content_truncated_count": content_truncated_count,
-            "content_budget_reached": content_budget_reached,
             "search_keywords": keywords,
             "time_range": str(time_range or "").strip(),
             "start_ts": start_ts,
             "end_ts": end_ts,
-            "messages": matched,
-        }
-        elapsed_time = time.time() - start_time
-        logger.info(f"成功获取好友 {target_user_id} 历史消息，返回 {len(matched)} 条，耗时 {elapsed_time:.2f}s")
-        return json.dumps(result, ensure_ascii=False, indent=2)
+            "results": all_results,
+        }, ensure_ascii=False, indent=2)
     except Exception as e:
         elapsed_time = time.time() - start_time
         logger.info(f"获取好友历史消息时发生错误: {e}，耗时 {elapsed_time:.2f}s")
@@ -2473,75 +2702,105 @@ async def process_friend_msg_history(
 
 async def set_group_ban_logic(
     event: AstrMessageEvent,
-    user_id: str,
+    user_ids: str,
     duration: int,
     group_id: str = None,
     admin_required_tools: Any = None,
     enabled_dangerous_tools: Any = None,
 ) -> str:
     """
-    在群聊中禁言某用户的逻辑。
+    在群聊中禁言某用户的逻辑。支持批量禁言。
     """
     try:
         target_group_id, env_error = _ensure_group_write_context(event, group_id=group_id)
         if env_error:
             return env_error
 
-        target_user_id = str(user_id or "").strip() or str(event.get_sender_id() or "").strip()
-        if not target_user_id:
+        user_id_list = _parse_user_id_list(user_ids)
+        if not user_id_list:
             return _json_error("无法确定要禁言/解除禁言的目标用户 ID。")
 
-        disabled_resp = _check_write_tool_access(
-            event,
-            tool_id="set_group_ban",
-            action="禁言",
-            admin_required_tools=admin_required_tools,
-            enabled_dangerous_tools=enabled_dangerous_tools,
-            policy="admin_or_self",
-            target_user_id=target_user_id,
-        )
+        sender_id = str(event.get_sender_id())
+
+        # 单目标时检查 self-action；多目标时跳过 is_self_action 旁路
+        if len(user_id_list) == 1:
+            target_user_id = str(user_id_list[0] or "").strip()
+            disabled_resp = _check_write_tool_access(
+                event,
+                tool_id="set_group_ban",
+                action="禁言",
+                admin_required_tools=admin_required_tools,
+                enabled_dangerous_tools=enabled_dangerous_tools,
+                policy="admin_or_self",
+                target_user_id=target_user_id,
+            )
+        else:
+            # 批量操作不适用 self-action 旁路，按 admin_or_self 逻辑检查
+            disabled_resp = _check_write_tool_access(
+                event,
+                tool_id="set_group_ban",
+                action="禁言",
+                admin_required_tools=admin_required_tools,
+                enabled_dangerous_tools=enabled_dangerous_tools,
+                policy="admin_or_self",
+                target_user_id="",
+            )
         if disabled_resp:
             return disabled_resp
 
-        sender_id = str(event.get_sender_id())
         strict_permission_check = is_tool_admin_required("set_group_ban", admin_required_tools)
-        permission_error = validate_write_permission(
-            event,
-            target_user_id=target_user_id,
-            strict=strict_permission_check,
-            policy="admin_or_self",
-            action="禁言",
-        )
-        if permission_error:
-            logger.warning(f"用户 {sender_id} 尝试禁言 {target_user_id}，权限不足（严格校验开启）。")
-            return _json_error(permission_error)
 
-        # 3. 执行禁言
-        params = {
-            "group_id": int(target_group_id),
-            "user_id": int(target_user_id),
-            "duration": duration
-        }
+        results = []
+        success_count = 0
+        fail_count = 0
 
-        await _call_action(event, "set_group_ban", **params)
-        
-        logger.info(f"调用方 {sender_id} 通过工具禁言了用户 {target_user_id}，时长 {duration} 秒。")
+        for target_user_id in user_id_list:
+            target_user_id = str(target_user_id or "").strip()
+            if not target_user_id:
+                fail_count += 1
+                results.append({"user_id": target_user_id, "success": False, "error": "empty user_id"})
+                continue
 
-        return _json_success(
-            f"用户 {target_user_id} 已被禁言 {duration} 秒。",
-            user_id=target_user_id,
-            duration=duration,
-            timestamp=int(time.time()),
-        )
+            try:
+                params = {
+                    "group_id": int(target_group_id),
+                    "user_id": int(target_user_id),
+                    "duration": duration
+                }
+                await _call_action(event, "set_group_ban", **params)
+                results.append({"user_id": target_user_id, "success": True, "duration": duration})
+                success_count += 1
+            except Exception as e:
+                fail_count += 1
+                results.append({"user_id": target_user_id, "success": False, "error": str(e)})
 
+        logger.info(f"调用方 {sender_id} 通过工具禁言了用户们，success={success_count}, fail={fail_count}，时长 {duration} 秒。")
+
+        if len(user_id_list) == 1:
+            if results and results[0].get("success"):
+                return _json_success(
+                    f"用户 {user_id_list[0]} 已被禁言 {duration} 秒。",
+                    user_id=user_id_list[0],
+                    duration=duration,
+                    timestamp=int(time.time()),
+                )
+            return _json_error(results[0].get("error", "操作失败"), user_id=user_id_list[0])
+
+        return json.dumps({
+            "success_count": success_count,
+            "fail_count": fail_count,
+            "group_id": str(target_group_id),
+            "duration": duration,
+            "results": results
+        }, ensure_ascii=False)
     except Exception as e:
-        logger.error(f"禁言用户 {user_id} 失败: {e}")
-        return _json_error(f"操作失败：无法禁言用户 {user_id}", error=str(e))
+        logger.error(f"禁言用户失败: {e}")
+        return _json_error(f"操作失败：无法禁言用户", error=str(e))
 
 
 async def kick_group_member_logic(
     event: AstrMessageEvent,
-    user_id: str,
+    user_ids: str,
     group_id: Optional[str] = None,
     reject_add_request: bool = False,
     admin_required_tools: Any = None,
@@ -2554,17 +2813,35 @@ async def kick_group_member_logic(
         target_group_id, env_error = _ensure_group_write_context(event, group_id=group_id)
         if env_error:
             return env_error
-        target_user_id = str(user_id or "").strip() or str(event.get_sender_id() or "").strip()
-        if not target_user_id:
+
+        user_id_list = _parse_user_id_list(user_ids)
+        if not user_id_list:
             return _json_error("无法确定要踢出的目标用户 ID。")
 
-        disabled_resp = _check_write_tool_access(
-            event,
-            tool_id="kick_group_member",
-            action="踢人",
-            admin_required_tools=admin_required_tools,
-            enabled_dangerous_tools=enabled_dangerous_tools,
-        )
+        sender_id = str(event.get_sender_id())
+
+        # 单目标时检查 self-action；多目标时跳过 is_self_action 旁路
+        if len(user_id_list) == 1:
+            target_user_id = str(user_id_list[0] or "").strip()
+            disabled_resp = _check_write_tool_access(
+                event,
+                tool_id="kick_group_member",
+                action="踢人",
+                admin_required_tools=admin_required_tools,
+                enabled_dangerous_tools=enabled_dangerous_tools,
+                policy="admin_or_self",
+                target_user_id=target_user_id,
+            )
+        else:
+            disabled_resp = _check_write_tool_access(
+                event,
+                tool_id="kick_group_member",
+                action="踢人",
+                admin_required_tools=admin_required_tools,
+                enabled_dangerous_tools=enabled_dangerous_tools,
+                policy="admin_or_self",
+                target_user_id="",
+            )
         if disabled_resp:
             return disabled_resp
 
@@ -2575,7 +2852,7 @@ async def kick_group_member_logic(
             group_scope=str(target_group_id),
             fingerprint_payload={
                 "group_id": str(target_group_id),
-                "user_id": target_user_id,
+                "user_ids": user_id_list,
                 "reject_add_request": _to_bool(reject_add_request, False),
             },
             confirm_required_tools=confirm_required_tools,
@@ -2585,19 +2862,47 @@ async def kick_group_member_logic(
         if confirm_resp:
             return confirm_resp
 
-        await _call_action(
-            event,
-            "set_group_kick",
-            group_id=int(target_group_id),
-            user_id=int(target_user_id),
-            reject_add_request=_to_bool(reject_add_request, False),
-        )
-        return _json_success(
-            f"已将用户 {target_user_id} 踢出群 {target_group_id}。",
-            group_id=str(target_group_id),
-            user_id=target_user_id,
-            reject_add_request=_to_bool(reject_add_request, False),
-        )
+        results = []
+        success_count = 0
+        fail_count = 0
+
+        for target_user_id in user_id_list:
+            target_user_id = str(target_user_id or "").strip()
+            if not target_user_id:
+                fail_count += 1
+                results.append({"user_id": target_user_id, "success": False, "error": "empty user_id"})
+                continue
+
+            try:
+                await _call_action(
+                    event,
+                    "set_group_kick",
+                    group_id=int(target_group_id),
+                    user_id=int(target_user_id),
+                    reject_add_request=_to_bool(reject_add_request, False),
+                )
+                results.append({"user_id": target_user_id, "success": True})
+                success_count += 1
+            except Exception as e:
+                fail_count += 1
+                results.append({"user_id": target_user_id, "success": False, "error": str(e)})
+
+        if len(user_id_list) == 1:
+            if results and results[0].get("success"):
+                return _json_success(
+                    f"已将用户 {user_id_list[0]} 踢出群 {target_group_id}。",
+                    group_id=str(target_group_id),
+                    user_id=user_id_list[0],
+                    reject_add_request=_to_bool(reject_add_request, False),
+                )
+            return _json_error(results[0].get("error", "踢人失败"), group_id=str(target_group_id), user_id=user_id_list[0])
+
+        return json.dumps({
+            "success_count": success_count,
+            "fail_count": fail_count,
+            "group_id": str(target_group_id),
+            "results": results
+        }, ensure_ascii=False)
     except Exception as e:
         return _json_error("踢人失败。", error=str(e))
 
@@ -2662,7 +2967,7 @@ async def set_group_whole_ban_logic(
 
 async def set_group_admin_logic(
     event: AstrMessageEvent,
-    user_id: str,
+    user_ids: str,
     enable: bool = True,
     group_id: Optional[str] = None,
     admin_required_tools: Any = None,
@@ -2675,8 +2980,9 @@ async def set_group_admin_logic(
         target_group_id, env_error = _ensure_group_write_context(event, group_id=group_id)
         if env_error:
             return env_error
-        target_user_id = str(user_id or "").strip() or str(event.get_sender_id() or "").strip()
-        if not target_user_id:
+
+        user_id_list = _parse_user_id_list(user_ids)
+        if not user_id_list:
             return _json_error("无法确定目标用户 ID。")
 
         disabled_resp = _check_write_tool_access(
@@ -2690,6 +2996,7 @@ async def set_group_admin_logic(
             return disabled_resp
 
         enabled = _to_bool(enable, True)
+
         confirm_resp = _check_write_tool_confirmation(
             event,
             tool_id="set_group_admin",
@@ -2697,7 +3004,7 @@ async def set_group_admin_logic(
             group_scope=str(target_group_id),
             fingerprint_payload={
                 "group_id": str(target_group_id),
-                "user_id": target_user_id,
+                "user_ids": user_id_list,
                 "enable": enabled,
             },
             confirm_required_tools=confirm_required_tools,
@@ -2707,20 +3014,44 @@ async def set_group_admin_logic(
         if confirm_resp:
             return confirm_resp
 
-        await _call_action(
-            event,
-            "set_group_admin",
-            group_id=int(target_group_id),
-            user_id=int(target_user_id),
-            enable=enabled,
-        )
-        action_text = "设为管理员" if enabled else "取消管理员"
-        return _json_success(
-            f"已将用户 {target_user_id} {action_text}。",
-            group_id=str(target_group_id),
-            user_id=target_user_id,
-            enable=enabled,
-        )
+        results = []
+        success_count = 0
+        fail_count = 0
+
+        for target_user_id in user_id_list:
+            target_user_id = str(target_user_id or "").strip()
+            if not target_user_id:
+                fail_count += 1
+                results.append({"user_id": target_user_id, "success": False, "error": "empty user_id"})
+                continue
+
+            try:
+                await _call_action(
+                    event,
+                    "set_group_admin",
+                    group_id=int(target_group_id),
+                    user_id=int(target_user_id),
+                    enable=enabled,
+                )
+                action_text = "设为管理员" if enabled else "取消管理员"
+                results.append({"user_id": target_user_id, "success": True, "action": f"已将用户 {target_user_id} {action_text}"})
+                success_count += 1
+            except Exception as e:
+                fail_count += 1
+                results.append({"user_id": target_user_id, "success": False, "error": str(e)})
+
+        if len(user_id_list) == 1:
+            if results and results[0].get("success"):
+                return _json_success(results[0].get("action", "操作成功"), group_id=str(target_group_id), user_id=user_id_list[0], enable=enabled)
+            return _json_error(results[0].get("error", "操作失败"), group_id=str(target_group_id), user_id=user_id_list[0])
+
+        return json.dumps({
+            "success_count": success_count,
+            "fail_count": fail_count,
+            "group_id": str(target_group_id),
+            "enable": enabled,
+            "results": results
+        }, ensure_ascii=False)
     except Exception as e:
         return _json_error("设置群管理员失败。", error=str(e))
 
@@ -2817,21 +3148,27 @@ async def set_group_special_title_logic(
 
 async def set_essence_msg_logic(
     event: AstrMessageEvent,
-    message_id: str = "",
+    message_ids: str = "",
     admin_required_tools: Any = None,
     enabled_dangerous_tools: Any = None,
 ) -> str:
+    """
+    设置群精华消息。支持批量设置。
+    """
     try:
         if not isinstance(event, AiocqhttpMessageEvent):
             return _json_error(f"此功能仅支持 QQ 平台 (aiocqhttp)，当前平台为 {event.get_platform_name()}")
         target_group_id = str(event.get_group_id() or "").strip()
         if not target_group_id:
             return _json_error("此工具仅支持在群聊中使用。")
-        target_message_id = str(message_id or "").strip()
-        if not target_message_id:
-            target_message_id = str(_extract_reply_message_id(event) or "").strip()
-        if not target_message_id:
-            return _json_error("无法确定目标消息，请传入 message_id 或先引用一条消息再调用本工具。")
+
+        msg_id_list = _parse_user_id_list(message_ids) if message_ids else []
+        if not msg_id_list:
+            extracted_id = str(_extract_reply_message_id(event) or "").strip()
+            if extracted_id:
+                msg_id_list = [extracted_id]
+        if not msg_id_list:
+            return _json_error("无法确定目标消息，请传入 message_ids 或先引用一条消息再调用本工具。")
 
         disabled_resp = _check_write_tool_access(
             event,
@@ -2843,32 +3180,66 @@ async def set_essence_msg_logic(
         if disabled_resp:
             return disabled_resp
 
-        await _call_action(event, "set_essence_msg", message_id=int(target_message_id))
-        return _json_success("已设置群精华消息。", message_id=target_message_id)
+        results = []
+        success_count = 0
+        fail_count = 0
+
+        for target_message_id in msg_id_list:
+            target_message_id = str(target_message_id or "").strip()
+            if not target_message_id:
+                fail_count += 1
+                results.append({"message_id": target_message_id, "success": False, "error": "empty message_id"})
+                continue
+
+            try:
+                await _call_action(event, "set_essence_msg", message_id=int(target_message_id))
+                results.append({"message_id": target_message_id, "success": True})
+                success_count += 1
+            except Exception as e:
+                fail_count += 1
+                results.append({"message_id": target_message_id, "success": False, "error": str(e)})
+
+        if len(msg_id_list) == 1:
+            if results and results[0].get("success"):
+                return _json_success("已设置群精华消息。", message_id=msg_id_list[0])
+            return _json_error(results[0].get("error", "设置失败"), message_id=msg_id_list[0])
+
+        return json.dumps({
+            "success_count": success_count,
+            "fail_count": fail_count,
+            "group_id": target_group_id,
+            "results": results
+        }, ensure_ascii=False)
     except Exception as e:
         return _json_error("设置精华消息失败。", error=str(e))
 
 
 async def delete_essence_msg_logic(
     event: AstrMessageEvent,
-    message_id: str = "",
+    message_ids: str = "",
     admin_required_tools: Any = None,
     enabled_dangerous_tools: Any = None,
     confirm_required_tools: Any = None,
     confirm_timeout_sec: int = CONFIRM_TIMEOUT_DEFAULT_SEC,
     confirm_token: str = "",
 ) -> str:
+    """
+    移出群精华消息。支持批量移出。
+    """
     try:
         if not isinstance(event, AiocqhttpMessageEvent):
             return _json_error(f"此功能仅支持 QQ 平台 (aiocqhttp)，当前平台为 {event.get_platform_name()}")
         target_group_id = str(event.get_group_id() or "").strip()
         if not target_group_id:
             return _json_error("此工具仅支持在群聊中使用。")
-        target_message_id = str(message_id or "").strip()
-        if not target_message_id:
-            target_message_id = str(_extract_reply_message_id(event) or "").strip()
-        if not target_message_id:
-            return _json_error("无法确定目标消息，请传入 message_id 或先引用一条消息再调用本工具。")
+
+        msg_id_list = _parse_user_id_list(message_ids) if message_ids else []
+        if not msg_id_list:
+            extracted_id = str(_extract_reply_message_id(event) or "").strip()
+            if extracted_id:
+                msg_id_list = [extracted_id]
+        if not msg_id_list:
+            return _json_error("无法确定目标消息，请传入 message_ids 或先引用一条消息再调用本工具。")
 
         disabled_resp = _check_write_tool_access(
             event,
@@ -2887,7 +3258,7 @@ async def delete_essence_msg_logic(
             group_scope=target_group_id,
             fingerprint_payload={
                 "group_id": target_group_id,
-                "message_id": target_message_id,
+                "message_ids": msg_id_list,
             },
             confirm_required_tools=confirm_required_tools,
             confirm_timeout_sec=confirm_timeout_sec,
@@ -2896,36 +3267,68 @@ async def delete_essence_msg_logic(
         if confirm_resp:
             return confirm_resp
 
-        await _call_action(
-            event,
-            "delete_essence_msg",
-            message_id=int(target_message_id),
-            group_id=int(target_group_id),
-        )
-        return _json_success("已移出群精华消息。", message_id=target_message_id, group_id=target_group_id)
+        results = []
+        success_count = 0
+        fail_count = 0
+
+        for target_message_id in msg_id_list:
+            target_message_id = str(target_message_id or "").strip()
+            if not target_message_id:
+                fail_count += 1
+                results.append({"message_id": target_message_id, "success": False, "error": "empty message_id"})
+                continue
+
+            try:
+                await _call_action(
+                    event,
+                    "delete_essence_msg",
+                    message_id=int(target_message_id),
+                    group_id=int(target_group_id),
+                )
+                results.append({"message_id": target_message_id, "success": True})
+                success_count += 1
+            except Exception as e:
+                fail_count += 1
+                results.append({"message_id": target_message_id, "success": False, "error": str(e)})
+
+        if len(msg_id_list) == 1:
+            if results and results[0].get("success"):
+                return _json_success("已移出群精华消息。", message_id=msg_id_list[0], group_id=target_group_id)
+            return _json_error(results[0].get("error", "移出失败"), message_id=msg_id_list[0], group_id=target_group_id)
+
+        return json.dumps({
+            "success_count": success_count,
+            "fail_count": fail_count,
+            "group_id": target_group_id,
+            "results": results
+        }, ensure_ascii=False)
     except Exception as e:
         return _json_error("移出精华消息失败。", error=str(e))
 
 
 async def delete_msg_logic(
     event: AstrMessageEvent,
-    message_id: str = "",
+    message_ids: str = "",
     admin_required_tools: Any = None,
     enabled_dangerous_tools: Any = None,
     confirm_required_tools: Any = None,
     confirm_timeout_sec: int = CONFIRM_TIMEOUT_DEFAULT_SEC,
     confirm_token: str = "",
 ) -> str:
-    """撤回指定消息，默认优先使用传入 message_id，缺省时尝试从引用(reply)解析。"""
+    """
+    撤回指定消息，默认优先使用传入 message_id，缺省时尝试从引用(reply)解析。支持批量撤回。
+    """
     try:
         if not isinstance(event, AiocqhttpMessageEvent):
             return _json_error(f"此功能仅支持 QQ 平台 (aiocqhttp)，当前平台为 {event.get_platform_name()}")
 
-        target_message_id = str(message_id or "").strip()
-        if not target_message_id:
-            target_message_id = str(_extract_reply_message_id(event) or "").strip()
-        if not target_message_id:
-            return _json_error("无法确定目标消息，请传入 message_id 或先引用一条消息再调用本工具。")
+        msg_id_list = _parse_user_id_list(message_ids) if message_ids else []
+        if not msg_id_list:
+            extracted_id = str(_extract_reply_message_id(event) or "").strip()
+            if extracted_id:
+                msg_id_list = [extracted_id]
+        if not msg_id_list:
+            return _json_error("无法确定目标消息，请传入 message_ids 或先引用一条消息再调用本工具。")
 
         disabled_resp = _check_write_tool_access(
             event,
@@ -2938,6 +3341,7 @@ async def delete_msg_logic(
             return disabled_resp
 
         group_scope = str(event.get_group_id() or f"private_{event.get_sender_id() or 'unknown'}")
+
         confirm_resp = _check_write_tool_confirmation(
             event,
             tool_id="delete_msg",
@@ -2945,7 +3349,7 @@ async def delete_msg_logic(
             group_scope=group_scope,
             fingerprint_payload={
                 "group_scope": group_scope,
-                "message_id": target_message_id,
+                "message_ids": msg_id_list,
             },
             confirm_required_tools=confirm_required_tools,
             confirm_timeout_sec=confirm_timeout_sec,
@@ -2954,9 +3358,37 @@ async def delete_msg_logic(
         if confirm_resp:
             return confirm_resp
 
-        msg_param: Any = int(target_message_id) if target_message_id.isdigit() else target_message_id
-        await _call_action(event, "delete_msg", message_id=msg_param)
-        return _json_success("已撤回目标消息。", message_id=target_message_id, group_scope=group_scope)
+        results = []
+        success_count = 0
+        fail_count = 0
+
+        for target_message_id in msg_id_list:
+            target_message_id = str(target_message_id or "").strip()
+            if not target_message_id:
+                fail_count += 1
+                results.append({"message_id": target_message_id, "success": False, "error": "empty message_id"})
+                continue
+
+            try:
+                msg_param: Any = int(target_message_id) if target_message_id.isdigit() else target_message_id
+                await _call_action(event, "delete_msg", message_id=msg_param)
+                results.append({"message_id": target_message_id, "success": True})
+                success_count += 1
+            except Exception as e:
+                fail_count += 1
+                results.append({"message_id": target_message_id, "success": False, "error": str(e)})
+
+        if len(msg_id_list) == 1:
+            if results and results[0].get("success"):
+                return _json_success("已撤回目标消息。", message_id=msg_id_list[0], group_scope=group_scope)
+            return _json_error(results[0].get("error", "撤回失败"), message_id=msg_id_list[0], group_scope=group_scope)
+
+        return json.dumps({
+            "success_count": success_count,
+            "fail_count": fail_count,
+            "group_scope": group_scope,
+            "results": results
+        }, ensure_ascii=False)
     except Exception as e:
         return _json_error("撤回消息失败。", error=str(e))
 
@@ -3155,80 +3587,3 @@ async def dismiss_group_logic(
         return _json_success("已发起解散群操作。", group_id=str(target_group_id), is_dismiss=True)
     except Exception as e:
         return _json_error("解散群失败。", error=str(e))
-
-
-async def set_group_kick_members_logic(
-    event: AstrMessageEvent,
-    user_ids: Any,
-    group_id: Optional[str] = None,
-    reject_add_request: bool = False,
-    admin_required_tools: Any = None,
-    enabled_dangerous_tools: Any = None,
-    confirm_required_tools: Any = None,
-    confirm_timeout_sec: int = CONFIRM_TIMEOUT_DEFAULT_SEC,
-    confirm_token: str = "",
-) -> str:
-    try:
-        target_group_id, env_error = _ensure_group_write_context(event, group_id=group_id)
-        if env_error:
-            return env_error
-
-        users = _parse_user_id_list(user_ids)
-        if not users:
-            return _json_error("请提供用户 ID 列表(user_ids)，支持逗号分隔字符串或数组。")
-
-        disabled_resp = _check_write_tool_access(
-            event,
-            tool_id="set_group_kick_members",
-            action="批量踢出群成员",
-            admin_required_tools=admin_required_tools,
-            enabled_dangerous_tools=enabled_dangerous_tools,
-        )
-        if disabled_resp:
-            return disabled_resp
-
-        confirm_resp = _check_write_tool_confirmation(
-            event,
-            tool_id="set_group_kick_members",
-            action="批量踢出群成员",
-            group_scope=str(target_group_id),
-            fingerprint_payload={
-                "group_id": str(target_group_id),
-                "user_ids": users,
-                "reject_add_request": _to_bool(reject_add_request, False),
-            },
-            confirm_required_tools=confirm_required_tools,
-            confirm_timeout_sec=confirm_timeout_sec,
-            confirm_token=confirm_token,
-        )
-        if confirm_resp:
-            return confirm_resp
-
-        is_llbot = await _is_llbot_backend(event)
-        if is_llbot:
-            llbot_user_ids = [int(uid) for uid in users if str(uid).strip().isdigit()]
-            if not llbot_user_ids:
-                return _json_error("LLBot 批量踢人需要纯数字 user_ids。")
-            await _call_action(
-                event,
-                "batch_delete_group_member",
-                group_id=int(target_group_id),
-                user_ids=llbot_user_ids,
-            )
-        else:
-            await _call_action(
-                event,
-                "set_group_kick_members",
-                group_id=str(target_group_id),
-                user_id=users,
-                reject_add_request=_to_bool(reject_add_request, False),
-            )
-        return _json_success(
-            "批量踢出群成员操作已执行。",
-            group_id=str(target_group_id),
-            user_ids=users,
-            reject_add_request=_to_bool(reject_add_request, False),
-            count=len(users),
-        )
-    except Exception as e:
-        return _json_error("批量踢人失败。", error=str(e))

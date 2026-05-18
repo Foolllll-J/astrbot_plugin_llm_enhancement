@@ -17,6 +17,7 @@ from astrbot.api.event import AstrMessageEvent
 from astrbot.api.provider import ProviderRequest
 import astrbot.api.message_components as Comp
 from .provider_utils import find_provider
+from .runtime_helpers import append_text_part_to_request
 
 from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import AiocqhttpMessageEvent
 
@@ -981,7 +982,8 @@ class VideoFrameProcessor:
             f"{sender_prefix}[{label}] {summary}\n"
             f"--- 注入内容结束 ---"
         )
-        req.prompt = user_question + context_prompt
+        if not append_text_part_to_request(req, context_prompt, mark_temp=False):
+            req.prompt = user_question + context_prompt
         logger.debug(f"[VideoFrameProcessor] 成功注入{label}")
     
     def _find_provider(self, provider_id: str):

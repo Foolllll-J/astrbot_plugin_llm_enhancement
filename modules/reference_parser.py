@@ -16,7 +16,12 @@ from .json_parser import (
     parse_json_segment_data,
 )
 from .url_parser import extract_url_infos_from_chain
-from .runtime_helpers import transcribe_record_segment, transcribe_record_from_chain, cleanup_paths_later
+from .runtime_helpers import (
+    transcribe_record_segment,
+    transcribe_record_from_chain,
+    cleanup_paths_later,
+    append_text_part_to_request,
+)
 from .qq_face import build_message_text_with_qq_faces, has_qq_face_segment
 
 from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import AiocqhttpMessageEvent
@@ -99,7 +104,8 @@ def _append_context_block(
         + "；".join(normalized_details)
         + "。请结合这些补充信息回答。"
     )
-    req.prompt += injected_text
+    if not append_text_part_to_request(req, injected_text, mark_temp=False):
+        req.prompt += injected_text
     logger.debug("[LLMEnhancement] %s: injected=%s", log_title, injected_text.strip())
 
 
@@ -1045,5 +1051,6 @@ async def inject_record_asr_context(
         f"{sender_prefix}[语音转写] {record_asr_text}\n"
         "--- 注入内容结束 ---"
     )
-    req.prompt = (user_question + context_prompt) if user_question else context_prompt.strip()
+    if not append_text_part_to_request(req, context_prompt, mark_temp=False):
+        req.prompt = (user_question + context_prompt) if user_question else context_prompt.strip()
     return True

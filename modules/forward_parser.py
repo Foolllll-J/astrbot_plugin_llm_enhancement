@@ -13,6 +13,7 @@ from astrbot.api.provider import ProviderRequest
 
 from .reference_parser import _segment_is_emoji_image
 from .json_parser import parse_json_segment_data
+from .runtime_helpers import append_text_part_to_request
 from .video_parser import extract_audio_wav, extract_forward_video_keyframes
 
 from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import AiocqhttpMessageEvent
@@ -130,7 +131,8 @@ def _inject_forward_context(req: ProviderRequest, context_text: str) -> None:
         "以下是系统完成多组件解析后的完整结构化内容，请基于此回复：\n"
         f"--- 聊天记录解析开始 ---\n{context_text}\n--- 聊天记录解析结束 ---"
     )
-    req.prompt = user_question + context_prompt
+    if not append_text_part_to_request(req, context_prompt, mark_temp=False):
+        req.prompt = user_question + context_prompt
 
 
 def _normalize_emoji_summary(summary: str) -> str:

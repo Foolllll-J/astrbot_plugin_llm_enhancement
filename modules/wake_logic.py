@@ -1,3 +1,4 @@
+import asyncio
 import re
 import random
 from datetime import datetime
@@ -16,6 +17,7 @@ _MENTION_WAKE_REGEX_CACHE: dict[str, re.Pattern[str]] = {}
 _MENTION_WAKE_REGEX_INVALID: set[str] = set()
 _WAKE_JUDGE_TYPES = {"explicit", "mention", "relevant", "ask", "bored", "prob"}
 _BOT_ACCOUNT_SKIP_WAKE_TYPES = {"explicit", "active", "wake_extend"}
+WAKE_LLM_TIMEOUT_SEC = 5
 _WAKE_JUDGE_PROMPT_DEFAULT = """你是群聊“唤醒判定器”。请判断机器人是否应该响应这条显式唤醒请求。
 
 [当前时间]
@@ -178,6 +180,7 @@ def try_acquire_request_concurrency_slot(
     now_ns: int,
     user_limit: int,
     group_limit: int,
+    allow_existing_dynamic_session_reuse: bool = False,
 ) -> tuple[bool, str, str]:
     """Try to allocate one request-concurrency slot.
 
@@ -195,7 +198,7 @@ def try_acquire_request_concurrency_slot(
 
     current_ref = int(active_request_refs.get(key, 0) or 0)
     is_new_slot = current_ref <= 0
-    if not is_new_slot:
+    if (not is_new_slot) and allow_existing_dynamic_session_reuse:
         active_request_refs[key] = current_ref + 1
         return True, key, "reuse_existing_dynamic_session"
 
@@ -223,12 +226,13 @@ def can_accept_request_concurrency_slot(
     dynamic_merge_mode: bool,
     user_limit: int,
     group_limit: int,
+    allow_existing_dynamic_session_reuse: bool = False,
 ) -> tuple[bool, str]:
     """仅检查是否可接受新并发请求，不分配槽位。"""
     if not gid:
         return True, "private_skip_limits"
     scope_id = gid or f"private_{uid}"
-    if dynamic_merge_mode:
+    if dynamic_merge_mode and allow_existing_dynamic_session_reuse:
         key = build_request_concurrency_key(
             dynamic_merge_mode=True,
             scope_id=scope_id,
@@ -987,6 +991,7 @@ async def wake_extend_llm_decision(
     provider_id: str,
     prompt_template: str,
     find_provider: Callable[[str], Any],
+    timeout_sec: Optional[int] = WAKE_LLM_TIMEOUT_SEC,
 ) -> Optional[bool]:
     """使用配置的 Provider 做唤醒延长判定。返回 True/False，失败返回 None。"""
     provider = find_provider(provider_id)
@@ -1013,12 +1018,16 @@ async def wake_extend_llm_decision(
     prompt = _render_prompt_template(prompt_template, placeholders)
     system_prompt = "你是唤醒判定器。只输出一个大写字母：T 或 F。禁止输出其他内容。"
     try:
-        resp = await provider.text_chat(
+        chat_coro = provider.text_chat(
             prompt=prompt,
             system_prompt=system_prompt,
             image_urls=[],
             context=[],
         )
+        if timeout_sec and timeout_sec > 0:
+            resp = await asyncio.wait_for(chat_coro, timeout=float(timeout_sec))
+        else:
+            resp = await chat_coro
         text = _extract_provider_text(resp).upper()
         if text.startswith("T"):
             logger.info("[LLMEnhancement] 唤醒延长模型判定结果: T")
@@ -1027,6 +1036,12 @@ async def wake_extend_llm_decision(
             logger.debug("[LLMEnhancement] 唤醒延长模型判定结果: F")
             return False
         logger.warning(f"[LLMEnhancement] 唤醒延长模型判定返回无效结果: {text[:20]}")
+        return None
+    except asyncio.TimeoutError:
+        logger.warning(
+            "[LLMEnhancement] 唤醒延长模型判定超时，改用本地相似度兜底："
+            f"provider={provider_id}, timeout_sec={timeout_sec}"
+        )
         return None
     except Exception as e:
         logger.warning(f"[LLMEnhancement] 唤醒延长模型判定失败，回退本地相似度: {e}")
@@ -1042,6 +1057,7 @@ async def wake_judge_llm_decision(
     provider_id: str,
     prompt_template: str,
     find_provider: Callable[[str], Any],
+    timeout_sec: Optional[int] = WAKE_LLM_TIMEOUT_SEC,
 ) -> Tuple[Optional[bool], str]:
     """使用可配置提示词模板执行唤醒判定。"""
     provider = find_provider(provider_id)
@@ -1075,12 +1091,16 @@ async def wake_judge_llm_decision(
         "不要输出解释、标点、换行或其他字符。"
     )
     try:
-        resp = await provider.text_chat(
+        chat_coro = provider.text_chat(
             prompt=prompt,
             system_prompt=system_prompt,
             image_urls=[],
             context=[],
         )
+        if timeout_sec and timeout_sec > 0:
+            resp = await asyncio.wait_for(chat_coro, timeout=float(timeout_sec))
+        else:
+            resp = await chat_coro
         text = _extract_provider_text(resp).upper()
         if text.startswith("T"):
             return True, "model:T"
@@ -1088,6 +1108,12 @@ async def wake_judge_llm_decision(
             return False, "model:F"
         logger.warning(f"[LLMEnhancement] 唤醒判定返回无效结果: {text[:20]}")
         return None, "invalid_output"
+    except asyncio.TimeoutError:
+        logger.warning(
+            "[LLMEnhancement] 唤醒判定模型超时，直接按放行兜底："
+            f"provider={provider_id}, timeout_sec={timeout_sec}"
+        )
+        return None, "timeout"
     except Exception as e:
         logger.warning(f"[LLMEnhancement] 唤醒判定失败: {e}")
         return None, "model_error"
@@ -1105,6 +1131,15 @@ def _get_wake_judge_context_count(get_cfg: Callable[[str, Any], Any]) -> int:
     except Exception:
         value = 10
     return max(1, min(50, value))
+
+
+def _get_wake_llm_timeout_sec(get_cfg: Callable[[str, Any], Any]) -> int:
+    raw = get_cfg("wake_llm_timeout_sec", WAKE_LLM_TIMEOUT_SEC)
+    try:
+        value = int(raw)
+    except Exception:
+        value = WAKE_LLM_TIMEOUT_SEC
+    return max(0, min(30, value))
 
 
 def _get_wake_judge_prompt_template(get_cfg: Callable[[str, Any], Any]) -> str:
@@ -1262,6 +1297,7 @@ async def evaluate_post_wake_judge(
 
     prompt_template = _get_wake_judge_prompt_template(get_cfg)
     history_count = _get_wake_judge_context_count(get_cfg)
+    timeout_sec = _get_wake_llm_timeout_sec(get_cfg)
     history_msgs = await get_history_msg(event, history_count)
     llm_decision, detail = await wake_judge_llm_decision(
         event=event,
@@ -1272,6 +1308,7 @@ async def evaluate_post_wake_judge(
         provider_id=provider_id,
         prompt_template=prompt_template,
         find_provider=find_provider,
+        timeout_sec=timeout_sec,
     )
     if llm_decision is None:
         return True, f"fallback_allow:{detail}"
@@ -1512,6 +1549,7 @@ async def evaluate_wake_extend(
         return True, "唤醒延长(阈值0)"
 
     history_count = _get_wake_judge_context_count(get_cfg)
+    timeout_sec = _get_wake_llm_timeout_sec(get_cfg)
     history_msgs = await get_history_msg(event, history_count)
     if not history_msgs:
         return False, None
@@ -1527,6 +1565,7 @@ async def evaluate_wake_extend(
             provider_id=provider_id,
             prompt_template=prompt_template,
             find_provider=find_provider,
+            timeout_sec=timeout_sec,
         )
         if llm_decision is True:
             _mark_wake_extend_consumed(group_state, ref_ts)

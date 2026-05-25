@@ -646,6 +646,9 @@ class LLMEnhancement(Star):
             if dynamic_merge_mode
             else uid
         )
+        allow_existing_dynamic_session_reuse = bool(
+            dynamic_merge_mode and event.get_extra("_llme_dynamic_requeued", default=False)
+        )
         user_limit = normalize_concurrency_limit(self._get_cfg("max_user_concurrent_requests", 0))
         group_limit = normalize_concurrency_limit(self._get_cfg("max_group_concurrent_requests", 0))
         if gid and (user_limit > 0 or group_limit > 0):
@@ -667,6 +670,7 @@ class LLMEnhancement(Star):
                     dynamic_merge_mode=dynamic_merge_mode,
                     user_limit=user_limit,
                     group_limit=group_limit,
+                    allow_existing_dynamic_session_reuse=allow_existing_dynamic_session_reuse,
                 )
             if not accepted_slot:
                 logger.debug(f"[LLMEnhancement] 并发预检查拦截：{slot_detail}")
@@ -2295,6 +2299,9 @@ class LLMEnhancement(Star):
             if dynamic_merge_mode
             else uid
         )
+        allow_existing_dynamic_session_reuse = bool(
+            dynamic_merge_mode and event.get_extra("_llme_dynamic_requeued", default=False)
+        )
         current_msg_id = get_event_msg_id(event) or ""
 
         user_limit = normalize_concurrency_limit(self._get_cfg("max_user_concurrent_requests", 0))
@@ -2320,6 +2327,7 @@ class LLMEnhancement(Star):
                 now_ns=time.time_ns(),
                 user_limit=user_limit,
                 group_limit=group_limit,
+                allow_existing_dynamic_session_reuse=allow_existing_dynamic_session_reuse,
             )
             if accepted_slot:
                 self._active_request_ts[slot_key] = now_ts
@@ -2581,7 +2589,7 @@ class LLMEnhancement(Star):
                 msg=event.message_str,
                 gid=gid,
                 uid=uid,
-                now=event_ts,
+                now=event_ts_llm,
                 group_state=g if gid else None,
                 member=sender_member if gid else None,
                 wake=bool(event.is_at_or_wake_command),

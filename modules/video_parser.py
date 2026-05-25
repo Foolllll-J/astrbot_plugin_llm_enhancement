@@ -123,9 +123,15 @@ def extract_videos_from_chain(chain: List[object]) -> List[str]:
                     f = sdata.get("file")
                     n = sdata.get("name")
                     cand = None
-                    if isinstance(u, str) and u and _looks_like_video(u): cand = u
-                    elif isinstance(f, str) and f and (_looks_like_video(f) or os.path.isabs(f)): cand = f
-                    elif isinstance(n, str) and n and _looks_like_video(n) and isinstance(f, str) and f: cand = f
+                    if isinstance(u, str) and u and _looks_like_video(u):
+                        cand = u
+                    elif isinstance(f, str) and f and (_looks_like_video(f) or os.path.isabs(f)):
+                        cand = f
+                    elif isinstance(n, str) and n and _looks_like_video(n):
+                        if isinstance(u, str) and u:
+                            cand = u
+                        elif isinstance(f, str) and f:
+                            cand = f
                     if cand: videos.append(cand)
             elif isinstance(seg, Comp.Video):
                 f = getattr(seg, "file", None)
@@ -143,8 +149,11 @@ def extract_videos_from_chain(chain: List[object]) -> List[str]:
                     cand = u
                 elif isinstance(f, str) and f and (_looks_like_video(f) or os.path.isabs(f)):
                     cand = f
-                elif isinstance(n, str) and n and _looks_like_video(n) and isinstance(f, str) and f:
-                    cand = f
+                elif isinstance(n, str) and n and _looks_like_video(n):
+                    if isinstance(u, str) and u:
+                        cand = u
+                    elif isinstance(f, str) and f:
+                        cand = f
                 if isinstance(cand, str) and cand:
                     videos.append(cand)
             elif hasattr(Comp, "Node") and isinstance(seg, getattr(Comp, "Node")):
@@ -928,7 +937,7 @@ class VideoFrameProcessor:
         
         # 步骤 3：LLM 汇总
         try:
-            llm_provider = self.context.get_using_provider(umo=self.event.unified_msg_origin)
+            llm_provider = self._get_summary_provider()
             if not llm_provider:
                 logger.warning("[帧聚合汇总] 无可用 LLM Provider")
                 return None
@@ -995,7 +1004,6 @@ class VideoFrameProcessor:
         provider_id = self._get_cfg("image_provider_id")
         p = self._find_provider(provider_id)
         if p:
-            logger.debug(f"[VideoFrameProcessor] 使用指定 Vision Provider: {provider_id}")
             return p
         
         if provider_id:
@@ -1005,7 +1013,6 @@ class VideoFrameProcessor:
         try:
             default_p = self.context.get_using_provider(umo=self.event.unified_msg_origin)
             if default_p:
-                logger.debug(f"[VideoFrameProcessor] 使用当前会话 Provider 进行识图")
                 return default_p
         except Exception as e:
             logger.debug(f"[VideoFrameProcessor] 获取会话 Vision Provider 失败: err={e}")
@@ -1017,7 +1024,6 @@ class VideoFrameProcessor:
         asr_pid = self._get_cfg("asr_provider_id")
         p = self._find_provider(asr_pid)
         if p:
-            logger.debug(f"[VideoFrameProcessor] 成功匹配到指定的 STT Provider: {asr_pid}")
             return p
         
         if asr_pid:
@@ -1029,6 +1035,25 @@ class VideoFrameProcessor:
         except Exception as e:
             logger.debug(f"[VideoFrameProcessor] 获取会话 STT Provider 失败: err={e}")
         
+        return None
+
+    def _get_summary_provider(self):
+        """获取视频/GIF 汇总摘要 Provider"""
+        provider_id = self._get_cfg("video_summary_provider_id")
+        p = self._find_provider(provider_id)
+        if p:
+            return p
+
+        if provider_id:
+            logger.warning(f"[VideoFrameProcessor] 未找到指定的视频摘要 Provider: {provider_id}")
+
+        try:
+            default_p = self.context.get_using_provider(umo=self.event.unified_msg_origin)
+            if default_p:
+                return default_p
+        except Exception as e:
+            logger.debug(f"[VideoFrameProcessor] 获取会话摘要 Provider 失败: err={e}")
+
         return None
     
     def _extract_completion_text(self, response) -> str:
@@ -1097,6 +1122,13 @@ def _normalize_video_source_for_event(event: AstrMessageEvent, source: str) -> s
     except Exception:
         pass
     return src
+
+
+def _is_direct_media_source(source: str) -> bool:
+    src = str(source or "").strip()
+    if not src:
+        return False
+    return src.startswith(("http://", "https://", "file://")) or os.path.isabs(src)
 
 
 async def _extract_videos_from_telegram_update(event: AstrMessageEvent) -> List[str]:
@@ -1353,17 +1385,29 @@ async def process_media_content(
                     video_sources = extract_videos_from_chain(original_msg["message"])
             except Exception:
                 pass
-        else:
-            reply_chain = getattr(reply_seg, "chain", None)
-            if isinstance(reply_chain, list) and reply_chain:
-                video_sources = extract_videos_from_chain(reply_chain)
+        reply_chain = getattr(reply_seg, "chain", None)
+        if isinstance(reply_chain, list) and reply_chain:
+            reply_chain_sources = extract_videos_from_chain(reply_chain)
+            if reply_chain_sources:
+                video_sources.extend(
+                    [src for src in reply_chain_sources if src not in video_sources]
+                )
 
     if video_sources:
         normalized_sources: List[str] = []
         for src in video_sources:
             normalized = _normalize_video_source_for_event(event, src)
+            if (
+                normalized
+                and (not normalized.startswith(("http://", "https://", "file://")))
+                and (not os.path.isabs(normalized))
+            ):
+                resolved = await napcat_resolve_file_url(event, normalized)
+                if resolved:
+                    normalized = resolved
             if normalized and normalized not in normalized_sources:
                 normalized_sources.append(normalized)
+        normalized_sources.sort(key=lambda src: 0 if _is_direct_media_source(src) else 1)
         video_sources = normalized_sources
 
     media_ctx = await detect_media_scenario(req, get_cfg, video_sources)

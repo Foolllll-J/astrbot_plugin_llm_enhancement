@@ -26,6 +26,14 @@ from .qq_face import build_message_text_with_qq_faces, has_qq_face_segment
 
 from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import AiocqhttpMessageEvent
 
+VIDEO_FILE_EXTENSIONS = {
+    ".mp4", ".mov", ".m4v", ".avi", ".webm", ".mkv", ".flv", ".wmv", ".ts", ".mpeg", ".mpg", ".3gp", ".gif",
+}
+
+AUDIO_FILE_EXTENSIONS = {
+    ".amr", ".mp3", ".wav", ".m4a", ".aac", ".ogg", ".opus", ".flac", ".wma",
+}
+
 
 @dataclass
 class ReplyParseResult:
@@ -85,6 +93,54 @@ def _build_chain(event: AstrMessageEvent, all_components: list[Any]) -> list[Any
     if isinstance(all_components, list) and all_components:
         chain.extend(all_components)
     return chain
+
+
+def _extract_file_name(seg_data: dict[str, Any]) -> str:
+    return str(
+        seg_data.get("name") or seg_data.get("file_name") or seg_data.get("file") or ""
+    ).strip()
+
+
+def _extract_file_size_bytes(seg_data: dict[str, Any]) -> Optional[int]:
+    for key in ("file_size", "size", "fileSize"):
+        value = seg_data.get(key)
+        if value in (None, ""):
+            continue
+        try:
+            size = int(value)
+        except (TypeError, ValueError):
+            continue
+        if size >= 0:
+            return size
+    return None
+
+
+def _format_file_size(size_bytes: Optional[int]) -> str:
+    if size_bytes is None:
+        return ""
+    if size_bytes < 1024:
+        return f"{size_bytes} B"
+    if size_bytes < 1024 * 1024:
+        return f"{size_bytes / 1024:.1f} KB"
+    if size_bytes < 1024 * 1024 * 1024:
+        return f"{size_bytes / (1024 * 1024):.1f} MB"
+    return f"{size_bytes / (1024 * 1024 * 1024):.1f} GB"
+
+
+def _looks_like_file_with_ext(seg_data: dict[str, Any], exts: set[str]) -> bool:
+    for key in ("name", "file_name", "file", "url", "path"):
+        value = str(seg_data.get(key) or "").strip().lower()
+        if value and any(value.endswith(ext) for ext in exts):
+            return True
+    return False
+
+
+def _looks_like_video_file(seg_data: dict[str, Any]) -> bool:
+    return _looks_like_file_with_ext(seg_data, VIDEO_FILE_EXTENSIONS)
+
+
+def _looks_like_audio_file(seg_data: dict[str, Any]) -> bool:
+    return _looks_like_file_with_ext(seg_data, AUDIO_FILE_EXTENSIONS)
 
 
 def _append_context_block(
@@ -588,12 +644,14 @@ async def parse_reply_context(
             return result
 
         quoted_image_labels: list[str] = []
-        quoted_file_names: list[str] = []
+        quoted_file_descriptions: list[str] = []
         quoted_file_infos: list[str] = []
         quoted_file_parse_failed = False
         quoted_json_infos: list[str] = []
         quoted_record_texts: list[str] = []
         quoted_record_count = 0
+        quoted_audio_file_descriptions: list[str] = []
+        quoted_audio_file_texts: list[str] = []
         quoted_face_text = _build_quoted_face_message_text(original_msg)
 
         if not hasattr(req, "image_urls") or req.image_urls is None:
@@ -601,7 +659,6 @@ async def parse_reply_context(
         if not hasattr(req, "_cleanup_paths"):
             req._cleanup_paths = []
 
-        allow_file_name_inject = bool(get_cfg("inject_file_name", True))
         try:
             file_text_inject_len = max(0, int(get_cfg("inject_file_text_length", 0) or 0))
         except (TypeError, ValueError):
@@ -643,10 +700,33 @@ async def parse_reply_context(
                         quoted_record_texts.append(asr_text)
 
             elif enable_file_parse and seg_type == "file":
-                file_name = seg_data.get("name") or seg_data.get("file_name") or seg_data.get("file")
-                if allow_file_name_inject and file_name:
-                    quoted_file_names.append(str(file_name))
-                if file_text_inject_len > 0:
+                file_name = _extract_file_name(seg_data)
+                file_size_text = _format_file_size(_extract_file_size_bytes(seg_data))
+                is_video_file = _looks_like_video_file(seg_data)
+                is_audio_file = _looks_like_audio_file(seg_data)
+                if file_name:
+                    file_description = (
+                        f"{file_name}（大小：{file_size_text}）"
+                        if file_size_text
+                        else file_name
+                    )
+                    if file_description not in quoted_file_descriptions:
+                        quoted_file_descriptions.append(file_description)
+                    if is_audio_file and file_description not in quoted_audio_file_descriptions:
+                        quoted_audio_file_descriptions.append(file_description)
+                if is_audio_file and enable_record_parse:
+                    pseudo_record_segment = {"type": "record", "data": dict(seg_data)}
+                    asr_text, cleanup_paths = await transcribe_record_segment(
+                        context=context,
+                        get_cfg=get_cfg,
+                        event=event,
+                        segment=pseudo_record_segment,
+                    )
+                    if cleanup_paths:
+                        req._cleanup_paths.extend(cleanup_paths)
+                    if asr_text and asr_text not in quoted_audio_file_texts:
+                        quoted_audio_file_texts.append(asr_text)
+                if file_text_inject_len > 0 and (not is_video_file) and (not is_audio_file):
                     file_failure_details: list[str] = []
                     file_infos = await extract_file_infos_from_chain(
                         event=event,
@@ -699,10 +779,11 @@ async def parse_reply_context(
 
         if (
             quoted_image_labels
-            or quoted_file_names
+            or quoted_file_descriptions
             or quoted_file_infos
             or quoted_json_infos
             or quoted_record_count
+            or quoted_audio_file_descriptions
             or quoted_face_text
         ):
             quoted_sender = getattr(req, "_quoted_sender", "未知用户")
@@ -712,12 +793,24 @@ async def parse_reply_context(
             if quoted_image_labels:
                 image_desc = "和".join(quoted_image_labels)
                 parts.append(f"当前用户引用了 {quoted_sender} 发送的{image_desc}。")
-            if quoted_file_names:
-                parts.append(f"当前用户引用了 {quoted_sender} 发送的文件：{'；'.join(quoted_file_names)}。")
+            if quoted_file_descriptions:
+                parts.append(
+                    f"当前用户引用了 {quoted_sender} 发送的文件：{'；'.join(quoted_file_descriptions)}。"
+                )
             if quoted_file_infos:
                 parts.append(f"被引用文件的内容摘要：{'；'.join(quoted_file_infos[:2])}。")
             elif quoted_file_parse_failed:
                 parts.append("被引用文件未能成功解析，已跳过内容摘要注入。")
+            if quoted_audio_file_descriptions:
+                if quoted_audio_file_texts:
+                    parts.append(
+                        f"当前用户引用了 {quoted_sender} 发送的音频文件：{'；'.join(quoted_audio_file_descriptions)}，"
+                        f"转写内容：{' / '.join(quoted_audio_file_texts[:2])}。"
+                    )
+                else:
+                    parts.append(
+                        f"当前用户引用了 {quoted_sender} 发送的音频文件：{'；'.join(quoted_audio_file_descriptions)}。"
+                    )
             if quoted_json_infos:
                 parts.append(f"被引用卡片的关键信息：{'；'.join(quoted_json_infos[:2])}。")
             if quoted_record_count:
@@ -728,7 +821,7 @@ async def parse_reply_context(
             _append_prompt_context(req, parts)
             if quoted_json_infos:
                 result.injected_json = True
-            if quoted_file_names or quoted_file_infos:
+            if quoted_file_descriptions or quoted_file_infos or quoted_audio_file_descriptions:
                 result.injected_file = True
 
     except Exception as e:

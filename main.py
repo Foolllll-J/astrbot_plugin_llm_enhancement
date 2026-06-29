@@ -67,8 +67,6 @@ from .modules.runtime_helpers import (
     is_chain_effectively_empty,
     looks_like_error_result,
     apply_discarded_response_fallback,
-    get_blocked_commands,
-    match_blocked_command,
     append_text_part_to_request,
     
 )
@@ -97,6 +95,7 @@ from .modules.wake_logic import (
     get_prob_wake_observe_threshold,
     get_prob_wake_trigger_chance,
 )
+from .modules.group_concurrency import GroupConcurrencyModule
 from .modules.merge_flow import (
     load_merge_runtime_config,
     normalize_event_ts,
@@ -116,6 +115,7 @@ from .modules.merge_flow import (
     ensure_snapshot_merge_key,
     upsert_premerge_snapshot,
     consume_premerge_snapshots_for_trigger,
+    attach_dynamic_premerge_snapshots,
     upsert_dynamic_unresolved_snapshot,
     upsert_recent_wake_snapshot,
     prepare_initial_merge_snapshots,
@@ -178,6 +178,133 @@ def _raw_get(raw: Any, key: str, default: Any = None) -> Any:
     except Exception:
         return default
 
+async def _background_context_injection(
+    *,
+    self: Any,
+    event: AstrMessageEvent,
+    g: Any,
+    uid: str,
+    msg: str,
+    message_chain: Any,
+    raw_image_datas: Any,
+    has_image_component: bool,
+    has_video_component: bool,
+    has_file_component: bool,
+    has_forward_component: bool,
+    has_json_component: bool,
+    has_record_component: bool,
+    file_name: str,
+    reply_to_id: str,
+    reply_msg_id: str,
+    at_targets: Any,
+    at_bot: bool,
+    at_all: bool,
+    now: float,
+    emoji_summary: str,
+    context_injection_max_messages: int,
+) -> None:
+    """后台异步执行上下文注入，不阻塞主消息流程。"""
+    try:
+        reply_preview = await try_build_reply_preview(event, reply_msg_id)
+        parse_options = get_context_non_text_parse_options(self._get_cfg)
+        current_msg_id = get_event_msg_id(event) or ""
+        context_text = ""
+        if msg:
+            text_enrichment = await build_text_context_enrichment(
+                event=event,
+                get_cfg=self._get_cfg,
+                message_chain=message_chain,
+                parse_options=parse_options,
+            )
+            if "image" in parse_options and has_image_component:
+                image_caption = await try_get_image_caption(
+                    event=event,
+                    message_chain=message_chain,
+                    raw_image_datas=raw_image_datas,
+                    get_cfg=self._get_cfg,
+                    provider_by_id_resolver=lambda provider_id: resolve_provider(self.context, provider_id),
+                    default_provider_resolver=lambda: get_vision_provider(self.context, self._get_cfg, event=event),
+                )
+                if image_caption:
+                    image_label = get_image_component_label(message_chain, raw_image_datas=raw_image_datas)
+                    text_enrichment = (
+                        f"{text_enrichment} | {image_label}转述: {image_caption}"
+                        if text_enrichment
+                        else f"{image_label}转述: {image_caption}"
+                    )
+            if text_enrichment:
+                context_text = f"{msg} | {text_enrichment}"
+        if (not context_text) and (not msg):
+            context_text = await build_non_text_context_text(
+                event=event,
+                context=self.context,
+                get_cfg=self._get_cfg,
+                message_chain=message_chain,
+                sender_name=event.get_sender_name(),
+                msg_id=current_msg_id,
+                parse_options=parse_options,
+                raw_image_datas=raw_image_datas,
+                provider_by_id_resolver=lambda provider_id: resolve_provider(self.context, provider_id),
+                default_provider_resolver=lambda: get_vision_provider(self.context, self._get_cfg, event=event),
+            )
+        if not context_text:
+            image_caption = ""
+            image_label = "图片"
+            if (not msg) and ("image" in parse_options):
+                image_label = get_image_component_label(message_chain, raw_image_datas=raw_image_datas)
+            context_text = build_context_text(
+                msg,
+                event.get_sender_name(),
+                image_caption=image_caption,
+                has_image_component=has_image_component,
+                has_video_component=has_video_component,
+                has_file_component=has_file_component,
+                has_forward_component=has_forward_component,
+                has_json_component=has_json_component,
+                has_record_component=has_record_component,
+                file_name=file_name,
+                image_label=image_label,
+                emoji_summary=emoji_summary,
+            )
+        if context_text:
+            context_text = append_emoji_summary_suffix(context_text, emoji_summary)
+        parse_features: list[str] = []
+        if "聊天记录抽取:" in context_text:
+            parse_features.append("forward")
+        if "URL解析:" in context_text:
+            parse_features.append("url")
+        if "JSON解析:" in context_text:
+            parse_features.append("json")
+        if "文件信息:" in context_text:
+            parse_features.append("file")
+        if ("图片转述:" in context_text) or ("表情包转述:" in context_text):
+            parse_features.append("image")
+        if has_record_component:
+            parse_features.append("record")
+        if not event.get_extra("_llme_dynamic_requeued", default=False):
+            append_group_context_message(
+                g,
+                uid=uid,
+                sender_name=event.get_sender_name(),
+                message_text=context_text,
+                max_messages=context_injection_max_messages,
+                msg_id=current_msg_id,
+                is_bot=False,
+                source="incoming",
+                at_targets=at_targets,
+                at_bot=at_bot,
+                at_all=at_all,
+                reply_to_id=reply_to_id,
+                reply_msg_id=reply_msg_id,
+                reply_preview=reply_preview,
+                parse_features=parse_features,
+                now_ts=now,
+                get_cfg=self._get_cfg,
+            )
+    except Exception as e:
+        logger.error(f"[LLMEnhancement] 后台上下文注入失败: {type(e).__name__}: {e}")
+
+
 class LLMEnhancement(Star): 
     def __init__(self, context: Context, config: AstrBotConfig): 
         super().__init__(context) 
@@ -190,6 +317,7 @@ class LLMEnhancement(Star):
         self._active_request_ts: dict[str, float] = {}
         self._private_typing_tasks: dict[str, tuple[asyncio.Task, asyncio.Event]] = {}
         self._effective_dialog_history = EffectiveDialogHistory(max_turns=4)
+        self._group_concurrency = GroupConcurrencyModule()
         self._refresh_config()
         self.sent = Sentiment()
         self.similarity = Similarity()
@@ -218,6 +346,7 @@ class LLMEnhancement(Star):
             "video_injection",
             "forward_parsing",
             "file_parsing",
+            "url_parsing",
             "qq_platform",
             "blacklist",
         ]:
@@ -225,7 +354,28 @@ class LLMEnhancement(Star):
             if isinstance(section_cfg, dict):
                 for k, v in section_cfg.items():
                     self.cfg[k] = v
-                
+
+        # 3. 群聊按用户并发兼容性检查
+        orch = self.config.get("request_orchestration", {})
+        if not isinstance(orch, dict):
+            orch = {}
+        dynamic_mode = str(orch.get("merge_dynamic_mode", "dynamic") or "dynamic").strip().lower() == "dynamic"
+        allow_multi_user = bool(orch.get("merge_multi_user", False))
+        group_concurrency = bool(orch.get("group_sender_concurrency", False))
+        if dynamic_mode and allow_multi_user and group_concurrency:
+            if not hasattr(self, "_warned_group_concurrency_conflict"):
+                self._warned_group_concurrency_conflict = True
+                logger.warning(
+                    "[LLMEnhancement] 动态合并模式下多人合并与请求并发冲突，"
+                    "已自动禁用群组按用户并发功能。"
+                )
+            group_concurrency = False
+        old_val = self.cfg.get("_group_concurrency_enabled", False)
+        self.cfg["_group_concurrency_enabled"] = group_concurrency
+        if group_concurrency and not old_val:
+            self._group_concurrency.install()
+        elif not group_concurrency and old_val:
+            self._group_concurrency.terminate()
 
     def _get_cfg(self, key: str, default: Any = None) -> Any:
         """获取配置项"""
@@ -547,7 +697,6 @@ class LLMEnhancement(Star):
     @filter.event_message_type(filter.EventMessageType.ALL, priority=1)
     async def on_message_event(self, event: AstrMessageEvent):
         """处理消息的初步过滤、黑白名单检查及唤醒逻辑。支持群聊和私聊。"""
-        self._refresh_config()
         raw_message = event.message_obj.raw_message if (event.message_obj and hasattr(event.message_obj, "raw_message")) else {}
         if not raw_message and hasattr(event, "event"):
             raw_message = event.event
@@ -604,11 +753,11 @@ class LLMEnhancement(Star):
             return await self._effective_dialog_history.get_history_messages(_event, count)
         command_trigger_event = self._is_command_trigger_event(event)
 
-        # 1. 全局屏蔽检查
+        # 0. 全局屏蔽检查
         if uid == bid:
             return
         
-        # 1.0 内置黑名单拦截（三档：仅LLM/指令+LLM/全消息）
+        # 1. 内置黑名单拦截（三档：仅LLM/指令+LLM/全消息）
         blacklist_level = self.blacklist.blacklist_intercept_level()
         if blacklist_level == "all_messages":
             if await self.blacklist.intercept_event(event):
@@ -623,22 +772,13 @@ class LLMEnhancement(Star):
             if whitelist and gid not in whitelist:
                 return
             
-        # 2. 内置指令屏蔽
-        blocked_commands = get_blocked_commands(self._get_cfg)
-        if not event.is_admin() and blocked_commands:
-            matched_cmd = match_blocked_command(msg, blocked_commands)
-            if matched_cmd:
-                event.stop_event()
-                return
-
-        # 【移动】：第一时间提取消息发送时间，用于所有后续判定
+        # 提取消息发送时间，用于所有后续判定
         raw_msg_ts = _raw_get(raw_message, "time", None)
         if raw_msg_ts in (None, ""):
             raw_msg_ts = _raw_get(raw_message, "date", None)
-        # event_ts 优先用于所有 now 相关判定，避免用系统时间导致的窗口漂移
         event_ts = normalize_event_ts(raw_msg_ts, time.time())
 
-        # 2.5 并发预检查（不占位，仅在超限时提前跳过唤醒计算）
+        # 2. 并发预检查（不占位，仅在超限时提前跳过唤醒计算）
         merge_cfg = load_merge_runtime_config(self._get_cfg)
         dynamic_merge_mode = bool(merge_cfg.dynamic_mode and merge_cfg.delay_sec > 0)
         state_uid = (
@@ -649,9 +789,17 @@ class LLMEnhancement(Star):
         allow_existing_dynamic_session_reuse = bool(
             dynamic_merge_mode and event.get_extra("_llme_dynamic_requeued", default=False)
         )
-        user_limit = normalize_concurrency_limit(self._get_cfg("max_user_concurrent_requests", 0))
-        group_limit = normalize_concurrency_limit(self._get_cfg("max_group_concurrent_requests", 0))
-        if gid and (user_limit > 0 or group_limit > 0):
+        orch = self._get_cfg("request_orchestration", {})
+        user_limit = normalize_concurrency_limit(orch.get("max_user_concurrent_requests", 0))
+        group_limit = normalize_concurrency_limit(orch.get("max_group_concurrent_requests", 0))
+        # 动态合并模式：用户有进行中的动态合并会话时，绕过预检查。
+        should_bypass_concurrency = (
+            dynamic_merge_mode
+            and gid
+            and uid in g.members
+            and g.members[uid].dynamic_inflight_seq > 0
+        )
+        if gid and (user_limit > 0 or group_limit > 0) and not should_bypass_concurrency:
             async with self._request_counter_lock:
                 now_ts = time.time()
                 evict_stale_concurrency_slots(
@@ -680,7 +828,6 @@ class LLMEnhancement(Star):
         if uid not in g.members:
             g.members[uid] = MemberState(uid=uid)
         member = g.members[uid]
-        # 【修改】：直接复用提前提取的 event_ts，不再用系统时间
         now = event_ts
 
         skip_explicit_wake_for_bot = should_skip_bot_wake_type(
@@ -778,12 +925,19 @@ class LLMEnhancement(Star):
             reason = ""
         ordinary_group_msg = False
         if gid:
+            is_bot_msg = is_bot_account_message(uid, self._get_cfg)
+            if gid and is_bot_msg:
+                logger.debug(
+                    "[LLMEnhancement] 消息发送者为已配置的机器人账号，"
+                    "不计入主动唤醒统计。"
+                    f" group={gid}, uid={uid}"
+                )
             ordinary_group_msg = (
                 (not direct_wake)
                 and (not command_trigger_event)
                 and (not addressed_to_bot)
                 and (not at_all)
-                and (not is_bot_account_message(uid, self._get_cfg))
+                and (not is_bot_msg)
             )
             wake_extend_window = float(self._get_cfg("wake_extend", 0) or 0)
             ref_ts = float(g.last_response_ts or 0.0)
@@ -828,110 +982,30 @@ class LLMEnhancement(Star):
             )
 
         if context_injection_enabled:
-            reply_preview = await try_build_reply_preview(event, reply_msg_id)
-            parse_options = get_context_non_text_parse_options(self._get_cfg)
-            current_msg_id = get_event_msg_id(event) or ""
-            context_text = ""
-            if msg:
-                text_enrichment = await build_text_context_enrichment(
-                    event=event,
-                    get_cfg=self._get_cfg,
-                    message_chain=message_chain,
-                    parse_options=parse_options,
-                )
-                if "image" in parse_options and has_image_component:
-                    image_caption = await try_get_image_caption(
-                        event=event,
-                        message_chain=message_chain,
-                        raw_image_datas=raw_image_datas,
-                        get_cfg=self._get_cfg,
-                        provider_by_id_resolver=lambda provider_id: resolve_provider(self.context, provider_id),
-                        default_provider_resolver=lambda: get_vision_provider(self.context, self._get_cfg, event=event),
-                    )
-                    if image_caption:
-                        image_label = get_image_component_label(message_chain, raw_image_datas=raw_image_datas)
-                        text_enrichment = (
-                            f"{text_enrichment} | {image_label}转述: {image_caption}"
-                            if text_enrichment
-                            else f"{image_label}转述: {image_caption}"
-                        )
-                if text_enrichment:
-                    context_text = f"{msg} | {text_enrichment}"
-            if (not context_text) and (not msg):
-                context_text = await build_non_text_context_text(
-                    event=event,
-                    context=self.context,
-                    get_cfg=self._get_cfg,
-                    message_chain=message_chain,
-                    sender_name=event.get_sender_name(),
-                    msg_id=current_msg_id,
-                    parse_options=parse_options,
-                    raw_image_datas=raw_image_datas,
-                    provider_by_id_resolver=lambda provider_id: resolve_provider(self.context, provider_id),
-                    default_provider_resolver=lambda: get_vision_provider(self.context, self._get_cfg, event=event),
-                )
-            if not context_text:
-                image_caption = ""
-                image_label = "图片"
-                if (not msg) and ("image" in parse_options):
-                    # 非文本场景下，若勾选了图片解析，再尝试图片转述并参与回退构建。
-                    image_caption = await try_get_image_caption(
-                        event=event,
-                        message_chain=message_chain,
-                        raw_image_datas=raw_image_datas,
-                        get_cfg=self._get_cfg,
-                        provider_by_id_resolver=lambda provider_id: resolve_provider(self.context, provider_id),
-                        default_provider_resolver=lambda: get_vision_provider(self.context, self._get_cfg, event=event),
-                    )
-                    image_label = get_image_component_label(message_chain, raw_image_datas=raw_image_datas)
-                context_text = build_context_text(
-                    msg,
-                    event.get_sender_name(),
-                    image_caption=image_caption,
-                    has_image_component=has_image_component,
-                    has_video_component=has_video_component,
-                    has_file_component=has_file_component,
-                    has_forward_component=has_forward_component,
-                    has_json_component=has_json_component,
-                    has_record_component=has_record_component,
-                    file_name=file_name,
-                    image_label=image_label,
-                    emoji_summary=emoji_summary,
-                )
-            if context_text:
-                context_text = append_emoji_summary_suffix(context_text, emoji_summary)
-            parse_features: list[str] = []
-            if "聊天记录抽取:" in context_text:
-                parse_features.append("forward")
-            if "URL解析:" in context_text:
-                parse_features.append("url")
-            if "JSON解析:" in context_text:
-                parse_features.append("json")
-            if "文件信息:" in context_text:
-                parse_features.append("file")
-            if ("图片转述:" in context_text) or ("表情包转述:" in context_text):
-                parse_features.append("image")
-            if has_record_component:
-                parse_features.append("record")
-            append_group_context_message(
-                g,
+            asyncio.create_task(_background_context_injection(
+                self=self,
+                event=event,
+                g=g,
                 uid=uid,
-                sender_name=event.get_sender_name(),
-                message_text=context_text,
-                max_messages=context_injection_max_messages,
-                msg_id=current_msg_id,
-                is_bot=False,
-                source="incoming",
+                msg=msg,
+                message_chain=message_chain,
+                raw_image_datas=raw_image_datas,
+                has_image_component=has_image_component,
+                has_video_component=has_video_component,
+                has_file_component=has_file_component,
+                has_forward_component=has_forward_component,
+                has_json_component=has_json_component,
+                has_record_component=has_record_component,
+                file_name=file_name,
+                reply_to_id=reply_to_id,
+                reply_msg_id=reply_msg_id,
                 at_targets=at_targets,
                 at_bot=at_bot,
                 at_all=at_all,
-                reply_to_id=reply_to_id,
-                reply_msg_id=reply_msg_id,
-                reply_preview=reply_preview,
-                parse_features=parse_features,
-                now_ts=now,
-                get_cfg=self._get_cfg,
-            )
+                now=now,
+                emoji_summary=emoji_summary,
+                context_injection_max_messages=context_injection_max_messages,
+            ))
 
         image_label = get_image_component_label(message_chain, raw_image_datas=raw_image_datas)
         normalized_msg, normalized_reason = normalize_wake_trigger_message(
@@ -1054,20 +1128,19 @@ class LLMEnhancement(Star):
                         merge_delay=merge_cfg.delay_sec,
                         merge_max_count=merge_cfg.max_count,
                     )
-                    if (not recompute_decision.accepted) and (
-                        recompute_decision.reason in {
-                            "deadline_reached",
-                            "max_count_reached",
-                        }
-                    ):
+                    max_count_limit_reached = (
+                        (not recompute_decision.accepted)
+                        and recompute_decision.reason in {"deadline_reached", "max_count_reached"}
+                    )
+                    if max_count_limit_reached:
                         logger.debug(
-                            "[LLMEnhancement] 动态软重算忽略后续消息："
+                            "[LLMEnhancement] 动态软重算已达上限，消息降级为普通新消息继续唤醒判定："
                             f"group={gid or 'private'}, owner_uid={target_uid}, incoming_uid={uid}, "
                             f"reason={recompute_decision.reason}, max_count={merge_cfg.max_count}"
                         )
-                        return
+                        event.set_extra("_llme_dynamic_max_count_reached", True)
                     inflight_seq = int(recompute_decision.inflight_seq or 0)
-                    if recompute_decision.accepted and inflight_seq > 0:
+                    if (not max_count_limit_reached) and recompute_decision.accepted and inflight_seq > 0:
                         stop_requested = request_dynamic_recompute_stop(
                             event,
                             inflight_seq=inflight_seq,
@@ -1115,7 +1188,7 @@ class LLMEnhancement(Star):
 
         # 提及唤醒 (仅群聊)
         if gid and (not wake) and (not skip_active_wake_for_bot):
-            matched_mention = evaluate_mention_wake(msg, self._get_cfg("mention_wake"))
+            matched_mention = evaluate_mention_wake(msg, self._get_cfg("mention_wake"), gid=gid, uid=uid)
             if matched_mention:
                 wake = True
                 reason = f"提及唤醒({matched_mention})"
@@ -1236,20 +1309,19 @@ class LLMEnhancement(Star):
                         merge_delay=merge_cfg.delay_sec,
                         merge_max_count=merge_cfg.max_count,
                     )
-                    if (not recompute_decision.accepted) and (
-                        recompute_decision.reason in {
-                            "deadline_reached",
-                            "max_count_reached",
-                        }
-                    ):
+                    max_count_limit_reached = (
+                        (not recompute_decision.accepted)
+                        and recompute_decision.reason in {"deadline_reached", "max_count_reached"}
+                    )
+                    if max_count_limit_reached:
                         logger.debug(
-                            "[LLMEnhancement] 动态软重算忽略后续消息："
+                            "[LLMEnhancement] 动态软重算已达上限，已唤醒消息不参与动态合并，继续走后续流程："
                             f"group={gid or 'private'}, owner_uid={target_uid}, incoming_uid={uid}, "
                             f"reason={recompute_decision.reason}, max_count={merge_cfg.max_count}"
                         )
-                        return
+                        event.set_extra("_llme_dynamic_max_count_reached", True)
                     inflight_seq = int(recompute_decision.inflight_seq or 0)
-                    if recompute_decision.accepted and inflight_seq > 0:
+                    if (not max_count_limit_reached) and recompute_decision.accepted and inflight_seq > 0:
                         stop_requested = request_dynamic_recompute_stop(
                             event,
                             inflight_seq=inflight_seq,
@@ -1290,9 +1362,10 @@ class LLMEnhancement(Star):
             forbidden_word = contains_forbidden_wake_word(
                 event.message_str or "",
                 self._get_cfg("wake_forbidden_words"),
+                gid=gid,
+                uid=uid,
             )
             if forbidden_word:
-                event.stop_event()
                 return
 
         if wake:
@@ -1308,14 +1381,17 @@ class LLMEnhancement(Star):
                 snap = build_event_snapshot(event, gid, uid, ts=event_ts)
                 ensure_snapshot_merge_key(snap)
                 upsert_recent_wake_snapshot(member, snap)
-                if dynamic_merge_mode and dynamic_state_uid is None and (not command_trigger_event):
+                if dynamic_merge_mode and dynamic_state_uid is None and (not command_trigger_event) and (
+                    not event.get_extra("_llme_dynamic_max_count_reached", False)
+                ) and merge_cfg.premerge_window_sec > 0:
                     premerge_candidates = consume_premerge_snapshots_for_trigger(
                         member,
                         trigger_ts=event_ts,
-                        window_sec=max(0.0, merge_cfg.delay_sec),
+                        window_sec=merge_cfg.premerge_window_sec,
                         max_items=max(0, int(merge_cfg.max_count) - 1),
                     )
                     if premerge_candidates:
+                        attach_dynamic_premerge_snapshots(member, premerge_candidates)
                         event.set_extra("_llme_premerge_snapshots", premerge_candidates)
                         logger.debug(
                             "[LLMEnhancement] 动态合并命中预合并消息："
@@ -1323,10 +1399,10 @@ class LLMEnhancement(Star):
                             f"premerge_msg_ids={[str(item.get('msg_id') or '').strip() for item in premerge_candidates if str(item.get('msg_id') or '').strip()]}"
                         )
                     upsert_dynamic_unresolved_snapshot(member, snap)
-        elif dynamic_merge_mode and merge_cfg.max_count > 1 and (not prefix_wake_blocked):
+        elif dynamic_merge_mode and merge_cfg.premerge_window_sec > 0 and merge_cfg.max_count > 1 and (not prefix_wake_blocked):
             max_premerge_count = max(0, int(merge_cfg.max_count) - 1)
             if max_premerge_count > 0:
-                premerge_window = max(0.5, merge_cfg.delay_sec + 0.3)
+                premerge_window = max(0.5, merge_cfg.premerge_window_sec)
                 in_recent_wake_window = False
                 keep_sec = max(max(merge_cfg.delay_sec, 10.0) * 6, 60.0)
                 async with member.lock:
@@ -1361,7 +1437,6 @@ class LLMEnhancement(Star):
         merged_skip_ttl = max(ttl_base * 6, 120.0)
         wait_timeout_sec = max(0.1, merge_cfg.delay_sec)
         merged_window_tolerance = 0.3
-        # 【修复】：直接使用消息发送时间作为合并起点，不再回退到系统时间
         merge_start_ts = event_ts
         merge_deadline_ts = merge_start_ts + merge_delay
 
@@ -1526,7 +1601,7 @@ class LLMEnhancement(Star):
                 f"uid={uid}, group={gid or 'private'}, trigger_msg_id={member.trigger_msg_id or 'unknown'}, "
                 f"buffer_count={len(message_buffer)}"
             )
-            pass # 继续后续处理
+            pass
         finally:
             async with member.lock:
                 member.in_merging = False # 合并结束
@@ -1720,7 +1795,7 @@ class LLMEnhancement(Star):
         )
         yield event.plain_result(result)
 
-    @blacklist.command("移除", alias={"rm", "解除"})
+    @blacklist.command("移除", alias={"rm", "解除", "删除"})
     async def blacklist_rm(self, event: AstrMessageEvent, user_ref: str = ""):
         """移除黑名单。支持用户ID或@目标。用法: /黑名单 移除 <用户ID/@用户>"""
         result = await self.blacklist.command_rm(event=event, user_ref=user_ref)
@@ -1827,8 +1902,8 @@ class LLMEnhancement(Star):
         """
         return await process_contact_list(event=event, limit_each=limit_each)
 
-    @filter.llm_tool(name="send_message")
-    async def send_message(
+    @filter.llm_tool(name="send_qq_message")
+    async def send_qq_message(
         self,
         event: AstrMessageEvent,
         chat_type: str,
@@ -1849,7 +1924,7 @@ class LLMEnhancement(Star):
             user_ids (str, optional): 当 `chat_type=private` 时必填，表示目标用户 QQ 号，支持逗号分隔批量发送。
             auto_escape (bool, optional): 是否将 CQ 码按纯文本发送。`True`=不解析，`False`=按 CQ 码解析。默认 `False`。
         """
-        return await send_message_logic(
+        result_text = await send_message_logic(
             event=event,
             chat_type=chat_type,
             message=message,
@@ -1857,6 +1932,51 @@ class LLMEnhancement(Star):
             user_ids=user_ids,
             auto_escape=auto_escape,
         )
+
+        # 上下文补录：工具发送成功后记录到目标群的 StateManager
+        try:
+            data = json.loads(result_text)
+            targets: list[tuple[str, str]] = []
+
+            if data.get("success") and data.get("chat_type") == "group":
+                gid = str(data.get("group_id") or "").strip()
+                mid = str(data.get("message_id") or "").strip()
+                if gid:
+                    targets.append((gid, mid))
+            elif "results" in data and data.get("chat_type") == "group":
+                for r in (data.get("results") or []):
+                    if r.get("success"):
+                        rgid = str(r.get("group_id") or "").strip()
+                        rmid = str(r.get("message_id") or "").strip()
+                        if rgid:
+                            targets.append((rgid, rmid))
+
+            if targets and is_context_injection_enabled(self._get_cfg):
+                text = str(message or "").strip()
+                for gid, mid in targets:
+                    g = StateManager.get_group(gid)
+                    append_group_context_message(
+                        g,
+                        uid=str(event.get_self_id() or "bot"),
+                        sender_name="Bot",
+                        message_text=text,
+                        max_messages=get_context_injection_max_messages(self._get_cfg),
+                        msg_id=mid,
+                        is_bot=True,
+                        source="assistant",
+                        at_targets=[],
+                        at_bot=False,
+                        at_all=False,
+                        reply_to_id="",
+                        reply_msg_id="",
+                        reply_preview="",
+                        now_ts=time.time(),
+                        get_cfg=self._get_cfg,
+                    )
+        except Exception:
+            pass
+
+        return result_text
 
     @filter.llm_tool(name="get_msg_history")
     async def get_msg_history(
@@ -1928,8 +2048,8 @@ class LLMEnhancement(Star):
             user_ids,
             duration,
             group_id,
-            admin_required_tools=self._get_cfg("tool_admin_required_tools", []),
-            enabled_dangerous_tools=self._get_cfg("enabled_dangerous_tools", []),
+            self_only_tools=self._get_cfg("self_only_tools", []),
+            enabled_risk_tools=self._get_cfg("enabled_risk_tools", []),
         )
 
     @filter.llm_tool(name="kick_group_member")
@@ -1955,8 +2075,8 @@ class LLMEnhancement(Star):
             user_ids=user_ids,
             group_id=group_id,
             reject_add_request=reject_add_request,
-            admin_required_tools=self._get_cfg("tool_admin_required_tools", []),
-            enabled_dangerous_tools=self._get_cfg("enabled_dangerous_tools", []),
+            self_only_tools=self._get_cfg("self_only_tools", []),
+            enabled_risk_tools=self._get_cfg("enabled_risk_tools", []),
             confirm_required_tools=self._get_cfg("confirm_required_tools", []),
             confirm_timeout_sec=self._confirm_timeout_sec(),
             confirm_token=confirm_token,
@@ -1982,8 +2102,7 @@ class LLMEnhancement(Star):
             event=event,
             enable=enable,
             group_id=group_id,
-            admin_required_tools=self._get_cfg("tool_admin_required_tools", []),
-            enabled_dangerous_tools=self._get_cfg("enabled_dangerous_tools", []),
+            enabled_risk_tools=self._get_cfg("enabled_risk_tools", []),
             confirm_required_tools=self._get_cfg("confirm_required_tools", []),
             confirm_timeout_sec=self._confirm_timeout_sec(),
             confirm_token=confirm_token,
@@ -2012,8 +2131,7 @@ class LLMEnhancement(Star):
             user_ids=user_ids,
             enable=enable,
             group_id=group_id,
-            admin_required_tools=self._get_cfg("tool_admin_required_tools", []),
-            enabled_dangerous_tools=self._get_cfg("enabled_dangerous_tools", []),
+            enabled_risk_tools=self._get_cfg("enabled_risk_tools", []),
             confirm_required_tools=self._get_cfg("confirm_required_tools", []),
             confirm_timeout_sec=self._confirm_timeout_sec(),
             confirm_token=confirm_token,
@@ -2034,8 +2152,8 @@ class LLMEnhancement(Star):
             user_id=user_id,
             card=card,
             group_id=group_id,
-            admin_required_tools=self._get_cfg("tool_admin_required_tools", []),
-            enabled_dangerous_tools=self._get_cfg("enabled_dangerous_tools", []),
+            self_only_tools=self._get_cfg("self_only_tools", []),
+            enabled_risk_tools=self._get_cfg("enabled_risk_tools", []),
         )
 
     @filter.llm_tool(name="set_group_special_title")
@@ -2059,8 +2177,8 @@ class LLMEnhancement(Star):
             user_id=user_id,
             special_title=special_title,
             group_id=group_id,
-            admin_required_tools=self._get_cfg("tool_admin_required_tools", []),
-            enabled_dangerous_tools=self._get_cfg("enabled_dangerous_tools", []),
+            self_only_tools=self._get_cfg("self_only_tools", []),
+            enabled_risk_tools=self._get_cfg("enabled_risk_tools", []),
         )
 
     @filter.llm_tool(name="set_essence_msg")
@@ -2074,8 +2192,7 @@ class LLMEnhancement(Star):
         return await set_essence_msg_logic(
             event=event,
             message_ids=message_ids,
-            admin_required_tools=self._get_cfg("tool_admin_required_tools", []),
-            enabled_dangerous_tools=self._get_cfg("enabled_dangerous_tools", []),
+            enabled_risk_tools=self._get_cfg("enabled_risk_tools", []),
         )
 
     @filter.llm_tool(name="delete_essence_msg")
@@ -2095,8 +2212,7 @@ class LLMEnhancement(Star):
         return await delete_essence_msg_logic(
             event=event,
             message_ids=message_ids,
-            admin_required_tools=self._get_cfg("tool_admin_required_tools", []),
-            enabled_dangerous_tools=self._get_cfg("enabled_dangerous_tools", []),
+            enabled_risk_tools=self._get_cfg("enabled_risk_tools", []),
             confirm_required_tools=self._get_cfg("confirm_required_tools", []),
             confirm_timeout_sec=self._confirm_timeout_sec(),
             confirm_token=confirm_token,
@@ -2114,8 +2230,7 @@ class LLMEnhancement(Star):
         return await delete_msg_logic(
             event=event,
             message_ids=message_ids,
-            admin_required_tools=self._get_cfg("tool_admin_required_tools", []),
-            enabled_dangerous_tools=self._get_cfg("enabled_dangerous_tools", []),
+            enabled_risk_tools=self._get_cfg("enabled_risk_tools", []),
             confirm_required_tools=self._get_cfg("confirm_required_tools", []),
             confirm_timeout_sec=self._confirm_timeout_sec(),
             confirm_token=confirm_token,
@@ -2134,8 +2249,7 @@ class LLMEnhancement(Star):
             event=event,
             group_name=group_name,
             group_id=group_id,
-            admin_required_tools=self._get_cfg("tool_admin_required_tools", []),
-            enabled_dangerous_tools=self._get_cfg("enabled_dangerous_tools", []),
+            enabled_risk_tools=self._get_cfg("enabled_risk_tools", []),
         )
 
     @filter.llm_tool(name="send_group_notice")
@@ -2159,8 +2273,7 @@ class LLMEnhancement(Star):
             content=content,
             group_id=group_id,
             pinned=pinned,
-            admin_required_tools=self._get_cfg("tool_admin_required_tools", []),
-            enabled_dangerous_tools=self._get_cfg("enabled_dangerous_tools", []),
+            enabled_risk_tools=self._get_cfg("enabled_risk_tools", []),
         )
 
     @filter.llm_tool(name="delete_group_notice")
@@ -2183,8 +2296,7 @@ class LLMEnhancement(Star):
             event=event,
             notice_id=notice_id,
             group_id=group_id,
-            admin_required_tools=self._get_cfg("tool_admin_required_tools", []),
-            enabled_dangerous_tools=self._get_cfg("enabled_dangerous_tools", []),
+            enabled_risk_tools=self._get_cfg("enabled_risk_tools", []),
             confirm_required_tools=self._get_cfg("confirm_required_tools", []),
             confirm_timeout_sec=self._confirm_timeout_sec(),
             confirm_token=confirm_token,
@@ -2202,8 +2314,7 @@ class LLMEnhancement(Star):
         return await dismiss_group_logic(
             event=event,
             group_id=group_id,
-            admin_required_tools=self._get_cfg("tool_admin_required_tools", []),
-            enabled_dangerous_tools=self._get_cfg("enabled_dangerous_tools", []),
+            enabled_risk_tools=self._get_cfg("enabled_risk_tools", []),
             confirm_required_tools=self._get_cfg("confirm_required_tools", []),
             confirm_timeout_sec=self._confirm_timeout_sec(),
             confirm_token=confirm_token,
@@ -2279,12 +2390,23 @@ class LLMEnhancement(Star):
         if bool(event.get_extra("_llme_skip_due_to_prefix_block", default=False)):
             return
 
-        self._refresh_config()
         uid: str = event.get_sender_id()
         if not uid:
             return
         gid: str = event.get_group_id()
         if not gid:
+            return
+
+        # 违禁词检查 — 已触发唤醒场景下拦截 LLM 请求
+        msg = (event.message_str or "").strip()
+        forbidden_word = contains_forbidden_wake_word(
+            msg,
+            self._get_cfg("wake_forbidden_words"),
+            gid=gid,
+            uid=uid,
+        )
+        if forbidden_word:
+            event.stop_event()
             return
 
         if bool(event.get_extra("_llme_concurrency_acquired", default=False)) and (
@@ -2304,8 +2426,9 @@ class LLMEnhancement(Star):
         )
         current_msg_id = get_event_msg_id(event) or ""
 
-        user_limit = normalize_concurrency_limit(self._get_cfg("max_user_concurrent_requests", 0))
-        group_limit = normalize_concurrency_limit(self._get_cfg("max_group_concurrent_requests", 0))
+        orch = self._get_cfg("request_orchestration", {})
+        user_limit = normalize_concurrency_limit(orch.get("max_user_concurrent_requests", 0))
+        group_limit = normalize_concurrency_limit(orch.get("max_group_concurrent_requests", 0))
         async with self._request_counter_lock:
             now_ts = time.time()
             evict_stale_concurrency_slots(
@@ -2392,7 +2515,6 @@ class LLMEnhancement(Star):
         if state_uid not in g.members:
             g.members[state_uid] = MemberState(uid=state_uid)
         merge_member = g.members[state_uid]
-        # 【新增】：在 on_llm_request 中第一时间提取消息发送时间，用于后续时序判定
         raw_message_llm = (
             event.message_obj.raw_message
             if (event.message_obj and hasattr(event.message_obj, "raw_message"))
@@ -2457,6 +2579,32 @@ class LLMEnhancement(Star):
         msg = event.message_str
         current_msg_id = get_event_msg_id(event)
         is_dynamic_followup = bool(event.get_extra("_llme_dynamic_followup", default=False))
+        if is_dynamic_followup and requeue_from_seq > 0 and req.conversation and req.conversation.history:
+            try:
+                original_history = json.loads(req.conversation.history)
+                n = len(original_history)
+                if n >= 2 and original_history[-1].get("role") == "assistant":
+                    first, second = original_history[0], original_history[1]
+                    start = None
+                    for i, msg_ctx in enumerate(req.contexts):
+                        if (msg_ctx.get("role") == first.get("role")
+                                and i + 1 < len(req.contexts)
+                                and req.contexts[i + 1].get("role") == second.get("role")
+                                and msg_ctx.get("content") == first.get("content")):
+                            start = i
+                            break
+                    if start is not None and start + n <= len(req.contexts):
+                        idx = start + n - 2
+                        if (req.contexts[idx].get("role") == "user"
+                                and req.contexts[idx + 1].get("role") == "assistant"):
+                            del req.contexts[idx:idx + 2]
+                            logger.debug(
+                                "[LLMEnhancement] 清理 requeued followup 残留对话历史："
+                                f"group={gid or 'private'}, uid={uid}, "
+                                f"requeue_from_seq={requeue_from_seq}"
+                            )
+            except Exception as e:
+                logger.warning("[LLMEnhancement] 清理 requeued 历史失败：%s", e)
         if current_msg_id and self._consume_recent_recall(event.unified_msg_origin, current_msg_id):
             logger.info(
                 "[LLMEnhancement] on_llm_request 拦截：触发消息已在本次请求前撤回。"
@@ -2600,6 +2748,7 @@ class LLMEnhancement(Star):
                 get_cfg=self._get_cfg,
                 get_history_msg=_get_wake_context_messages,
                 find_provider=lambda provider_id: resolve_provider(self.context, provider_id),
+                context=self.context,
             )
             if direct_wake and not wake:
                 logger.debug(
@@ -2762,6 +2911,7 @@ class LLMEnhancement(Star):
 
             # ==================== 4. 转发聊天记录解析 ====================
             handled_forward = await process_forward_record_content(
+                context=self.context,
                 event=event,
                 req=req,
                 forward_id=ref_result.forward_id,
@@ -2815,8 +2965,6 @@ class LLMEnhancement(Star):
                 await self._release_concurrency_slot_if_needed(
                     event, reason="request_blocked_before_provider"
                 )
-            # 【修改】：不清理 unresolved_msgs，让它在 after_message_sent 中延迟清理
-            # 这样 mark_dynamic_soft_recompute 可以通过 unresolved_msgs 的长度正确判断是否达到上限
             if dynamic_merge_mode and event.is_stopped():
                 dynamic_req_seq = int(event.get_extra("_llme_dynamic_request_seq") or 0)
                 if dynamic_req_seq > 0:
@@ -2860,6 +3008,7 @@ class LLMEnhancement(Star):
             )
             state_uid = str(event.get_extra("_llme_dynamic_state_uid", default=uid) or uid).strip()
             member = g.members.get(state_uid)
+            should_drop = False
 
             if member:
                 merge_cfg = load_merge_runtime_config(self._get_cfg)
@@ -2877,8 +3026,6 @@ class LLMEnhancement(Star):
                         if dynamic_req_seq <= member.dynamic_discard_before_seq:
                             should_drop = True
                             cache_stored = store_discarded_response_cache(member, dynamic_req_seq, resp)
-                        # 【修改】：不清理 unresolved_msgs，交给 after_message_sent 延迟清理
-                        # 否则在 LLM 生成完到消息发出的空档期，池子被提前清空，导致拦截失效
                         if member.dynamic_inflight_seq == dynamic_req_seq:
                             member.dynamic_inflight_seq = 0
                             reset_dynamic_capture_session(member)
@@ -2922,6 +3069,9 @@ class LLMEnhancement(Star):
                     )
                     member.cancel_merge = False
                     clear_pending_msg_ids(g, member)
+                    if not member.dynamic_unresolved_msgs:
+                        member.dynamic_attached_premerge_msgs = []
+                        reset_dynamic_capture_session(member)
                     event.set_extra("_llme_pending_last_response_update", False)
                     event.set_extra("_llme_effective_assistant_text_candidate", "")
                     event.stop_event()
@@ -2959,7 +3109,7 @@ class LLMEnhancement(Star):
                     # 正常可发送内容，发送成功后清理缓存。
                     event.set_extra("_llme_discard_cache_clear_after_sent", True)
 
-                if context_injection_enabled:
+                if context_injection_enabled and not should_drop:
                     assistant_text = self._effective_dialog_history.extract_assistant_text_from_response(resp)
                     if not assistant_text:
                         assistant_text = str(resp.completion_text or "").strip()
@@ -3040,6 +3190,48 @@ class LLMEnhancement(Star):
             await self._release_concurrency_slot_if_needed(
                 event, reason="after_message_sent_no_pending"
             )
+            # ===== 非 LLM 回复补录 =====
+            gid = event.get_group_id()
+            if (
+                gid
+                and is_context_injection_enabled(self._get_cfg)
+                and getattr(event, "_has_send_oper", False)
+            ):
+                result = event.get_result()
+                if result:
+                    text = result.get_plain_text().strip()
+                    if not text:
+                        chain = list(result.chain or [])
+                        for seg in chain:
+                            if isinstance(seg, Comp.Image):
+                                text = "[图片]"
+                            elif isinstance(seg, Comp.File):
+                                text = "[文件]"
+                            elif isinstance(seg, Comp.Video):
+                                text = "[视频]"
+                            if text:
+                                break
+                    if text:
+                        uid_val = event.get_sender_id() or ""
+                        g = StateManager.get_group(gid)
+                        append_group_context_message(
+                            g,
+                            uid=str(event.get_self_id() or "bot"),
+                            sender_name="Bot",
+                            message_text=text,
+                            max_messages=get_context_injection_max_messages(self._get_cfg),
+                            msg_id="",
+                            is_bot=True,
+                            source="plugin_response",
+                            at_targets=[],
+                            at_bot=False,
+                            at_all=False,
+                            reply_to_id=uid_val,
+                            reply_msg_id="",
+                            reply_preview="",
+                            now_ts=time.time(),
+                            get_cfg=self._get_cfg,
+                        )
             return
 
         uid: str = event.get_sender_id()
@@ -3090,8 +3282,6 @@ class LLMEnhancement(Star):
             if should_clear_discard_cache:
                 clear_discarded_response_cache(member)
 
-            # 【新增】：消息发出后，清理 dynamic_unresolved_msgs 中已处理的消息
-            # 这是"延迟清理"方案的关键：消息在 LLM 请求期间一直占位，直到回复发出才清理
             batch_msg_ids = event.get_extra("_llme_dynamic_batch_msg_ids", default=[]) or []
             if batch_msg_ids:
                 batch_id_set = {str(mid).strip() for mid in batch_msg_ids if str(mid or "").strip()}
@@ -3109,6 +3299,7 @@ class LLMEnhancement(Star):
                         )
                     # 如果池子空了，重置状态
                     if not member.dynamic_unresolved_msgs:
+                        member.dynamic_attached_premerge_msgs = []
                         member.dynamic_inflight_seq = 0
                         member.merge_start_ts = 0.0
 
@@ -3159,5 +3350,6 @@ class LLMEnhancement(Star):
                     f"[LLMEnhancement] 私聊输入状态任务异常结束: task_key={task_key}",
                     exc_info=True,
                 )
+        self._group_concurrency.terminate()
         await self.blacklist.terminate()
         logger.info("[LLMEnhancement] 插件已终止")

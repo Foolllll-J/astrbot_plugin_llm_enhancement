@@ -14,6 +14,7 @@ class MemberState(BaseModel):
     trigger_msg_id: Optional[str] = None                   # 触发当前流程的首条消息ID
     recent_wake_msgs: list[dict[str, Any]] = Field(default_factory=list) # 唤醒阶段预采样消息
     premerge_msgs: list[dict[str, Any]] = Field(default_factory=list)     # 唤醒前的非唤醒预合并消息
+    dynamic_attached_premerge_msgs: list[dict[str, Any]] = Field(default_factory=list)  # 当前动态会话附着的预合并消息
     last_wake_ts: float = 0.0                              # 最近一次唤醒时间（时间戳）
     merge_start_ts: float = 0.0                            # 合并会话起点时间（硬等待: 当前请求；动态: 当前会话）
     merged_msg_ids: dict[str, float] = Field(default_factory=dict)        # 已并入其他请求的消息ID过期表

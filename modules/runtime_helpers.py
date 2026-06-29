@@ -4,6 +4,7 @@ import json
 import os
 import shutil
 import time
+import tempfile
 from typing import Any, Callable, Optional
 
 from astrbot.api import logger
@@ -20,6 +21,13 @@ from .provider_utils import find_provider
 _RECORD_ASR_CACHE_TTL_SEC = 10 * 60
 _RECORD_ASR_CACHE_MAX_SIZE = 100
 _record_asr_cache: dict[str, dict[str, Any]] = {}
+_DEFAULT_LLM_ASR_PROMPT = (
+    "You are a speech transcription assistant. "
+    "Transcribe the spoken content faithfully, preserving meaningful filler words and "
+    "annotating major background sounds with short bracketed tags such as [Laughter] or "
+    "[Background Music] when they are clearly present. "
+    "Output only the final annotated transcription text."
+)
 
 
 def _parse_version_tuple(version_text: str) -> tuple[int, ...]:
@@ -80,56 +88,6 @@ def append_text_part_to_request(
         part = part.mark_as_temp()
     parts.append(part)
     return True
-
-
-def normalize_blocked_command_text(text: str) -> str:
-    """标准化阻断命令文本：去边界空白、折叠多空白、转小写。"""
-    return " ".join(str(text or "").strip().lower().split())
-
-def is_valid_blocked_command_match(text: str, command: str) -> bool:
-    """严格匹配命令（全文一致或命令后跟空格）。"""
-    if not text.startswith(command):
-        return False
-    if len(text) == len(command):
-        return True
-    return text[len(command)] == " "
-
-def normalize_blocked_command_values(commands: Any) -> list[str]:
-    """标准化并去重（保留原顺序）的阻断命令列表。"""
-    normalized: list[str] = []
-    for raw_cmd in commands or []:
-        if not isinstance(raw_cmd, str):
-            continue
-        normalized_cmd = normalize_blocked_command_text(raw_cmd)
-        if normalized_cmd:
-            normalized.append(normalized_cmd)
-
-    deduped: list[str] = []
-    seen: set[str] = set()
-    for cmd in normalized:
-        if cmd in seen:
-            continue
-        seen.add(cmd)
-        deduped.append(cmd)
-    return deduped
-
-def get_blocked_commands(get_cfg: Callable[[str, Any], Any]) -> list[str]:
-    """读取并标准化阻断命令列表配置。"""
-    blocked_commands = get_cfg("blocked_commands")
-    if isinstance(blocked_commands, (list, tuple, set)):
-        return normalize_blocked_command_values(blocked_commands)
-    return []
-
-def match_blocked_command(msg: str, blocked_commands: list[str]) -> str:
-    """返回命中命令；未命中返回空。"""
-    normalized_msg = normalize_blocked_command_text(msg)
-    if not normalized_msg:
-        return ""
-
-    for normalized_cmd in blocked_commands:
-        if is_valid_blocked_command_match(normalized_msg, normalized_cmd):
-            return normalized_cmd
-    return ""
 
 
 class EffectiveDialogHistory:
@@ -343,6 +301,148 @@ def get_stt_provider(
         return None
 
 
+def _provider_supports_audio_input(provider: Any) -> bool:
+    provider_cfg = getattr(provider, "provider_config", None)
+    if not isinstance(provider_cfg, dict):
+        return False
+    modalities = provider_cfg.get("modalities", [])
+    if not isinstance(modalities, list):
+        return False
+    return "audio" in modalities
+
+
+def _get_explicit_stt_provider(
+    context: Any,
+    get_cfg: Callable[[str, Any], Any],
+):
+    asr_pid = str(get_cfg("asr_provider_id", "") or "").strip()
+    if not asr_pid:
+        return None
+    provider = resolve_provider(context, asr_pid)
+    if provider:
+        logger.debug(f"[LLMEnhancement] 成功匹配到指定 STT Provider: {asr_pid}")
+        return provider
+    logger.warning(f"[LLMEnhancement] 未找到指定 STT Provider: {asr_pid}")
+    return None
+
+
+async def _ensure_audio_path_for_llm(
+    audio_path: str,
+    ffmpeg_path: str,
+) -> tuple[str, list[str]]:
+    normalized = str(audio_path or "").strip()
+    if not normalized or normalized.lower().endswith(".wav"):
+        return normalized, []
+
+    try:
+        from .video_parser import extract_audio_wav
+    except Exception as e:
+        logger.debug(f"[LLMEnhancement] 导入 extract_audio_wav 失败: err={e}")
+        return normalized, []
+
+    try:
+        wav_path = await extract_audio_wav(ffmpeg_path, normalized)
+    except Exception as e:
+        logger.warning(f"[LLMEnhancement] LLM ASR 音频转 WAV 失败: path={normalized}, err={e}")
+        return normalized, []
+
+    if wav_path and os.path.exists(wav_path):
+        return wav_path, [wav_path]
+    return normalized, []
+
+
+async def _transcribe_via_llm(
+    *,
+    context: Any,
+    get_cfg: Callable[[str, Any], Any],
+    event: Optional[AstrMessageEvent],
+    audio_path: str,
+    audio_is_prepared_wav: bool = False,
+) -> tuple[str, list[str]]:
+    llm_pid = str(get_cfg("asr_llm_provider_id", "") or "").strip()
+    if not llm_pid:
+        return "", []
+
+    provider = resolve_provider(context, llm_pid)
+    if not provider:
+        logger.warning(f"[LLMEnhancement] 未找到指定 LLM ASR Provider: {llm_pid}")
+        return "", []
+
+    if not _provider_supports_audio_input(provider):
+        logger.warning(f"[LLMEnhancement] LLM ASR Provider 不支持 audio modality: {llm_pid}")
+        return "", []
+
+    llm_audio_path = str(audio_path or "").strip()
+    cleanup_paths: list[str] = []
+    if not llm_audio_path:
+        return "", []
+
+    if not audio_is_prepared_wav:
+        llm_audio_path, cleanup_paths = await _ensure_audio_path_for_llm(
+            llm_audio_path,
+            str(get_cfg("ffmpeg_path", "") or ""),
+        )
+
+    try:
+        response = await provider.text_chat(
+            prompt=_DEFAULT_LLM_ASR_PROMPT,
+            audio_urls=[llm_audio_path],
+            contexts=[],
+        )
+    except Exception as e:
+        logger.warning(f"[LLMEnhancement] LLM ASR 调用失败: provider={llm_pid}, err={e}")
+        return "", cleanup_paths
+
+    text = str(getattr(response, "completion_text", "") or "").strip()
+    return text, cleanup_paths
+
+
+async def transcribe_audio_with_fallback(
+    *,
+    context: Any,
+    get_cfg: Callable[[str, Any], Any],
+    event: Optional[AstrMessageEvent],
+    audio_path: str,
+    audio_is_prepared_wav: bool = False,
+) -> tuple[str, list[str]]:
+    cleanup_paths: list[str] = []
+    normalized_audio_path = str(audio_path or "").strip()
+    if not normalized_audio_path:
+        return "", []
+
+    explicit_stt = _get_explicit_stt_provider(context, get_cfg)
+    text = ""
+    if explicit_stt:
+        try:
+            if hasattr(explicit_stt, "get_text"):
+                text = await explicit_stt.get_text(normalized_audio_path)
+            elif hasattr(explicit_stt, "speech_to_text"):
+                res = await explicit_stt.speech_to_text(normalized_audio_path)
+                if isinstance(res, dict):
+                    text = str(res.get("text") or "")
+                elif hasattr(res, "text"):
+                    text = str(res.text)
+                else:
+                    text = str(res or "")
+        except Exception as e:
+            logger.warning(f"[LLMEnhancement] 显式 STT ASR 调用失败: err={e}")
+            text = ""
+
+    text = str(text or "").strip()
+    if text:
+        return text, []
+
+    llm_text, llm_cleanup_paths = await _transcribe_via_llm(
+        context=context,
+        get_cfg=get_cfg,
+        event=event,
+        audio_path=normalized_audio_path,
+        audio_is_prepared_wav=audio_is_prepared_wav,
+    )
+    cleanup_paths.extend(llm_cleanup_paths)
+    return str(llm_text or "").strip(), cleanup_paths
+
+
 def get_vision_provider(
     context: Any,
     get_cfg: Callable[[str, Any], Any],
@@ -527,29 +627,18 @@ async def transcribe_record_segment(
     cached_text = _get_record_asr_cache(cache_key)
     if cached_text:
         return cached_text, []
-    stt = get_stt_provider(context, get_cfg, event=event)
-    if not stt:
-        return "", []
     record_path, should_cleanup = await resolve_record_file_path(event, segment)
     if not record_path:
         return "", []
-    text = ""
-    try:
-        if hasattr(stt, "get_text"):
-            text = await stt.get_text(record_path)
-        elif hasattr(stt, "speech_to_text"):
-            res = await stt.speech_to_text(record_path)
-            if isinstance(res, dict):
-                text = str(res.get("text") or "")
-            elif hasattr(res, "text"):
-                text = str(res.text)
-            else:
-                text = str(res or "")
-        else:
-            text = ""
-    except Exception as e:
-        text = ""
+    text, llm_cleanup_paths = await transcribe_audio_with_fallback(
+        context=context,
+        get_cfg=get_cfg,
+        event=event,
+        audio_path=record_path,
+        audio_is_prepared_wav=False,
+    )
     cleanup_paths = [record_path] if should_cleanup else []
+    cleanup_paths.extend(llm_cleanup_paths)
     text = str(text or "").strip()
     if text:
         _set_record_asr_cache(cache_key or record_path, text)

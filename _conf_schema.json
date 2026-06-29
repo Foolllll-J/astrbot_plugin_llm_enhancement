@@ -8,7 +8,7 @@
     "intelligent_wake": {
         "type": "object",
         "description": "智能唤醒",
-        "hint": "配置智能唤醒相关参数",
+        "hint": "配置智能唤醒相关参数。",
         "items": {
             "prob_wake": {
                 "description": "概率唤醒活跃度",
@@ -25,7 +25,7 @@
             },
             "mention_wake": {
                 "description": "提及唤醒规则",
-                "hint": "支持普通文本包含、re:pattern 与 /pattern/flags（flags: i,m,s,x,a,u,L）。不填时关闭提及检测。",
+                "hint": "支持普通文本包含与 re:pattern（正则）。不填时关闭提及检测。",
                 "type": "list",
                 "default": []
             },
@@ -103,7 +103,7 @@
                 "type": "string",
                 "_special": "select_provider",
                 "default": "",
-                "hint": "仅用于普通 @ / 唤醒前缀请求的唤醒判定。留空表示不启用该判定。"
+                "hint": "用于选中的各类唤醒类型的后置判定。留空表示不启用该判定。"
             },
             "wake_judge_prompt": {
                 "description": "唤醒判定提示词",
@@ -113,7 +113,7 @@
                 "editor_language": "markdown",
                 "editor_theme": "vs-dark",
                 "default": "你是群聊“唤醒判定器”。请判断机器人是否应该响应这条显式唤醒请求。\n\n[当前时间]\n{time}\n\n[用户ID]\n{user_id}\n\n[用户名]\n{user_name}\n\n[群组ID]\n{group_id}\n\n[最近上下文]\n{history}\n\n[当前消息]\n{message}\n\n[判定规则]\n1) 用户明确表示“别回复/不用回/闭嘴/停下”等，输出 F。\n2) 当前消息仅为收尾确认（如“嗯/好/知道了/收到/晚安/拜拜/谢谢”）且没有新问题或新任务，输出 F。\n3) 含有新的问题、任务、追问，或明确要求继续，输出 T。\n4) 不确定时优先输出 T，避免漏回关键请求。\n\n[输出格式]\n只能输出一个大写字母：T 或 F。",
-                "hint": "支持占位符：{time}、{user_id}、{user_name}、{group_id}、{history}、{message}、{persona}、{random}。"
+                "hint": "支持占位符：{time}、{user_id}、{user_name}、{group_id}、{history}、{message}、{persona}、{rN}、{schedule}（需安装 life_scheduler 插件）。"
             },
             "wake_extend": {
                 "description": "唤醒延长（秒）",
@@ -155,7 +155,7 @@
                 "editor_language": "markdown",
                 "editor_theme": "vs-dark",
                 "default": "请判断当前消息是否与上文足够相关，是否需要继续响应。\n\n[当前时间]\n{time}\n\n[用户ID]\n{user_id}\n\n[用户名]\n{user_name}\n\n[群组ID]\n{group_id}\n\n[相关性阈值参考]\n{threshold}\n\n[上文]\n{history}\n\n[当前消息]\n{message}\n\n[判定规则]\n1) 如果当前消息是对上文的自然追问、补充、纠正、承接或继续讨论，输出 T。\n2) 如果当前消息与上文明显无关、话题跳转过大，或不需要机器人继续响应，输出 F。\n3) 不确定时优先结合上文连续性判断；只有在明显无关时才输出 F。\n\n[输出格式]\n只能输出一个大写字母：T 或 F。",
-                "hint": "支持占位符：{time}、{user_id}、{user_name}、{group_id}、{threshold}、{history}、{message}、{persona}、{random}。仅在配置了 wake_extend_provider_id 时生效。"
+                "hint": "支持占位符：{time}、{user_id}、{user_name}、{group_id}、{threshold}、{history}、{message}、{persona}、{rN}、{schedule}。仅在配置了 唤醒延长判定 Provider ID 时生效。"
             },
             "wake_judge_context_count": {
                 "description": "唤醒判定上下文条数",
@@ -177,20 +177,6 @@
                     "step": 1
                 }
             },
-            "max_user_concurrent_requests": {
-                "description": "用户级并发请求上限",
-                "hint": "限制单个用户同时进行中的 LLM 请求数。设为 0 表示不限制。",
-                "type": "int",
-                "minimum": 0,
-                "default": 0
-            },
-            "max_group_concurrent_requests": {
-                "description": "群聊级并发请求上限",
-                "hint": "限制单个群同时进行中的 LLM 请求数。设为 0 表示不限制。",
-                "type": "int",
-                "minimum": 0,
-                "default": 0
-            },
             "wake_forbidden_words": {
                 "description": "屏蔽唤醒规则",
                 "hint": "支持格式同唤醒规则。命中规则时不会唤醒 Bot。",
@@ -199,23 +185,6 @@
                     "政治",
                     "键证",
                     "党"
-                ]
-            },
-            "blocked_commands": {
-                "description": "屏蔽指令",
-                "hint": "屏蔽内置或插件指令，默认仅屏蔽内置指令。",
-                "type": "list",
-                "default": [
-                    "help",
-                    "new",
-                    "reset",
-                    "sid",
-                    "stop",
-                    "stats",
-                    "set",
-                    "unset",
-                    "dashboard_update",
-                    "provider"
                 ]
             },
             "require_at_for_wake_prefix": {
@@ -248,10 +217,10 @@
             }
         }
     },
-    "merge": {
+    "request_orchestration": {
         "type": "object",
-        "description": "消息合并",
-        "hint": "配置硬等待合并与动态合并的行为。",
+        "description": "请求编排",
+        "hint": "控制 LLM 请求的合并策略、并发上限和群聊按用户并发。",
         "items": {
             "merge_dynamic_mode": {
                 "description": "合并模式",
@@ -265,7 +234,7 @@
                     "硬合并",
                     "动态合并"
                 ],
-                "default": "hard"
+                "default": "dynamic"
             },
             "merge_delay": {
                 "description": "合并窗口（秒）",
@@ -277,7 +246,13 @@
                 "description": "合并数量上限",
                 "hint": "单次最多可合并的消息条数，超过上限后将停止继续收集。",
                 "type": "int",
-                "default": 3
+                "default": 2
+            },
+            "merge_premerge_window": {
+                "description": "预合并窗口（秒）",
+                "hint": "唤醒前，将在此窗口秒数内的用户消息作为预合并候选。仅动态合并模式生效，设为 0 时关闭预合并。",
+                "type": "int",
+                "default": 0
             },
             "merge_followup_require_wake": {
                 "description": "后续合并需再次唤醒",
@@ -288,6 +263,26 @@
             "merge_multi_user": {
                 "description": "允许合并多人消息",
                 "hint": "开启后，合并窗口期间若有其他群成员发送消息，也会被一并收集。",
+                "type": "bool",
+                "default": false
+            },
+            "max_user_concurrent_requests": {
+                "description": "用户级并发请求上限",
+                "hint": "限制单个用户同时进行中的 LLM 请求数。设为 0 表示不限制。",
+                "type": "int",
+                "minimum": 0,
+                "default": 0
+            },
+            "max_group_concurrent_requests": {
+                "description": "群聊级并发请求上限",
+                "hint": "限制单个群同时进行中的 LLM 请求数。设为 0 表示不限制。",
+                "type": "int",
+                "minimum": 0,
+                "default": 0
+            },
+            "group_sender_concurrency": {
+                "description": "群聊按用户并发",
+                "hint": "开启后，同群内不同用户的 LLM 请求各自独立排队，不再全局串行等待，可同时进行处理。同一用户连续发消息仍然串行。若同时开启了动态合并 + 多人合并，此功能将不会生效。",
                 "type": "bool",
                 "default": false
             }
@@ -453,7 +448,14 @@
                 "description": "ASR 提供商 ID",
                 "type": "string",
                 "_special": "select_provider_stt",
-                "hint": "用于将视频音频或语音内容转写为文本。留空时使用当前会话正在使用的 STT Provider。"
+                "hint": "用于将视频音频或语音内容转写为文本。若留空，则跳过 STT Provider，直接尝试下方配置的 LLM 语音转写提供商。"
+            },
+            "asr_llm_provider_id": {
+                "description": "LLM 语音转写提供商 ID",
+                "type": "string",
+                "_special": "select_provider",
+                "default": "",
+                "hint": "当指定的 STT Provider 未配置或转写失败时，使用此 LLM Provider 做语音转写。模型需在提供商配置中勾选 audio 能力；若不支持则直接放弃。"
             },
             "image_provider_id": {
                 "description": "图片转述 Provider ID",
@@ -581,7 +583,7 @@
             "inject_url_max_download_kb": {
                 "description": "URL 下载大小上限（KB）",
                 "type": "int",
-                "default": 512,
+                "default": 2048,
                 "minimum": 32,
                 "hint": "单个链接最多下载的内容大小，超出将停止正文解析。"
             },
@@ -600,18 +602,17 @@
                 "default": [],
                 "hint": "命中黑名单域名（含子域名）时直接跳过解析。"
             },
-            "inject_url_cache_ttl_sec": {
-                "description": "URL 解析缓存时长（秒）",
-                "type": "int",
-                "default": 600,
-                "minimum": 0,
-                "hint": "同一链接在缓存有效期内复用解析结果；设为 0 表示不缓存。"
+            "tavily_api_keys": {
+                "description": "Tavily API 密钥",
+                "hint": "填写后 URL 解析优先使用 Tavily extract 服务，全部失败则回退到内置 HTTP 抓取。留空时仅使用内置抓取。",
+                "type": "list",
+                "default": []
             }
         }
     },
     "qq_platform": {
         "type": "object",
-        "description": "QQ平台配置",
+        "description": "QQ 平台配置",
         "hint": "集中配置 QQ 群聊场景的上下文注入与工具权限控制。",
         "items": {
             "perception_injection_fields": {
@@ -656,10 +657,11 @@
                     "标签",
                     "Q龄",
                     "QQ等级",
-                    "会员信息"
+                    "会员信息",
+                    "是否机器人"
                 ],
                 "description": "发送者信息注入字段",
-                "hint": "按需勾选要注入给 LLM 的字段。留空表示关闭该注入。仅 (aiocqhttp) 群聊生效。"
+                "hint": "按需勾选要注入给 LLM 的字段。留空表示关闭该注入。仅 QQ (aiocqhttp) 群聊生效。"
             },
             "extra_info_injection_include_bot_self": {
                 "type": "bool",
@@ -673,46 +675,50 @@
                 "description": "注入查询忽略缓存",
                 "hint": "开启后，每次注入将忽略缓存直接查询最新成员信息。"
             },
-            "tool_admin_required_tools": {
+            "enabled_risk_tools": {
                 "type": "list",
-                "default": [],
+                "default": [
+                    "设置群名片",
+                    "设置群头衔",
+                    "设置群名称",
+                    "设置精华消息",
+                    "发送群公告",
+                    "拉黑用户",
+                    "解除拉黑"
+                ],
                 "options": [
-                    "撤回消息",
-                    "禁言成员",
-                    "群组踢人",
-                    "全员禁言",
+                    "设置群名称",
                     "设置群管理员",
                     "设置群名片",
                     "设置群头衔",
                     "设置精华消息",
-                    "移出精华消息",
-                    "设置群名称",
                     "发送群公告",
                     "删除群公告",
-                    "批量踢出群成员",
-                    "解散群",
-                    "拉黑用户",
-                    "解除拉黑"
-                ],
-                "description": "启用管理员校验的工具",
-                "hint": "勾选后，对应工具调用时将强制要求管理员权限。未勾选则交给 LLM 自行判断。"
-            },
-            "enabled_dangerous_tools": {
-                "type": "list",
-                "default": [],
-                "options": [
+                    "移出精华消息",
                     "撤回消息",
                     "禁言成员",
                     "群组踢人",
                     "全员禁言",
-                    "删除群公告",
-                    "设置群管理员",
-                    "移出精华消息",
-                    "批量踢出群成员",
-                    "解散群"
+                    "解散群",
+                    "拉黑用户",
+                    "解除拉黑"
                 ],
-                "description": "允许启用的危险工具",
-                "hint": "默认不勾选表示危险工具全部禁用。建议将不启用的函数工具关闭。"
+                "description": "允许启用的风险工具",
+                "hint": "默认仅启用低风险工具，高风险操作（踢人/解散群等）需手动勾选。"
+            },
+            "self_only_tools": {
+                "type": "list",
+                "default": [],
+                "options": [
+                    "拉黑用户",
+                    "解除拉黑",
+                    "禁言成员",
+                    "群组踢人",
+                    "设置群名片",
+                    "设置群头衔"
+                ],
+                "description": "启用自我操作限制的工具",
+                "hint": "勾选后，非管理员调用该工具时只能操作自己，管理员不受限制。"
             },
             "confirm_required_tools": {
                 "type": "list",
@@ -724,7 +730,6 @@
                     "删除群公告",
                     "设置群管理员",
                     "移出精华消息",
-                    "批量踢出群成员",
                     "解散群"
                 ],
                 "description": "启用二次确认的工具",
@@ -744,19 +749,6 @@
         "description": "黑名单",
         "hint": "黑名单管理配置，用于命令与 LLM 工具拉黑。",
         "items": {
-            "max_blacklist_duration": {
-                "type": "int",
-                "default": 86400,
-                "minimum": 0,
-                "description": "黑名单最长时长（秒）",
-                "hint": "仅对 LLM 工具生效。设置为 0 表示允许永久拉黑。"
-            },
-            "allow_blacklist_bot_admin": {
-                "type": "bool",
-                "default": false,
-                "description": "允许拉黑 Bot 管理员",
-                "hint": "默认关闭。开启后可拉黑 Bot 管理员，需谨慎操作。"
-            },
             "blacklist_intercept_level": {
                 "type": "string",
                 "default": "llm_only",
@@ -772,6 +764,33 @@
                 ],
                 "description": "黑名单拦截等级",
                 "hint": "可按需选择黑名单拦截强度。"
+            },
+            "max_blacklist_duration": {
+                "type": "int",
+                "default": 86400,
+                "minimum": 0,
+                "description": "黑名单最长时长（秒）",
+                "hint": "仅对 LLM 工具生效。设置为 0 表示允许永久拉黑。"
+            },
+            "allow_blacklist_bot_admin": {
+                "type": "bool",
+                "default": false,
+                "description": "允许拉黑 Bot 管理员",
+                "hint": "默认关闭。开启后可拉黑 Bot 管理员，需谨慎操作。"
+            },
+            "blacklist_output_mode": {
+                "type": "string",
+                "default": "image",
+                "options": [
+                    "image",
+                    "text"
+                ],
+                "labels": [
+                    "图片",
+                    "纯文本"
+                ],
+                "description": "黑名单输出模式",
+                "hint": "列表和详情命令的输出形式。"
             }
         }
     }

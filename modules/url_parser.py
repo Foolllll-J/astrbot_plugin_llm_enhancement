@@ -1,5 +1,6 @@
 import asyncio
 import ipaddress
+import random
 import re
 import socket
 import time
@@ -87,6 +88,27 @@ class UrlInjectResult:
 
 
 
+def _is_error_summary(summary: str) -> bool:
+    """判断 summary 是否为错误/失败消息，不应注入到上下文"""
+    text = str(summary or "").strip()
+    if not text:
+        return True
+    # 检查是否包含错误关键词
+    error_keywords = [
+        "失败",
+        "跳过",
+        "被拦截",
+        "黑名单",
+        "内网地址",
+        "下载链接",
+        "下载后再发送",
+        "请先下载",
+        "未提取到有效正文",
+        "无法解析主机名",
+    ]
+    return any(keyword in text for keyword in error_keywords)
+
+
 def _normalize_text(text: str, limit: int) -> str:
     value = str(text or "").replace("\x00", "")
     value = re.sub(r"\r\n?", "\n", value)
@@ -106,10 +128,59 @@ def _preview_text(text: str, limit: int = 160) -> str:
 
 
 def _strip_html(html: str) -> str:
-    text = re.sub(r"<script[\s\S]*?</script>", " ", html, flags=re.IGNORECASE)
+    """提取HTML的文本内容，优先提取正文区域"""
+    # 1. 尝试提取常见的正文容器（article、main、content 等）
+    article_match = re.search(
+        r'<(?:article|main|div[^>]*?(?:class|id)=["\'][^"\']*(?:content|article|post|entry|main|body)[^"\']*["\'][^>]*)>([\s\S]*?)</(?:article|main|div)>',
+        html,
+        flags=re.IGNORECASE
+    )
+    if article_match:
+        text_source = article_match.group(0)
+    else:
+        text_source = html
+
+    # 2. 删除 script、style、注释、导航菜单等非正文标签
+    text = re.sub(r"<script[\s\S]*?</script>", " ", text_source, flags=re.IGNORECASE)
     text = re.sub(r"<style[\s\S]*?</style>", " ", text, flags=re.IGNORECASE)
+    text = re.sub(r"<!--[\s\S]*?-->", " ", text)  # 删除HTML注释
+    text = re.sub(r"<(?:nav|header|footer|aside|menu|sidebar)[\s\S]*?</(?:nav|header|footer|aside|menu|sidebar)>", " ", text, flags=re.IGNORECASE)
+
+    # 3. 删除所有标签
     text = re.sub(r"<[^>]+>", " ", text)
-    return _normalize_text(unescape(text), MAX_INJECT_CHARS_PER_URL)
+
+    # 4. HTML实体解码
+    text = unescape(text)
+
+    # 5. 规范化（这里会压缩空白）
+    return _normalize_text(text, MAX_INJECT_CHARS_PER_URL)
+
+
+def _detect_cloudflare(html: str, headers: Dict[str, str]) -> bool:
+    """检测是否被 Cloudflare 拦截"""
+    # 1. 检查 Server 头
+    server = str(headers.get("server", "")).lower()
+    if "cloudflare" in server:
+        return True
+
+    # 2. 检查 CF-* 开头的头部
+    if any(k.lower().startswith("cf-") for k in headers.keys()):
+        return True
+
+    # 3. 检查页面内容特征
+    html_lower = html.lower()
+    cf_keywords = [
+        "cloudflare",
+        "attention required",
+        "enable javascript and cookies",
+        "checking your browser",
+        "ddos protection by cloudflare",
+        "ray id:",  # Cloudflare Ray ID
+    ]
+    if any(keyword in html_lower for keyword in cf_keywords):
+        return True
+
+    return False
 
 
 def _extract_title(html: str) -> str:
@@ -117,6 +188,24 @@ def _extract_title(html: str) -> str:
     if not match:
         return ""
     return _normalize_text(unescape(match.group(1)), 120)
+
+
+def _extract_meta_description(html: str) -> str:
+    """提取 meta description，优先 Open Graph 和 Twitter Cards"""
+    # 优先级：og:description > twitter:description > name="description"
+    for pattern in [
+        r'property="og:description"[^>]+content="([^"]*)"',
+        r'content="([^"]*)"[^>]+property="og:description"',
+        r'name="twitter:description"[^>]+content="([^"]*)"',
+        r'content="([^"]*)"[^>]+name="twitter:description"',
+        r'name="description"[^>]+content="([^"]*)"',
+        r'content="([^"]*)"[^>]+name="description"',
+    ]:
+        match = re.search(pattern, html, flags=re.IGNORECASE)
+        if match:
+            desc = unescape(match.group(1).strip())
+            return _normalize_text(desc, 200)
+    return ""
 
 
 def _decode_response_body(body: bytes, content_type: str) -> str:
@@ -348,7 +437,7 @@ async def _fetch_by_aiohttp(
         "Accept": "text/html,application/xhtml+xml,text/plain,application/json,*/*;q=0.8",
     }
     try:
-        async with aiohttp.ClientSession(headers=headers) as session:
+        async with aiohttp.ClientSession(headers=headers, trust_env=True) as session:
             current = url
             for _ in range(MAX_REDIRECTS + 1):
                 parsed = urlparse(current)
@@ -470,12 +559,63 @@ async def _fetch_by_urllib(
     return result
 
 
+async def _try_tavily_extract(
+    url: str,
+    api_keys: List[str],
+    timeout_sec: int,
+) -> Optional[str]:
+    if not api_keys:
+        return None
+    keys = list(api_keys)
+    random.shuffle(keys)
+    max_attempts = min(2, len(keys))
+    for attempt in range(max_attempts):
+        key = keys[attempt]
+        try:
+            timeout = aiohttp.ClientTimeout(total=timeout_sec)
+            async with aiohttp.ClientSession(timeout=timeout, trust_env=True) as session:
+                async with session.post(
+                    "https://api.tavily.com/extract",
+                    json={"urls": [url], "extract_depth": "basic"},
+                    headers={
+                        "Authorization": f"Bearer {key}",
+                        "Content-Type": "application/json",
+                    },
+                ) as resp:
+                    if resp.status != 200:
+                        reason = await resp.text()
+                        logger.warning(
+                            f"[LLMEnhancement] Tavily 提取第 {attempt+1}/{max_attempts} 次失败 "
+                            f"(HTTP {resp.status}): {reason}"
+                        )
+                        continue
+                    data = await resp.json()
+                    results = data.get("results", [])
+                    if not results:
+                        continue
+                    raw_content = results[0].get("raw_content", "").strip()
+                    if raw_content:
+                        return _normalize_text(raw_content, limit=MAX_INJECT_CHARS_PER_URL)
+        except asyncio.TimeoutError:
+            logger.warning(
+                f"[LLMEnhancement] Tavily 提取第 {attempt+1}/{max_attempts} 次超时"
+            )
+            continue
+        except Exception as e:
+            logger.warning(
+                f"[LLMEnhancement] Tavily 提取第 {attempt+1}/{max_attempts} 次异常: {e}"
+            )
+            continue
+    return None
+
+
 async def _fetch_url_summary(
     url: str,
     timeout_sec: int,
     max_bytes: int,
     should_block_private_network: bool,
     blocked_domains: List[str],
+    tavily_api_keys: Optional[List[str]] = None,
 ) -> str:
     parsed = urlparse(url)
     host = str(parsed.hostname or "").strip().lower()
@@ -488,6 +628,11 @@ async def _fetch_url_summary(
 
     if _looks_like_download_url(url):
         return f"链接 {url} 看起来是下载链接，请先下载文件后再发送文件内容进行解析。"
+
+    if tavily_api_keys:
+        tavily_result = await _try_tavily_extract(url, tavily_api_keys, timeout_sec)
+        if tavily_result is not None:
+            return tavily_result
 
     response = await _fetch_by_aiohttp(
         url=url,
@@ -546,20 +691,42 @@ async def _fetch_url_summary(
         )
 
     html_or_text = _decode_response_body(response.get("body") or b"", content_type)
+
+    # Cloudflare 检测
+    is_cloudflare = _detect_cloudflare(html_or_text, headers)
+    if is_cloudflare:
+        logger.warning(f"[LLMEnhancement] 检测到 Cloudflare 防护: {url}")
+        return f"链接 {url} 启用了 Cloudflare 防护，无法直接抓取内容，已跳过解析。"
+
     title = _extract_title(html_or_text)
+    meta_desc = _extract_meta_description(html_or_text)
     snippet = _strip_html(html_or_text)
     truncated = bool(response.get("truncated"))
     final_url = str(response.get("final_url") or url)
 
-    if not snippet:
+    if not snippet and not meta_desc:
         return (
             f"链接 {final_url} 已访问，但未提取到有效正文。"
             + ("（已按下载上限截断）" if truncated else "")
         )
 
     suffix = "（已按下载上限截断）" if truncated else ""
+
+    # 优先使用 meta description，如果有的话
+    if meta_desc and not snippet:
+        # 只有 meta 描述，没有正文
+        if title:
+            return f"链接 {final_url} 的页面信息：标题《{title}》；描述：{meta_desc}{suffix}"
+        return f"链接 {final_url} 的页面描述：{meta_desc}{suffix}"
+
+    # 有正文内容
     if title:
-        return f"链接 {final_url} 的页面信息：标题《{title}》；正文摘要：{snippet}{suffix}"
+        if meta_desc:
+            # 标题 + meta 描述 + 正文摘要
+            return f"链接 {final_url} 的页面信息：标题《{title}》；描述：{meta_desc}；正文摘要：{snippet}{suffix}"
+        else:
+            # 标题 + 正文摘要
+            return f"链接 {final_url} 的页面信息：标题《{title}》；正文摘要：{snippet}{suffix}"
     return f"链接 {final_url} 的页面摘要：{snippet}{suffix}"
 
 
@@ -570,7 +737,7 @@ async def extract_url_infos_from_chain(
     max_download_kb: int = DEFAULT_MAX_DOWNLOAD_KB,
     block_private_network: bool = True,
     blocked_domains: Optional[List[str]] = None,
-    cache_ttl_sec: int = DEFAULT_CACHE_TTL_SEC,
+    tavily_api_keys: Optional[List[str]] = None,
 ) -> UrlInjectResult:
     result = UrlInjectResult()
     urls = _extract_urls_from_chain(event, chain)
@@ -585,10 +752,6 @@ async def extract_url_infos_from_chain(
         max_download_kb = max(32, int(max_download_kb))
     except Exception:
         max_download_kb = DEFAULT_MAX_DOWNLOAD_KB
-    try:
-        cache_ttl_sec = max(0, int(cache_ttl_sec))
-    except Exception:
-        cache_ttl_sec = DEFAULT_CACHE_TTL_SEC
 
     blocked_domains = [str(x or "").strip() for x in (blocked_domains or []) if str(x or "").strip()]
     should_block_private_network = bool(block_private_network) and (not bool(event.is_admin()))
@@ -597,13 +760,17 @@ async def extract_url_infos_from_chain(
 
     summaries: List[str] = []
     for url in urls[:MAX_URL_INJECT_COUNT]:
+        # B站 URL 优先走 API 元数据（分支替代普通网页抓取）
+        bili_text = await _try_fetch_single_bili_metadata(url)
+        if bili_text:
+            summaries.append(bili_text)
+            continue
+
         cache_key = (
             f"{url}|{timeout_sec}|{max_download_kb}|"
             f"private={int(should_block_private_network)}|blocked={blocked_domains_sig}"
         )
-        summary = None
-        if cache_ttl_sec > 0:
-            summary = await _get_cached_summary(cache_key)
+        summary = await _get_cached_summary(cache_key)
         if not summary:
             summary = await _fetch_url_summary(
                 url=url,
@@ -611,10 +778,13 @@ async def extract_url_infos_from_chain(
                 max_bytes=max_bytes,
                 should_block_private_network=should_block_private_network,
                 blocked_domains=blocked_domains,
+                tavily_api_keys=tavily_api_keys,
             )
-            if cache_ttl_sec > 0 and summary:
-                await _set_cached_summary(cache_key, summary, cache_ttl_sec)
-        if summary:
+            if summary:
+                await _set_cached_summary(cache_key, summary, DEFAULT_CACHE_TTL_SEC)
+
+        # 只注入成功解析的内容，跳过失败/被拦截/下载链接等错误消息
+        if summary and not _is_error_summary(summary):
             summaries.append(_normalize_text(summary, limit=MAX_INJECT_CHARS_PER_URL))
 
     if summaries:
@@ -628,3 +798,107 @@ async def extract_url_infos_from_chain(
             f"effective_block_private={should_block_private_network}"
         )
     return result
+
+
+async def extract_url_summary_from_text(
+    text: str,
+    max_urls: int = 3,
+    timeout_sec: int = DEFAULT_TIMEOUT_SEC,
+    max_download_kb: int = DEFAULT_MAX_DOWNLOAD_KB,
+    tavily_api_keys: Optional[List[str]] = None,
+) -> str:
+    """从纯文本中提取 URL，分别尝试 B站元数据（API）或普通网页摘要，返回已合并的摘要文本。"""
+    urls = _extract_urls_from_text(text)
+    if not urls:
+        return ""
+    max_bytes = max_download_kb * 1024
+    summaries: list[str] = []
+    for url in urls[:max_urls]:
+        bili_text = await _try_fetch_single_bili_metadata(url)
+        if bili_text:
+            summaries.append(bili_text)
+            continue
+        summary = await _fetch_url_summary(
+            url=url,
+            timeout_sec=timeout_sec,
+            max_bytes=max_bytes,
+            should_block_private_network=False,
+            blocked_domains=[],
+            tavily_api_keys=tavily_api_keys,
+        )
+        if summary and not _is_error_summary(summary):
+            summaries.append(_normalize_text(summary, limit=MAX_INJECT_CHARS_PER_URL))
+    return "；".join(summaries)
+
+
+_BILI_PATTERNS = [
+    re.compile(r'https?://www\.bilibili\.com/video/(BV\w+)', re.IGNORECASE),
+    re.compile(r'https?://b23\.tv/(\w+)', re.IGNORECASE),
+]
+_BILI_API_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Referer": "https://www.bilibili.com",
+}
+
+
+def _format_bili_count(n: int) -> str:
+    if n >= 100000000:
+        return f"{n / 100000000:.1f}亿"
+    if n >= 10000:
+        return f"{n / 10000:.1f}万"
+    return str(n)
+
+
+def _format_duration(seconds: int) -> str:
+    m, s = divmod(seconds, 60)
+    h, m = divmod(m, 60)
+    if h > 0:
+        return f"{h}:{m:02d}:{s:02d}"
+    return f"{m}:{s:02d}"
+
+
+async def _try_fetch_single_bili_metadata(url: str) -> Optional[str]:
+    """尝试对单个 URL 提取 B站元数据，非 B站 URL 返回 None。"""
+    bvid: str = ""
+    for pat in _BILI_PATTERNS:
+        m = pat.search(url)
+        if m:
+            code = m.group(1)
+            if pat is _BILI_PATTERNS[1]:
+                try:
+                    async with aiohttp.ClientSession(headers=_BILI_API_HEADERS, trust_env=True) as sess:
+                        async with sess.head(url, allow_redirects=True, timeout=10) as resp:
+                            resolved = str(resp.url)
+                            bv_m = re.search(r'/video/(BV\w+)', resolved, re.I)
+                            if bv_m:
+                                bvid = bv_m.group(1)
+                except Exception:
+                    continue
+            else:
+                bvid = code
+            break
+
+    if not bvid:
+        return None
+
+    try:
+        api_url = f"https://api.bilibili.com/x/web-interface/view?bvid={bvid}"
+        async with aiohttp.ClientSession(headers=_BILI_API_HEADERS) as sess:
+            async with sess.get(api_url, timeout=10) as resp:
+                data = await resp.json()
+        if data.get("code") != 0:
+            return None
+        d = data.get("data", {})
+        stat = d.get("stat", {})
+
+        title = str(d.get("title", "") or "").strip()
+        owner = str(d.get("owner", {}).get("name", "") or "").strip()
+        duration = _format_duration(int(d.get("duration", 0) or 0))
+        view = _format_bili_count(int(stat.get("view", 0) or 0))
+        danmaku = _format_bili_count(int(stat.get("danmaku", 0) or 0))
+        like = _format_bili_count(int(stat.get("like", 0) or 0))
+        reply = _format_bili_count(int(stat.get("reply", 0) or 0))
+
+        return f"B站视频: {title} | UP:{owner} | {duration} | 播放{view} 弹幕{danmaku} 点赞{like} 评论{reply}"
+    except Exception:
+        return None

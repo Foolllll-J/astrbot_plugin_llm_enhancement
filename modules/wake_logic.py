@@ -15,6 +15,7 @@ from .state_manager import GroupState, MemberState
 
 _MENTION_WAKE_REGEX_CACHE: dict[str, re.Pattern[str]] = {}
 _MENTION_WAKE_REGEX_INVALID: set[str] = set()
+_SCOPE_RE = re.compile(r"(?:^| )@([gu]):([^\s]+)")
 _WAKE_JUDGE_TYPES = {"explicit", "mention", "relevant", "ask", "bored", "prob"}
 _BOT_ACCOUNT_SKIP_WAKE_TYPES = {"explicit", "active", "wake_extend"}
 WAKE_LLM_TIMEOUT_SEC = 5
@@ -308,74 +309,94 @@ def evict_stale_concurrency_slots(
     return evicted
 
 
-def _parse_regex_flags(flags_text: str) -> int:
-    flags = 0
-    for ch in flags_text:
-        if ch == "i":
-            flags |= re.IGNORECASE
-        elif ch == "m":
-            flags |= re.MULTILINE
-        elif ch == "s":
-            flags |= re.DOTALL
-        elif ch == "x":
-            flags |= re.VERBOSE
-        elif ch == "a":
-            flags |= re.ASCII
-        elif ch == "u":
-            flags |= re.UNICODE
-        elif ch == "L":
-            flags |= re.LOCALE
-        else:
-            raise ValueError(f"unsupported regex flag: {ch}")
-    return flags
+def _parse_scoped_rule(
+    rule: str,
+) -> tuple[str, list[str], list[str], list[str], list[str]]:
+    """解析作用域规则，返回 (pattern, groups_include, users_include, groups_exclude, users_exclude)。
 
-
-def match_mention_wake_rule(rule: str, text: str) -> bool:
+    格式：规则文本 @g:id1,id2 @u:id1,id2
+    ID 前加 ! 表示排除（黑名单），不加 ! 表示包含（白名单）。
+    同一 @g:/@u: 组内不可混用包含和排除。
+    无 @g/@u 限定则为全局规则。
     """
-    mention_wake 支持三种规则：
-    1) 普通字符串：直接做子串匹配
-    2) re:pattern：按正则表达式匹配
-    3) /pattern/flags：按正则表达式匹配（flags 支持 i,m,s,x,a,u,L）
+    groups_include: list[str] = []
+    users_include: list[str] = []
+    groups_exclude: list[str] = []
+    users_exclude: list[str] = []
+
+    for m in _SCOPE_RE.finditer(rule):
+        raw_ids = [s.strip() for s in m.group(2).split(",") if s.strip()]
+        if not raw_ids:
+            continue
+        all_negate = all(rid.startswith("!") for rid in raw_ids)
+        ids = [rid.lstrip("!") for rid in raw_ids if rid.lstrip("!")]
+        if m.group(1) == "g":
+            if all_negate:
+                groups_exclude.extend(ids)
+            else:
+                groups_include.extend(ids)
+        else:
+            if all_negate:
+                users_exclude.extend(ids)
+            else:
+                users_include.extend(ids)
+
+    pattern = _SCOPE_RE.sub("", rule).strip()
+    return pattern, groups_include, users_include, groups_exclude, users_exclude
+
+
+def match_mention_wake_rule(
+    rule: str,
+    text: str,
+    gid: str | None = None,
+    uid: str | None = None,
+) -> bool:
+    """
+    规则匹配。支持：
+    1) 普通字符串：子串匹配
+    2) re:pattern：正则匹配
+
+    支持 @g: 和 @u: 限定作用域，无限定则为全局规则。
     """
     raw = str(rule or "").strip()
     if not raw or not text:
         return False
 
-    pattern = ""
-    flags = 0
-    use_regex = False
+    pattern, groups_include, users_include, groups_exclude, users_exclude = _parse_scoped_rule(raw)
 
-    if raw.startswith("re:"):
-        pattern = raw[3:].strip()
-        use_regex = bool(pattern)
-    elif raw.startswith("/") and len(raw) > 1:
-        tail = raw.rfind("/")
-        if tail > 0:
-            flag_text = raw[tail + 1 :].strip()
+    # 包含检查：有限定时 gid/uid 必须在白名单内
+    if groups_include and (not gid or str(gid) not in groups_include):
+        return False
+    if users_include and (not uid or str(uid) not in users_include):
+        return False
+
+    # 排除检查：有限定时 gid/uid 不能在黑名单内
+    if groups_exclude and gid and str(gid) in groups_exclude:
+        return False
+    if users_exclude and uid and str(uid) in users_exclude:
+        return False
+
+    if not pattern:
+        return False
+
+    if pattern.startswith("re:"):
+        p = pattern[3:].strip()
+        if not p:
+            return False
+        compiled = _MENTION_WAKE_REGEX_CACHE.get(p)
+        if compiled is None:
+            if p in _MENTION_WAKE_REGEX_INVALID:
+                return False
             try:
-                flags = _parse_regex_flags(flag_text)
-                pattern = raw[1:tail]
-                use_regex = bool(pattern)
-            except ValueError:
-                use_regex = False
+                compiled = re.compile(p)
+            except re.error as e:
+                _MENTION_WAKE_REGEX_INVALID.add(p)
+                logger.warning(f"[LLMEnhancement] 正则无效: rule={raw!r}, error={e}")
+                return False
+            _MENTION_WAKE_REGEX_CACHE[p] = compiled
+        return bool(compiled.search(text))
 
-    if not use_regex:
-        return raw in text
-
-    cache_key = f"{pattern}\n{flags}"
-    compiled = _MENTION_WAKE_REGEX_CACHE.get(cache_key)
-    if compiled is None:
-        if cache_key in _MENTION_WAKE_REGEX_INVALID:
-            return False
-        try:
-            compiled = re.compile(pattern, flags)
-        except re.error as e:
-            _MENTION_WAKE_REGEX_INVALID.add(cache_key)
-            logger.warning(f"[LLMEnhancement] mention_wake 正则无效: rule={raw!r}, error={e}")
-            return False
-        _MENTION_WAKE_REGEX_CACHE[cache_key] = compiled
-
-    return bool(compiled.search(text))
+    return pattern in text
 
 
 def detect_wake_media_components(message_chain: Any) -> tuple[bool, bool, bool, bool, bool, bool, str]:
@@ -464,21 +485,21 @@ def build_media_trigger_message(
     if has_image_component:
         if image_label == "表情包":
             return _append_emoji_summary_suffix(
-                f"{sender_name}发送了一个表情包",
+                f"{sender_name}发送了1个表情包",
                 emoji_summary,
             ), "表情包消息唤醒"
-        return f"{sender_name}发送了一张{image_label}", "图片消息唤醒"
+        return f"{sender_name}发送了1张{image_label}", "图片消息唤醒"
     if has_video_component:
-        return f"{sender_name}发送了一个视频", "视频消息唤醒"
+        return f"{sender_name}发送了1个视频", "视频消息唤醒"
     if has_file_component:
         suffix = f"（{file_name}）" if file_name else ""
-        return f"{sender_name}发送了一个文件{suffix}", "文件消息唤醒"
+        return f"{sender_name}发送了1个文件{suffix}", "文件消息唤醒"
     if has_forward_component:
-        return f"{sender_name}发送了一条转发消息", "转发消息唤醒"
+        return f"{sender_name}发送了1条转发消息", "转发消息唤醒"
     if has_json_component:
-        return f"{sender_name}发送了一条分享卡片", "JSON卡片唤醒"
+        return f"{sender_name}发送了1条分享卡片", "JSON卡片唤醒"
     if has_record_component:
-        return f"{sender_name}发送了一条语音", "语音消息唤醒"
+        return f"{sender_name}发送了1条语音", "语音消息唤醒"
     return "", None
 
 
@@ -508,21 +529,21 @@ def normalize_wake_trigger_message(
     if has_image_component:
         if image_label == "表情包":
             return _append_emoji_summary_suffix(
-                f"{sender_name}发送了一个表情包",
+                f"{sender_name}发送了1个表情包",
                 emoji_summary,
             ), "表情包消息唤醒"
-        return f"{sender_name}发送了一张{image_label}", "图片消息唤醒"
+        return f"{sender_name}发送了1张{image_label}", "图片消息唤醒"
     if has_video_component:
-        return f"{sender_name}发送了一条视频", "视频消息唤醒"
+        return f"{sender_name}发送了1条视频", "视频消息唤醒"
     if has_file_component:
         suffix = f"（{file_name}）" if file_name else ""
-        return f"{sender_name}发送了一个文件{suffix}", "文件消息唤醒"
+        return f"{sender_name}发送了1个文件{suffix}", "文件消息唤醒"
     if has_forward_component:
-        return f"{sender_name}发送了一条转发消息", "转发消息唤醒"
+        return f"{sender_name}发送了1条转发消息", "转发消息唤醒"
     if has_json_component:
-        return f"{sender_name}发送了一条分享卡片", "JSON卡片唤醒"
+        return f"{sender_name}发送了1条分享卡片", "JSON卡片唤醒"
     if has_record_component:
-        return f"{sender_name}发送了一条语音", "语音消息唤醒"
+        return f"{sender_name}发送了1条语音", "语音消息唤醒"
     return msg, None
 
 
@@ -734,7 +755,12 @@ async def prepare_empty_mention_context(
     return True
 
 
-def evaluate_mention_wake(msg: str, mention_wake: Any) -> Optional[str]:
+def evaluate_mention_wake(
+    msg: str,
+    mention_wake: Any,
+    gid: str | None = None,
+    uid: str | None = None,
+) -> Optional[str]:
     """提及唤醒命中时返回命中的规则文本。"""
     if not msg or not mention_wake:
         return None
@@ -746,12 +772,17 @@ def evaluate_mention_wake(msg: str, mention_wake: Any) -> Optional[str]:
         if not rule:
             continue
         raw_rule = str(rule)
-        if match_mention_wake_rule(raw_rule, msg):
+        if match_mention_wake_rule(raw_rule, msg, gid=gid, uid=uid):
             return raw_rule
     return None
 
 
-def contains_forbidden_wake_word(message_text: str, forbidden_words: Any) -> Optional[str]:
+def contains_forbidden_wake_word(
+    message_text: str,
+    forbidden_words: Any,
+    gid: str | None = None,
+    uid: str | None = None,
+) -> Optional[str]:
     """违禁词命中时返回命中的词。"""
     if not message_text or not forbidden_words:
         return None
@@ -763,7 +794,7 @@ def contains_forbidden_wake_word(message_text: str, forbidden_words: Any) -> Opt
         if not word:
             continue
         rule = str(word)
-        if rule and match_mention_wake_rule(rule, message_text):
+        if rule and match_mention_wake_rule(rule, message_text, gid=gid, uid=uid):
             return rule
     return None
 
@@ -1014,7 +1045,7 @@ async def wake_extend_llm_decision(
         "message": f"{sender_name}: {str(msg or '')}".strip(": "),
     }
     await _ensure_persona_placeholder(event, placeholders, prompt_template)
-    placeholders.update(_build_prompt_extra_placeholders(event))
+    placeholders.update(await _build_prompt_extra_placeholders(event))
     prompt = _render_prompt_template(prompt_template, placeholders)
     system_prompt = "你是唤醒判定器。只输出一个大写字母：T 或 F。禁止输出其他内容。"
     try:
@@ -1058,6 +1089,7 @@ async def wake_judge_llm_decision(
     prompt_template: str,
     find_provider: Callable[[str], Any],
     timeout_sec: Optional[int] = WAKE_LLM_TIMEOUT_SEC,
+    context: Any = None,
 ) -> Tuple[Optional[bool], str]:
     """使用可配置提示词模板执行唤醒判定。"""
     provider = find_provider(provider_id)
@@ -1080,7 +1112,7 @@ async def wake_judge_llm_decision(
         "message": f"{sender_name}: {str(msg or '')}".strip(": "),
     }
     await _ensure_persona_placeholder(event, placeholders, prompt_template)
-    placeholders.update(_build_prompt_extra_placeholders(event))
+    placeholders.update(await _build_prompt_extra_placeholders(event, context=context))
     prompt = _render_prompt_template(prompt_template, placeholders)
     trigger_note = _build_wake_trigger_note(wake_reason, direct_wake)
     if trigger_note:
@@ -1160,6 +1192,8 @@ def _render_prompt_template(template: str, values: Dict[str, str]) -> str:
         key = match.group(1)
         if key in values:
             return str(values.get(key, ""))
+        if re.match(r'^r\d+$', key):
+            return str(random.randint(1, 100))
         return match.group(0)
 
     return re.sub(r"\{([a-zA-Z_][a-zA-Z0-9_]*)\}", repl, template)
@@ -1194,11 +1228,21 @@ def _build_wake_trigger_note(wake_reason: str, direct_wake: bool = False) -> str
     )
 
 
-def _build_prompt_extra_placeholders(event: AstrMessageEvent) -> Dict[str, str]:
-    rand_value = f"{random.random():.6f}"
-    return {
-        "random": rand_value,
-    }
+async def _build_prompt_extra_placeholders(
+    event: AstrMessageEvent,
+    context: Any = None,
+) -> Dict[str, str]:
+    result: Dict[str, str] = {}
+    if context is not None:
+        try:
+            meta = context.get_registered_star("astrbot_plugin_life_scheduler")
+            if meta and meta.star_cls and hasattr(meta.star_cls, 'get_life_context'):
+                data = await meta.star_cls.get_life_context()
+                if data and data.get("schedule"):
+                    result["schedule"] = data["schedule"]
+        except Exception:
+            pass
+    return result
 
 
 async def _ensure_persona_placeholder(
@@ -1289,6 +1333,7 @@ async def evaluate_post_wake_judge(
     get_cfg: Callable[[str, Any], Any],
     get_history_msg: Callable[[AstrMessageEvent, int], Awaitable[List[str]]],
     find_provider: Callable[[str], Any],
+    context: Any = None,
 ) -> Tuple[bool, str]:
     """对指定唤醒类型执行唤醒判定，返回 (allow_continue, detail)。"""
     provider_id = _get_wake_judge_provider_id(get_cfg)
@@ -1309,6 +1354,7 @@ async def evaluate_post_wake_judge(
         prompt_template=prompt_template,
         find_provider=find_provider,
         timeout_sec=timeout_sec,
+        context=context,
     )
     if llm_decision is None:
         return True, f"fallback_allow:{detail}"
@@ -1333,6 +1379,7 @@ async def apply_post_wake_judge_gate(
     get_cfg: Callable[[str, Any], Any],
     get_history_msg: Callable[[AstrMessageEvent, int], Awaitable[List[str]]],
     find_provider: Callable[[str], Any],
+    context: Any = None,
 ) -> Tuple[bool, str]:
     """
     对已唤醒请求应用“唤醒判定” gate。
@@ -1377,6 +1424,7 @@ async def apply_post_wake_judge_gate(
         get_cfg=get_cfg,
         get_history_msg=get_history_msg,
         find_provider=find_provider,
+        context=context,
     )
     if not allow_continue:
         return False, detail

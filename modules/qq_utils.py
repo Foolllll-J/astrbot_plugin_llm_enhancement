@@ -6,11 +6,12 @@ import time
 import re
 from datetime import datetime, timedelta, date
 import zoneinfo
-from typing import List, Dict, Any, Optional, Literal
+from typing import List, Dict, Any, Optional
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent
 import astrbot.api.message_components as Comp
 
+from astrbot.core.platform.message_session import MessageSession
 from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import AiocqhttpMessageEvent
 from .runtime_helpers import append_text_part_to_request
 
@@ -20,7 +21,7 @@ try:
 except Exception:
     CHINESE_CALENDAR_AVAILABLE = False
 
-PermissionPolicy = Literal["admin_only", "admin_or_self"]
+
 INJECTABLE_MEMBER_FIELDS: Dict[str, str] = {
     "user_id": "用户ID",
     "nickname": "昵称",
@@ -40,6 +41,7 @@ INJECTABLE_MEMBER_FIELDS: Dict[str, str] = {
     "labels": "标签",
     "qq_age": "Q龄",
     "vip_info": "会员信息",
+    "is_robot": "是否机器人",
 }
 
 MEMBER_INJECTION_FIELD_WHITELIST = {
@@ -60,6 +62,7 @@ MEMBER_INJECTION_FIELD_WHITELIST = {
     "labels",
     "qq_age",
     "vip_info",
+    "is_robot",
 }
 MEMBER_INJECTION_OPTION_ORDER = [
     "user_id",
@@ -116,12 +119,11 @@ TOOL_OPTION_LABEL_TO_ID: Dict[str, str] = {
     "发送群公告": "send_group_notice",
     "删除群公告": "delete_group_notice",
     "解散群": "dismiss_group",
-    "批量踢出群成员": "set_group_kick_members",
     "撤回消息": "delete_msg",
     "拉黑用户": "block_user",
     "解除拉黑": "unblock_user",
 }
-DANGEROUS_TOOL_IDS = {
+RISK_TOOL_IDS = {
     "set_group_ban",
     "kick_group_member",
     "set_group_whole_ban",
@@ -130,7 +132,13 @@ DANGEROUS_TOOL_IDS = {
     "delete_essence_msg",
     "delete_group_notice",
     "dismiss_group",
-    "set_group_kick_members",
+    "set_group_card",
+    "set_group_special_title",
+    "set_essence_msg",
+    "set_group_name",
+    "send_group_notice",
+    "block_user",
+    "unblock_user",
 }
 CONFIRMATION_REQUIRED_TOOL_IDS = {
     "kick_group_member",
@@ -140,7 +148,6 @@ CONFIRMATION_REQUIRED_TOOL_IDS = {
     "delete_essence_msg",
     "delete_group_notice",
     "dismiss_group",
-    "set_group_kick_members",
 }
 PENDING_CONFIRMATION_MAX = 64
 CONFIRM_TIMEOUT_DEFAULT_SEC = 90
@@ -150,34 +157,6 @@ _PENDING_TOOL_CONFIRMATIONS: Dict[str, Dict[str, Any]] = {}
 _TOOL_LABEL_LOWER_TO_ID = {k.lower(): v for k, v in TOOL_OPTION_LABEL_TO_ID.items()}
 for _tool_id in TOOL_OPTION_LABEL_TO_ID.values():
     _TOOL_LABEL_LOWER_TO_ID[_tool_id.lower()] = _tool_id
-
-
-def validate_write_permission(
-    event: AstrMessageEvent,
-    *,
-    target_user_id: str,
-    strict: bool,
-    policy: PermissionPolicy,
-    action: str,
-) -> Optional[str]:
-    if not strict:
-        return None
-
-    sender_id = str(event.get_sender_id() or "")
-    is_admin = bool(event.is_admin())
-    is_self_action = bool(target_user_id) and target_user_id == sender_id
-
-    if policy == "admin_only":
-        if not is_admin:
-            return f"权限不足。只有管理员可以{action}。"
-        return None
-
-    if policy == "admin_or_self":
-        if not is_admin and not is_self_action:
-            return f"权限不足。您({sender_id})没有权限{action}其他用户({target_user_id})。"
-        return None
-
-    return f"权限策略错误: {policy}"
 
 
 def normalize_tool_selection(raw_tools: Any) -> set[str]:
@@ -195,13 +174,28 @@ def normalize_tool_selection(raw_tools: Any) -> set[str]:
     return normalized
 
 
-def is_tool_admin_required(tool_id: str, admin_required_tools: Any) -> bool:
-    return tool_id in normalize_tool_selection(admin_required_tools)
-
-
-def is_dangerous_tool_enabled(tool_id: str, enabled_dangerous_tools: Any) -> bool:
-    selected = normalize_tool_selection(enabled_dangerous_tools)
+def is_risk_tool_enabled(tool_id: str, enabled_risk_tools: Any) -> bool:
+    selected = normalize_tool_selection(enabled_risk_tools)
     return tool_id in selected
+
+
+def check_self_only_operation(
+    event: AstrMessageEvent,
+    tool_id: str,
+    target_user_id: str,
+    self_only_tools: Any,
+) -> Optional[str]:
+    if tool_id not in normalize_tool_selection(self_only_tools):
+        return None
+    if event.is_admin():
+        return None
+    sender_id = str(event.get_sender_id() or "")
+    if target_user_id and target_user_id == sender_id:
+        return None
+    return json.dumps({
+        "success": False,
+        "message": f"权限不足。非管理员只能操作自己。",
+    }, ensure_ascii=False)
 
 
 def is_tool_confirmation_required(tool_id: str, confirm_required_tools: Any) -> bool:
@@ -400,23 +394,10 @@ def _check_write_tool_access(
     *,
     tool_id: str,
     action: str,
-    admin_required_tools: Any,
-    enabled_dangerous_tools: Any,
-    policy: PermissionPolicy = "admin_only",
-    target_user_id: str = "",
+    enabled_risk_tools: Any,
 ) -> Optional[str]:
-    if tool_id in DANGEROUS_TOOL_IDS and not is_dangerous_tool_enabled(tool_id, enabled_dangerous_tools):
+    if tool_id in RISK_TOOL_IDS and not is_risk_tool_enabled(tool_id, enabled_risk_tools):
         return _build_tool_disabled_json(tool_id)
-
-    permission_error = validate_write_permission(
-        event,
-        target_user_id=target_user_id or str(event.get_sender_id() or ""),
-        strict=is_tool_admin_required(tool_id, admin_required_tools),
-        policy=policy,
-        action=action,
-    )
-    if permission_error:
-        return json.dumps({"success": False, "message": permission_error}, ensure_ascii=False)
     return None
 
 
@@ -619,6 +600,7 @@ def _normalize_member_injection_fields(raw_fields: Any) -> List[str]:
         "q龄": "qq_age",
         "qq龄": "qq_age",
         "会员信息": "vip_info",
+        "是否机器人": "is_robot",
     }
 
     for item in raw_fields:
@@ -633,12 +615,20 @@ def _normalize_member_injection_fields(raw_fields: Any) -> List[str]:
     return normalized
 
 
+_MEANINGLESS_MEMBER_STR_VALUES: frozenset[str] = frozenset({
+    "unknown", "保密", "none", "null", "未设置",
+})
+
+
 def _is_meaningful_member_value(field: str, value: Any) -> bool:
     """过滤空值与低价值默认值，减少注入 token。"""
     if value is None:
         return False
     if isinstance(value, str):
-        return bool(value.strip())
+        stripped = value.strip()
+        if not stripped or stripped.lower() in _MEANINGLESS_MEMBER_STR_VALUES:
+            return False
+        return True
     if field in {"join_time", "last_sent_time", "age"}:
         number = _safe_int(value)
         return bool(number is not None and number > 0)
@@ -782,6 +772,9 @@ def _build_injectable_member_info(member_info: Dict[str, Any], stranger_info: Op
     if vip_info:
         merged["vip_info"] = vip_info
 
+    if stranger.get("is_robot"):
+        merged["is_robot"] = True
+
     return merged
 
 
@@ -907,7 +900,7 @@ async def get_group_members_internal(event: AstrMessageEvent, group_id: Optional
         if not isinstance(event, AiocqhttpMessageEvent):
             return None
 
-        client = event.bot 
+        client = event.bot
         params = {"group_id": int(target_group_id)}
         try:
             raw_result = await client.api.call_action("get_group_member_list", **params)
@@ -940,10 +933,10 @@ async def get_group_member_info_internal(
         if not target_group_id or not target_user_id:
             return None
 
-        if not isinstance(event, AiocqhttpMessageEvent):
+        client = _get_aiocqhttp_client(event)
+        if client is None:
             return None
 
-        client = event.bot
         params = {
             "group_id": int(target_group_id),
             "user_id": int(target_user_id),
@@ -973,10 +966,10 @@ async def get_stranger_info_internal(
         target_user_id = user_id or event.get_sender_id()
         if not target_user_id:
             return None
-        if not isinstance(event, AiocqhttpMessageEvent):
+        client = _get_aiocqhttp_client(event)
+        if client is None:
             return None
 
-        client = event.bot
         params = {
             "user_id": int(target_user_id),
             "no_cache": bool(no_cache),
@@ -1004,10 +997,10 @@ async def process_group_members_info(event: AstrMessageEvent, group_id: Optional
             logger.info("用户在非群聊环境中调用群成员查询工具且未提供群号") 
             return json.dumps({"error": "未识别到群聊环境，请提供目标群号。"}) 
         
-        if not isinstance(event, AiocqhttpMessageEvent): 
+        if _get_aiocqhttp_client(event) is None:
             logger.info(f"不支持的平台: {event.get_platform_name()}") 
             return json.dumps({"error": f"此功能仅支持QQ群聊(aiocqhttp平台)，当前平台为 {event.get_platform_name()}"}) 
-
+ 
         # 从API获取 
         members_info = await get_group_members_internal(event, group_id=target_group_id) 
         if not members_info: 
@@ -1072,7 +1065,7 @@ async def process_group_member_info(
                 results.append({"user_id": target_user_id, "success": False, "error": "empty user_id"})
                 continue
 
-            if not isinstance(event, AiocqhttpMessageEvent):
+            if _get_aiocqhttp_client(event) is None:
                 logger.info(f"不支持的平台: {event.get_platform_name()}")
                 fail_count += 1
                 results.append({"user_id": target_user_id, "success": False, "error": f"此功能仅支持QQ群聊(aiocqhttp平台)，当前平台为 {event.get_platform_name()}"})
@@ -1171,7 +1164,7 @@ async def process_user_avatar(event: AstrMessageEvent, user_ids: str) -> Any:
     """
     start_time = time.time()
     try:
-        if not isinstance(event, AiocqhttpMessageEvent):
+        if _get_aiocqhttp_client(event) is None:
             return _json_error(f"此功能仅支持 QQ 平台 (aiocqhttp)，当前平台为 {event.get_platform_name()}")
 
         user_id_list = _parse_user_id_list(user_ids)
@@ -1279,7 +1272,7 @@ def _ensure_group_write_context(
     event: AstrMessageEvent,
     group_id: Optional[str] = None,
 ) -> tuple[Optional[str], Optional[str]]:
-    if not isinstance(event, AiocqhttpMessageEvent):
+    if _get_aiocqhttp_client(event) is None:
         return None, _json_error(f"此功能仅支持 QQ 平台 (aiocqhttp)，当前平台为 {event.get_platform_name()}")
     target_group_id = str(group_id or event.get_group_id() or "").strip()
     if not target_group_id:
@@ -1334,13 +1327,65 @@ async def _call_action(
     fallback_method: Optional[str] = None,
     **params: Any,
 ) -> Any:
-    client = event.bot
+    client = _get_aiocqhttp_client(event)
+    if client is None:
+        raise RuntimeError(
+            f"QQ action requires aiocqhttp runtime, current platform={event.get_platform_name()}"
+        )
     try:
         return await client.api.call_action(action, **params)
     except Exception:
         if fallback_method and hasattr(client, fallback_method):
             return await getattr(client, fallback_method)(**params)
         raise
+
+
+def _get_session_from_event(event: AstrMessageEvent) -> Optional[MessageSession]:
+    session = getattr(event, "session", None)
+    if isinstance(session, MessageSession):
+        return session
+    umo = str(getattr(event, "unified_msg_origin", "") or "").strip()
+    if not umo:
+        return None
+    try:
+        return MessageSession.from_str(umo)
+    except Exception:
+        return None
+
+
+def _get_aiocqhttp_client(event: AstrMessageEvent) -> Any:
+    if isinstance(event, AiocqhttpMessageEvent):
+        return getattr(event, "bot", None)
+
+    session = _get_session_from_event(event)
+    if session is None:
+        return None
+
+    context_obj = getattr(event, "context_obj", None)
+    if context_obj is None:
+        return None
+
+    platform = None
+    if hasattr(context_obj, "get_platform_inst"):
+        try:
+            platform = context_obj.get_platform_inst(session.platform_id)
+        except Exception:
+            platform = None
+    if platform is None:
+        return None
+
+    try:
+        if str(platform.meta().name or "").strip().lower() != "aiocqhttp":
+            return None
+    except Exception:
+        return None
+
+    if hasattr(platform, "get_client"):
+        try:
+            return platform.get_client()
+        except Exception:
+            return None
+    return getattr(platform, "bot", None)
 
 
 async def _is_llbot_backend(event: AstrMessageEvent) -> bool:
@@ -1740,7 +1785,7 @@ async def process_contact_list(event: AstrMessageEvent, limit_each: int = 200) -
     """
     start_time = time.time()
     try:
-        if not isinstance(event, AiocqhttpMessageEvent):
+        if _get_aiocqhttp_client(event) is None:
             return _json_error(f"此功能仅支持 QQ 平台 (aiocqhttp)，当前平台为 {event.get_platform_name()}")
 
         safe_limit = max(1, min(int(limit_each or 200), 1000))
@@ -1827,7 +1872,7 @@ async def send_message_logic(
     - chat_type=private 时调用 send_private_msg，支持批量发送
     """
     try:
-        if not isinstance(event, AiocqhttpMessageEvent):
+        if _get_aiocqhttp_client(event) is None:
             return _json_error(f"此功能仅支持 QQ 平台 (aiocqhttp)，当前平台为 {event.get_platform_name()}")
 
         normalized_type = str(chat_type or "").strip().lower()
@@ -1962,10 +2007,10 @@ async def get_group_info_internal(
         target_group_id = group_id or event.get_group_id()
         if not target_group_id:
             return None
-        if not isinstance(event, AiocqhttpMessageEvent):
+        client = _get_aiocqhttp_client(event)
+        if client is None:
             return None
 
-        client = event.bot
         params = {
             "group_id": int(target_group_id),
             "no_cache": bool(no_cache),
@@ -1997,7 +2042,7 @@ async def process_group_info(
         target_group_id = group_id or event.get_group_id()
         if not target_group_id:
             return json.dumps({"error": "未识别到群聊环境，请提供目标群号。"}, ensure_ascii=False)
-        if not isinstance(event, AiocqhttpMessageEvent):
+        if _get_aiocqhttp_client(event) is None:
             return json.dumps(
                 {"error": f"此功能仅支持QQ群聊(aiocqhttp平台)，当前平台为 {event.get_platform_name()}"},
                 ensure_ascii=False,
@@ -2030,10 +2075,10 @@ async def get_group_notices_internal(event: AstrMessageEvent, group_id: Optional
         target_group_id = group_id or event.get_group_id()
         if not target_group_id:
             return None
-        if not isinstance(event, AiocqhttpMessageEvent):
+        client = _get_aiocqhttp_client(event)
+        if client is None:
             return None
 
-        client = event.bot
         try:
             raw_result = await client.api.call_action("_get_group_notice", group_id=int(target_group_id))
         except Exception:
@@ -2063,7 +2108,7 @@ async def process_group_notices(
         target_group_id = group_id or event.get_group_id()
         if not target_group_id:
             return json.dumps({"error": "未识别到群聊环境，请提供目标群号。"}, ensure_ascii=False)
-        if not isinstance(event, AiocqhttpMessageEvent):
+        if _get_aiocqhttp_client(event) is None:
             return json.dumps(
                 {"error": f"此功能仅支持QQ群聊(aiocqhttp平台)，当前平台为 {event.get_platform_name()}"},
                 ensure_ascii=False,
@@ -2129,10 +2174,10 @@ async def get_group_essence_internal(event: AstrMessageEvent, group_id: Optional
         target_group_id = group_id or event.get_group_id()
         if not target_group_id:
             return None
-        if not isinstance(event, AiocqhttpMessageEvent):
+        client = _get_aiocqhttp_client(event)
+        if client is None:
             return None
 
-        client = event.bot
         try:
             raw_result = await client.api.call_action("get_essence_msg_list", group_id=int(target_group_id))
         except Exception:
@@ -2162,7 +2207,7 @@ async def process_group_essence(
         target_group_id = group_id or event.get_group_id()
         if not target_group_id:
             return json.dumps({"error": "未识别到群聊环境，请提供目标群号。"}, ensure_ascii=False)
-        if not isinstance(event, AiocqhttpMessageEvent):
+        if _get_aiocqhttp_client(event) is None:
             return json.dumps(
                 {"error": f"此功能仅支持QQ群聊(aiocqhttp平台)，当前平台为 {event.get_platform_name()}"},
                 ensure_ascii=False,
@@ -2215,7 +2260,7 @@ async def get_group_msg_history_internal(
         target_group_id = group_id or event.get_group_id()
         if not target_group_id:
             return None
-        if not isinstance(event, AiocqhttpMessageEvent):
+        if _get_aiocqhttp_client(event) is None:
             return None
 
         page_size = max(1, min(int(count or 50), 50))
@@ -2246,7 +2291,7 @@ async def get_friend_msg_history_internal(
         target_user_id = str(user_id or "").strip()
         if not target_user_id:
             return None
-        if not isinstance(event, AiocqhttpMessageEvent):
+        if _get_aiocqhttp_client(event) is None:
             return None
 
         page_size = max(1, min(int(count or 50), 50))
@@ -2288,7 +2333,7 @@ async def process_group_msg_history(
                 group_id_list = [gid]
         if not group_id_list:
             return _json_error("未识别到群聊环境，请提供目标群号。")
-        if not isinstance(event, AiocqhttpMessageEvent):
+        if _get_aiocqhttp_client(event) is None:
             return _json_error(
                 f"此功能仅支持QQ群聊(aiocqhttp平台)，当前平台为 {event.get_platform_name()}"
             )
@@ -2498,7 +2543,7 @@ async def process_friend_msg_history(
     """
     start_time = time.time()
     try:
-        if not isinstance(event, AiocqhttpMessageEvent):
+        if _get_aiocqhttp_client(event) is None:
             return _json_error(
                 f"此功能仅支持 QQ 平台 (aiocqhttp)，当前平台为 {event.get_platform_name()}"
             )
@@ -2705,8 +2750,8 @@ async def set_group_ban_logic(
     user_ids: str,
     duration: int,
     group_id: str = None,
-    admin_required_tools: Any = None,
-    enabled_dangerous_tools: Any = None,
+    self_only_tools: Any = None,
+    enabled_risk_tools: Any = None,
 ) -> str:
     """
     在群聊中禁言某用户的逻辑。支持批量禁言。
@@ -2722,33 +2767,26 @@ async def set_group_ban_logic(
 
         sender_id = str(event.get_sender_id())
 
-        # 单目标时检查 self-action；多目标时跳过 is_self_action 旁路
-        if len(user_id_list) == 1:
-            target_user_id = str(user_id_list[0] or "").strip()
-            disabled_resp = _check_write_tool_access(
-                event,
-                tool_id="set_group_ban",
-                action="禁言",
-                admin_required_tools=admin_required_tools,
-                enabled_dangerous_tools=enabled_dangerous_tools,
-                policy="admin_or_self",
-                target_user_id=target_user_id,
-            )
-        else:
-            # 批量操作不适用 self-action 旁路，按 admin_or_self 逻辑检查
-            disabled_resp = _check_write_tool_access(
-                event,
-                tool_id="set_group_ban",
-                action="禁言",
-                admin_required_tools=admin_required_tools,
-                enabled_dangerous_tools=enabled_dangerous_tools,
-                policy="admin_or_self",
-                target_user_id="",
-            )
+        disabled_resp = _check_write_tool_access(
+            event,
+            tool_id="set_group_ban",
+            action="禁言",
+            enabled_risk_tools=enabled_risk_tools,
+        )
         if disabled_resp:
             return disabled_resp
 
-        strict_permission_check = is_tool_admin_required("set_group_ban", admin_required_tools)
+        # self_only 检查
+        if len(user_id_list) == 1:
+            target_user_id = str(user_id_list[0] or "").strip()
+            self_resp = check_self_only_operation(event, "set_group_ban", target_user_id, self_only_tools)
+            if self_resp:
+                return self_resp
+        else:
+            for target_user_id in user_id_list:
+                self_resp = check_self_only_operation(event, "set_group_ban", target_user_id, self_only_tools)
+                if self_resp:
+                    return self_resp
 
         results = []
         success_count = 0
@@ -2803,8 +2841,8 @@ async def kick_group_member_logic(
     user_ids: str,
     group_id: Optional[str] = None,
     reject_add_request: bool = False,
-    admin_required_tools: Any = None,
-    enabled_dangerous_tools: Any = None,
+    self_only_tools: Any = None,
+    enabled_risk_tools: Any = None,
     confirm_required_tools: Any = None,
     confirm_timeout_sec: int = CONFIRM_TIMEOUT_DEFAULT_SEC,
     confirm_token: str = "",
@@ -2820,28 +2858,20 @@ async def kick_group_member_logic(
 
         sender_id = str(event.get_sender_id())
 
-        # 单目标时检查 self-action；多目标时跳过 is_self_action 旁路
-        if len(user_id_list) == 1:
-            target_user_id = str(user_id_list[0] or "").strip()
-            disabled_resp = _check_write_tool_access(
-                event,
-                tool_id="kick_group_member",
-                action="踢人",
-                admin_required_tools=admin_required_tools,
-                enabled_dangerous_tools=enabled_dangerous_tools,
-                policy="admin_or_self",
-                target_user_id=target_user_id,
-            )
-        else:
-            disabled_resp = _check_write_tool_access(
-                event,
-                tool_id="kick_group_member",
-                action="踢人",
-                admin_required_tools=admin_required_tools,
-                enabled_dangerous_tools=enabled_dangerous_tools,
-                policy="admin_or_self",
-                target_user_id="",
-            )
+        disabled_resp = _check_write_tool_access(
+            event,
+            tool_id="kick_group_member",
+            action="踢人",
+            enabled_risk_tools=enabled_risk_tools,
+        )
+        if disabled_resp:
+            return disabled_resp
+
+        # self_only 检查
+        for target_user_id in user_id_list:
+            self_resp = check_self_only_operation(event, "kick_group_member", str(target_user_id or "").strip(), self_only_tools)
+            if self_resp:
+                return self_resp
         if disabled_resp:
             return disabled_resp
 
@@ -2911,8 +2941,7 @@ async def set_group_whole_ban_logic(
     event: AstrMessageEvent,
     enable: bool,
     group_id: Optional[str] = None,
-    admin_required_tools: Any = None,
-    enabled_dangerous_tools: Any = None,
+    enabled_risk_tools: Any = None,
     confirm_required_tools: Any = None,
     confirm_timeout_sec: int = CONFIRM_TIMEOUT_DEFAULT_SEC,
     confirm_token: str = "",
@@ -2926,8 +2955,7 @@ async def set_group_whole_ban_logic(
             event,
             tool_id="set_group_whole_ban",
             action="全员禁言",
-            admin_required_tools=admin_required_tools,
-            enabled_dangerous_tools=enabled_dangerous_tools,
+            enabled_risk_tools=enabled_risk_tools,
         )
         if disabled_resp:
             return disabled_resp
@@ -2970,8 +2998,7 @@ async def set_group_admin_logic(
     user_ids: str,
     enable: bool = True,
     group_id: Optional[str] = None,
-    admin_required_tools: Any = None,
-    enabled_dangerous_tools: Any = None,
+    enabled_risk_tools: Any = None,
     confirm_required_tools: Any = None,
     confirm_timeout_sec: int = CONFIRM_TIMEOUT_DEFAULT_SEC,
     confirm_token: str = "",
@@ -2989,8 +3016,7 @@ async def set_group_admin_logic(
             event,
             tool_id="set_group_admin",
             action="设置群管理员",
-            admin_required_tools=admin_required_tools,
-            enabled_dangerous_tools=enabled_dangerous_tools,
+            enabled_risk_tools=enabled_risk_tools,
         )
         if disabled_resp:
             return disabled_resp
@@ -3061,8 +3087,8 @@ async def set_group_card_logic(
     user_id: str,
     card: str,
     group_id: Optional[str] = None,
-    admin_required_tools: Any = None,
-    enabled_dangerous_tools: Any = None,
+    self_only_tools: Any = None,
+    enabled_risk_tools: Any = None,
 ) -> str:
     try:
         target_group_id, env_error = _ensure_group_write_context(event, group_id=group_id)
@@ -3076,9 +3102,14 @@ async def set_group_card_logic(
             event,
             tool_id="set_group_card",
             action="设置群名片",
-            admin_required_tools=admin_required_tools,
-            enabled_dangerous_tools=enabled_dangerous_tools,
+            enabled_risk_tools=enabled_risk_tools,
         )
+        if disabled_resp:
+            return disabled_resp
+
+        self_resp = check_self_only_operation(event, "set_group_card", target_user_id, self_only_tools)
+        if self_resp:
+            return self_resp
         if disabled_resp:
             return disabled_resp
 
@@ -3105,8 +3136,8 @@ async def set_group_special_title_logic(
     user_id: str,
     special_title: str,
     group_id: Optional[str] = None,
-    admin_required_tools: Any = None,
-    enabled_dangerous_tools: Any = None,
+    self_only_tools: Any = None,
+    enabled_risk_tools: Any = None,
 ) -> str:
     try:
         target_group_id, env_error = _ensure_group_write_context(event, group_id=group_id)
@@ -3123,9 +3154,14 @@ async def set_group_special_title_logic(
             event,
             tool_id="set_group_special_title",
             action="设置群头衔",
-            admin_required_tools=admin_required_tools,
-            enabled_dangerous_tools=enabled_dangerous_tools,
+            enabled_risk_tools=enabled_risk_tools,
         )
+        if disabled_resp:
+            return disabled_resp
+
+        self_resp = check_self_only_operation(event, "set_group_special_title", target_user_id, self_only_tools)
+        if self_resp:
+            return self_resp
         if disabled_resp:
             return disabled_resp
 
@@ -3149,14 +3185,13 @@ async def set_group_special_title_logic(
 async def set_essence_msg_logic(
     event: AstrMessageEvent,
     message_ids: str = "",
-    admin_required_tools: Any = None,
-    enabled_dangerous_tools: Any = None,
+    enabled_risk_tools: Any = None,
 ) -> str:
     """
     设置群精华消息。支持批量设置。
     """
     try:
-        if not isinstance(event, AiocqhttpMessageEvent):
+        if _get_aiocqhttp_client(event) is None:
             return _json_error(f"此功能仅支持 QQ 平台 (aiocqhttp)，当前平台为 {event.get_platform_name()}")
         target_group_id = str(event.get_group_id() or "").strip()
         if not target_group_id:
@@ -3174,8 +3209,7 @@ async def set_essence_msg_logic(
             event,
             tool_id="set_essence_msg",
             action="设置精华消息",
-            admin_required_tools=admin_required_tools,
-            enabled_dangerous_tools=enabled_dangerous_tools,
+            enabled_risk_tools=enabled_risk_tools,
         )
         if disabled_resp:
             return disabled_resp
@@ -3217,8 +3251,7 @@ async def set_essence_msg_logic(
 async def delete_essence_msg_logic(
     event: AstrMessageEvent,
     message_ids: str = "",
-    admin_required_tools: Any = None,
-    enabled_dangerous_tools: Any = None,
+    enabled_risk_tools: Any = None,
     confirm_required_tools: Any = None,
     confirm_timeout_sec: int = CONFIRM_TIMEOUT_DEFAULT_SEC,
     confirm_token: str = "",
@@ -3227,7 +3260,7 @@ async def delete_essence_msg_logic(
     移出群精华消息。支持批量移出。
     """
     try:
-        if not isinstance(event, AiocqhttpMessageEvent):
+        if _get_aiocqhttp_client(event) is None:
             return _json_error(f"此功能仅支持 QQ 平台 (aiocqhttp)，当前平台为 {event.get_platform_name()}")
         target_group_id = str(event.get_group_id() or "").strip()
         if not target_group_id:
@@ -3245,8 +3278,7 @@ async def delete_essence_msg_logic(
             event,
             tool_id="delete_essence_msg",
             action="移出精华消息",
-            admin_required_tools=admin_required_tools,
-            enabled_dangerous_tools=enabled_dangerous_tools,
+            enabled_risk_tools=enabled_risk_tools,
         )
         if disabled_resp:
             return disabled_resp
@@ -3309,8 +3341,7 @@ async def delete_essence_msg_logic(
 async def delete_msg_logic(
     event: AstrMessageEvent,
     message_ids: str = "",
-    admin_required_tools: Any = None,
-    enabled_dangerous_tools: Any = None,
+    enabled_risk_tools: Any = None,
     confirm_required_tools: Any = None,
     confirm_timeout_sec: int = CONFIRM_TIMEOUT_DEFAULT_SEC,
     confirm_token: str = "",
@@ -3319,7 +3350,7 @@ async def delete_msg_logic(
     撤回指定消息，默认优先使用传入 message_id，缺省时尝试从引用(reply)解析。支持批量撤回。
     """
     try:
-        if not isinstance(event, AiocqhttpMessageEvent):
+        if _get_aiocqhttp_client(event) is None:
             return _json_error(f"此功能仅支持 QQ 平台 (aiocqhttp)，当前平台为 {event.get_platform_name()}")
 
         msg_id_list = _parse_user_id_list(message_ids) if message_ids else []
@@ -3334,8 +3365,7 @@ async def delete_msg_logic(
             event,
             tool_id="delete_msg",
             action="撤回消息",
-            admin_required_tools=admin_required_tools,
-            enabled_dangerous_tools=enabled_dangerous_tools,
+            enabled_risk_tools=enabled_risk_tools,
         )
         if disabled_resp:
             return disabled_resp
@@ -3397,8 +3427,7 @@ async def set_group_name_logic(
     event: AstrMessageEvent,
     group_name: str,
     group_id: Optional[str] = None,
-    admin_required_tools: Any = None,
-    enabled_dangerous_tools: Any = None,
+    enabled_risk_tools: Any = None,
 ) -> str:
     try:
         target_group_id, env_error = _ensure_group_write_context(event, group_id=group_id)
@@ -3412,8 +3441,7 @@ async def set_group_name_logic(
             event,
             tool_id="set_group_name",
             action="设置群名称",
-            admin_required_tools=admin_required_tools,
-            enabled_dangerous_tools=enabled_dangerous_tools,
+            enabled_risk_tools=enabled_risk_tools,
         )
         if disabled_resp:
             return disabled_resp
@@ -3438,8 +3466,7 @@ async def send_group_notice_logic(
     content: str,
     group_id: Optional[str] = None,
     pinned: bool = False,
-    admin_required_tools: Any = None,
-    enabled_dangerous_tools: Any = None,
+    enabled_risk_tools: Any = None,
 ) -> str:
     try:
         target_group_id, env_error = _ensure_group_write_context(event, group_id=group_id)
@@ -3453,8 +3480,7 @@ async def send_group_notice_logic(
             event,
             tool_id="send_group_notice",
             action="发送群公告",
-            admin_required_tools=admin_required_tools,
-            enabled_dangerous_tools=enabled_dangerous_tools,
+            enabled_risk_tools=enabled_risk_tools,
         )
         if disabled_resp:
             return disabled_resp
@@ -3484,8 +3510,7 @@ async def delete_group_notice_logic(
     event: AstrMessageEvent,
     notice_id: str,
     group_id: Optional[str] = None,
-    admin_required_tools: Any = None,
-    enabled_dangerous_tools: Any = None,
+    enabled_risk_tools: Any = None,
     confirm_required_tools: Any = None,
     confirm_timeout_sec: int = CONFIRM_TIMEOUT_DEFAULT_SEC,
     confirm_token: str = "",
@@ -3502,8 +3527,7 @@ async def delete_group_notice_logic(
             event,
             tool_id="delete_group_notice",
             action="删除群公告",
-            admin_required_tools=admin_required_tools,
-            enabled_dangerous_tools=enabled_dangerous_tools,
+            enabled_risk_tools=enabled_risk_tools,
         )
         if disabled_resp:
             return disabled_resp
@@ -3544,8 +3568,7 @@ async def delete_group_notice_logic(
 async def dismiss_group_logic(
     event: AstrMessageEvent,
     group_id: Optional[str] = None,
-    admin_required_tools: Any = None,
-    enabled_dangerous_tools: Any = None,
+    enabled_risk_tools: Any = None,
     confirm_required_tools: Any = None,
     confirm_timeout_sec: int = CONFIRM_TIMEOUT_DEFAULT_SEC,
     confirm_token: str = "",
@@ -3559,8 +3582,7 @@ async def dismiss_group_logic(
             event,
             tool_id="dismiss_group",
             action="解散群",
-            admin_required_tools=admin_required_tools,
-            enabled_dangerous_tools=enabled_dangerous_tools,
+            enabled_risk_tools=enabled_risk_tools,
         )
         if disabled_resp:
             return disabled_resp

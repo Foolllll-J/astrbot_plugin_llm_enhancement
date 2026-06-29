@@ -15,7 +15,7 @@ from .json_parser import (
     parse_forward_card_info_from_json_segment_data,
     parse_json_segment_data,
 )
-from .url_parser import extract_url_infos_from_chain
+from .url_parser import extract_url_infos_from_chain, extract_url_summary_from_text
 from .runtime_helpers import (
     transcribe_record_segment,
     transcribe_record_from_chain,
@@ -158,7 +158,7 @@ def _append_context_block(
     injected_text = (
         f"\n\n[{block_title}] "
         + "；".join(normalized_details)
-        + "。请结合这些补充信息回答。"
+        + "。请参考以上补充信息回答。"
     )
     if not append_text_part_to_request(req, injected_text, mark_temp=False):
         req.prompt += injected_text
@@ -648,6 +648,7 @@ async def parse_reply_context(
         quoted_file_infos: list[str] = []
         quoted_file_parse_failed = False
         quoted_json_infos: list[str] = []
+        quoted_url_texts: list[str] = []
         quoted_record_texts: list[str] = []
         quoted_record_count = 0
         quoted_audio_file_descriptions: list[str] = []
@@ -777,11 +778,19 @@ async def parse_reply_context(
                         f"has_key_info={bool(key_info)}, news_count={len(forward_news_texts)}"
                     )
 
+            elif seg_type == "text":
+                t = str(seg_data.get("text") or "").strip()
+                if t and bool(get_cfg("url_parse_enable", True)):
+                    quoted_url_text = await extract_url_summary_from_text(t)
+                    if quoted_url_text:
+                        quoted_url_texts.append(quoted_url_text)
+
         if (
             quoted_image_labels
             or quoted_file_descriptions
             or quoted_file_infos
             or quoted_json_infos
+            or quoted_url_texts
             or quoted_record_count
             or quoted_audio_file_descriptions
             or quoted_face_text
@@ -793,6 +802,8 @@ async def parse_reply_context(
             if quoted_image_labels:
                 image_desc = "和".join(quoted_image_labels)
                 parts.append(f"当前用户引用了 {quoted_sender} 发送的{image_desc}。")
+            if quoted_url_texts:
+                parts.append(f"被引用消息中的链接信息：{'；'.join(quoted_url_texts)}。")
             if quoted_file_descriptions:
                 parts.append(
                     f"当前用户引用了 {quoted_sender} 发送的文件：{'；'.join(quoted_file_descriptions)}。"
@@ -958,11 +969,7 @@ async def process_reference_context(
                 if isinstance(blocked_domains_raw, list)
                 else []
             )
-            try:
-                cache_ttl_sec = max(0, int(get_cfg("inject_url_cache_ttl_sec", 600) or 600))
-            except (TypeError, ValueError):
-                cache_ttl_sec = 600
-
+            tavily_api_keys = get_cfg("tavily_api_keys", []) or []
             url_result = await extract_url_infos_from_chain(
                 event=event,
                 chain=chain_for_url,
@@ -970,7 +977,7 @@ async def process_reference_context(
                 max_download_kb=max_download_kb,
                 block_private_network=block_private_network,
                 blocked_domains=blocked_domains,
-                cache_ttl_sec=cache_ttl_sec,
+                tavily_api_keys=tavily_api_keys,
             )
             if url_result.injected and url_result.details:
                 sender_name = event.get_sender_name() or "未知用户"
@@ -1093,10 +1100,7 @@ async def process_reference_context(
                     if isinstance(blocked_domains_raw, list)
                     else []
                 )
-                try:
-                    cache_ttl_sec = max(0, int(get_cfg("inject_url_cache_ttl_sec", 600) or 600))
-                except (TypeError, ValueError):
-                    cache_ttl_sec = 600
+                merged_tavily_api_keys = get_cfg("tavily_api_keys", []) or []
                 merged_url_result = await extract_url_infos_from_chain(
                     event=event,
                     chain=merged_raw_chain,
@@ -1104,7 +1108,7 @@ async def process_reference_context(
                     max_download_kb=max_download_kb,
                     block_private_network=block_private_network,
                     blocked_domains=blocked_domains,
-                    cache_ttl_sec=cache_ttl_sec,
+                    tavily_api_keys=merged_tavily_api_keys,
                 )
                 if merged_url_result.injected and merged_url_result.details:
                     _append_prompt_context(

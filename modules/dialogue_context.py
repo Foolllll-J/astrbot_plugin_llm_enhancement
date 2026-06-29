@@ -20,7 +20,7 @@ from .runtime_helpers import (
 )
 from .wake_logic import build_media_trigger_message
 
-_CONTEXT_IMAGE_CAPTION_PROMPT = "请用中文简洁描述这张图片，包含主体、关键动作和可能场景，不超过50字。"
+_CONTEXT_IMAGE_CAPTION_PROMPT = "请用中文描述这张图片。包含：主体、数量、位置关系、动作、场景背景、画面中的文字内容、情绪氛围。控制在120字以内。"
 _NON_TEXT_PARSE_OPTIONS = {"image", "forward", "url", "file", "json", "record"}
 _LAST_USER_INTERACTION_TTL_SEC = 24 * 60 * 60
 _CONTEXT_IMAGE_CAPTION_CACHE_TTL_SEC = 10 * 60
@@ -766,7 +766,7 @@ async def try_get_image_caption(
     get_cfg: Any,
     provider_by_id_resolver: Any,
     default_provider_resolver: Any,
-    timeout_sec: float = 20.0,
+    timeout_sec: float = 60.0,
     preferred_provider_id: str = "",
     allow_default_provider: bool = True,
 ) -> str:
@@ -838,17 +838,42 @@ async def try_get_image_caption(
     if not image_input:
         return emoji_summary or ""
 
+    resized_tmp_path = ""
+    if image_input and os.path.exists(image_input):
+        try:
+            from PIL import Image
+            img = Image.open(image_input)
+            max_dim = 2048
+            if img.width > max_dim or img.height > max_dim:
+                ratio = max_dim / max(img.width, img.height)
+                new_size = (int(img.width * ratio), int(img.height * ratio))
+                img = img.resize(new_size, Image.LANCZOS)
+                fd, resized_tmp_path = tempfile.mkstemp(suffix='.jpg')
+                os.close(fd)
+                img.save(resized_tmp_path, 'JPEG', quality=95)
+                image_input = resized_tmp_path
+        except Exception as e:
+            logger.debug(f"[LLMEnhancement][ContextInjection] 图片压缩失败: {e}")
+
     try:
         async with _context_image_caption_semaphore:
-            resp = await asyncio.wait_for(
-                provider.text_chat(
+            if timeout_sec > 0:
+                resp = await asyncio.wait_for(
+                    provider.text_chat(
+                        prompt=prompt,
+                        session_id=uuid.uuid4().hex,
+                        image_urls=[image_input],
+                        persist=False,
+                    ),
+                    timeout=max(5.0, float(timeout_sec)),
+                )
+            else:
+                resp = await provider.text_chat(
                     prompt=prompt,
                     session_id=uuid.uuid4().hex,
                     image_urls=[image_input],
                     persist=False,
-                ),
-                timeout=max(5.0, float(timeout_sec)),
-            )
+                )
             text = str(getattr(resp, "completion_text", "") or "").strip()
             caption = text[:200]
             if caption:
@@ -862,6 +887,12 @@ async def try_get_image_caption(
             try:
                 if os.path.exists(temp_image_path):
                     os.remove(temp_image_path)
+            except Exception:
+                pass
+        if resized_tmp_path:
+            try:
+                if os.path.exists(resized_tmp_path):
+                    os.remove(resized_tmp_path)
             except Exception:
                 pass
 
@@ -1022,6 +1053,7 @@ async def inject_merged_images_by_provider(
             default_provider_resolver=default_provider_resolver,
             preferred_provider_id=caption_provider_id,
             allow_default_provider=False,
+            timeout_sec=0,
         )
         if not caption:
             continue
@@ -1089,7 +1121,7 @@ async def build_text_context_enrichment(
                 max_download_kb=int(get_cfg("inject_url_max_download_kb", 512) or 512),
                 block_private_network=bool(get_cfg("inject_url_block_private_network", True)),
                 blocked_domains=get_cfg("inject_url_blocked_domains", []) or [],
-                cache_ttl_sec=int(get_cfg("inject_url_cache_ttl_sec", 600) or 600),
+                tavily_api_keys=get_cfg("tavily_api_keys", []) or [],
             )
             if getattr(url_result, "details", None):
                 parts.append(f"URL解析: {_clip('；'.join(list(url_result.details)[:2]), 220)}")
@@ -1222,21 +1254,21 @@ async def build_non_text_context_text(
         if len(parts) == 1:
             only = parts[0]
             if only == "语音消息":
-                return "发送了一条语音消息"
+                return "发送了1条语音消息"
             if only.startswith("语音转写:"):
-                return f"发送了一条语音消息，{only}"
+                return f"发送了1条语音消息，{only}"
             if only.startswith("表情包转述:"):
-                return f"发送了一个表情包，{only}"
+                return f"发送了1个表情包，{only}"
             if only.startswith("图片转述:"):
-                return f"发送了一张图片，{only}"
+                return f"发送了1张图片，{only}"
             if only.startswith("聊天记录抽取:"):
                 return f"发送了聊天记录，{only}"
             if only.startswith("URL解析:"):
-                return f"发送了一个链接，{only}"
+                return f"发送了1个链接，{only}"
             if only.startswith("JSON解析:"):
                 return f"发送了分享卡片，{only}"
             if only.startswith("文件信息:"):
-                return f"发送了一个文件，{only}"
+                return f"发送了1个文件，{only}"
         return f"发送了复合媒体消息，解析结果：{' | '.join(parts)}"
     return ""
 
@@ -1261,7 +1293,7 @@ def build_context_text(
         if text:
             return append_emoji_summary_suffix(f"{text} [{image_label}描述: {image_caption}]", emoji_summary)
         return append_emoji_summary_suffix(
-            f"{sender_name}发送了一张{image_label}：{image_caption}",
+            f"{sender_name}发送了1张{image_label}：{image_caption}",
             emoji_summary,
         )
     if text:
@@ -1398,7 +1430,7 @@ def _dedup_simple_notice_text(sender: str, text: str) -> str:
     return value
 
 
-def _render_context_line(item: dict[str, Any], *, detailed: bool, limit: int = 110) -> str:
+def _render_context_line(item: dict[str, Any], *, detailed: bool, limit: int = 130) -> str:
     sender = str(item.get("sender_name") or item.get("uid") or "未知用户").strip()
     uid_text = str(item.get("uid") or "").strip()
     ts = item.get("ts")
@@ -1762,7 +1794,10 @@ def inject_context_into_request(
     if not should_inject_context(get_cfg=get_cfg, direct_wake=direct_wake, wake_reason=wake_reason):
         return False, "mode_skip", ""
 
-    context_messages = list(group_state.context_messages or [])
+    context_messages = sorted(
+        list(group_state.context_messages or []),
+        key=lambda x: float(x.get("ts", 0)),
+    )
     if not context_messages:
         return False, "no_context", ""
 
@@ -1780,7 +1815,7 @@ def inject_context_into_request(
     block = (
         f"\n\n[上下文注入|格式={'详细' if detailed else '精简'}]\n"
         + "\n".join(lines)
-        + "\n[说明] 以上为最近对话片段，请结合其连续性理解当前消息。"
+        + "\n[说明] 以上为最近对话片段，请据此理解当前上下文。"
     )
     if not append_text_part_to_request(req, block, mark_temp=True):
         req.prompt = f"{(req.prompt or '').strip()}{block}".strip()

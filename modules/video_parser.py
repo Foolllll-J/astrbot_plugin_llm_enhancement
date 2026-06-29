@@ -17,7 +17,7 @@ from astrbot.api.event import AstrMessageEvent
 from astrbot.api.provider import ProviderRequest
 import astrbot.api.message_components as Comp
 from .provider_utils import find_provider
-from .runtime_helpers import append_text_part_to_request
+from .runtime_helpers import append_text_part_to_request, transcribe_audio_with_fallback
 
 from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import AiocqhttpMessageEvent
 
@@ -333,7 +333,7 @@ async def sample_frames_equidistant(ffmpeg_path: str, video_path: str, duration_
         pass
     return frames
 
-DEFAULT_FRAME_CAPTION_PROMPT = "请根据这张关键帧图片，用一句中文描述画面要点；少于25字。若无法判断，请回答‘未识别’。禁止输出政治有关内容。"
+
 
 
 async def extract_forward_video_keyframes(
@@ -660,18 +660,38 @@ class VideoFrameProcessor:
             if cleanup_paths:
                 req._cleanup_paths.extend(cleanup_paths)
             
-            # 步骤：语音转录（可选）
+            # 步骤：并发 ASR + 逐帧识图
             asr_text = None
+            asr_task = None
             if self._get_cfg("video_asr_enable", True) and local_video_path:
-                asr_text = await self._extract_and_transcribe_audio(local_video_path)
+                asr_task = asyncio.create_task(
+                    self._extract_and_transcribe_audio(local_video_path)
+                )
             
-            # 步骤：帧聚合汇总
+            frame_descriptions = None
+            provider = self._get_vision_provider()
+            if provider and frames:
+                frame_descriptions = await self._describe_frames(
+                    provider, frames,
+                    max_concurrency=2,
+                    frame_timeout_sec=15
+                )
+            
+            if asr_task:
+                try:
+                    asr_text = await asyncio.wait_for(asr_task, timeout=35)
+                except asyncio.TimeoutError:
+                    logger.warning("[VideoFrameProcessor] ASR 超时")
+                    asr_text = None
+            
+            # 步骤：帧聚合汇总（已传入预计算的帧描述和 ASR）
             summary = await self._aggregate_frames_helper(
                 frames, 
                 len(frames), 
                 duration,
                 asr_text=asr_text,
-                max_summary_length=100
+                max_summary_length=200,
+                frame_descriptions=frame_descriptions
             )
             
             if summary:
@@ -842,28 +862,21 @@ class VideoFrameProcessor:
                 logger.warning("[VideoFrameProcessor] ASR: 提取音频 WAV 失败")
                 return None
             
-            stt = self._get_stt_provider()
-            if not stt:
-                logger.warning("[VideoFrameProcessor] ASR: 无可用 STT Provider")
-                try:
-                    os.remove(wav_path)
-                except Exception as e:
-                    logger.debug(f"[VideoFrameProcessor] ASR wav 清理失败(无 STT): path={wav_path}, err={e}")
-                return None
-            
             asr_text = None
             try:
                 logger.debug(f"[VideoFrameProcessor] ASR: 正在请求转录...")
-                if hasattr(stt, "get_text"):
-                    asr_text = await stt.get_text(wav_path)
-                elif hasattr(stt, "speech_to_text"):
-                    res = await stt.speech_to_text(wav_path)
-                    if isinstance(res, dict):
-                        asr_text = res.get("text", "")
-                    elif hasattr(res, "text"):
-                        asr_text = res.text
-                    else:
-                        asr_text = str(res)
+                asr_text, llm_cleanup_paths = await transcribe_audio_with_fallback(
+                    context=self.context,
+                    get_cfg=self._get_cfg,
+                    event=self.event,
+                    audio_path=wav_path,
+                    audio_is_prepared_wav=True,
+                )
+                for cleanup_path in llm_cleanup_paths:
+                    try:
+                        os.remove(cleanup_path)
+                    except Exception as e:
+                        logger.debug(f"[VideoFrameProcessor] ASR LLM 临时音频清理失败: path={cleanup_path}, err={e}")
                 
                 if asr_text:
                     logger.debug(f"[VideoFrameProcessor] ASR 成功: {asr_text[:100]}...")
@@ -882,51 +895,80 @@ class VideoFrameProcessor:
             logger.warning(f"[VideoFrameProcessor] ASR 处理失败: {e}")
             return None
     
-    async def _aggregate_frames_helper(self, frames: List[str], frame_count: int, duration: float, asr_text: Optional[str] = None, max_summary_length: int = 100) -> Optional[str]:
+    # ---- 逐帧识图（单帧） ----
+    
+    async def _describe_single_frame(self, provider, frame_path: str, idx: int, frame_count: int, timeout_sec: int = 15) -> Optional[str]:
+        start_t = time.time()
+        p_name = getattr(provider, "name", "unknown") or getattr(provider, "id", "unknown")
+        logger.debug(f"[帧聚合汇总] 正在请求第 {idx}/{frame_count} 帧 ...")
+        for attempt in (1, 2):
+            try:
+                response = await asyncio.wait_for(
+                    provider.text_chat(
+                        prompt=f"简要描述这一帧（第 {idx}/{frame_count} 帧）的内容，重点关注动作、表情和关键物体。",
+                        system_prompt="你是一个视频分析助手。请用 1-2 句话简洁描述图片内容。",
+                        image_urls=[frame_path],
+                        context=[]
+                    ),
+                    timeout=max(timeout_sec, 5)
+                )
+                desc = self._extract_completion_text(response)
+                cost = time.time() - start_t
+                if desc:
+                    logger.debug(f"[帧聚合汇总] 第 {idx}/{frame_count} 帧解析成功 (耗时: {cost:.2f}s). 响应: {desc}")
+                    return f"[第 {idx} 帧] {desc}"
+                else:
+                    logger.warning(f"[帧聚合汇总] 第 {idx}/{frame_count} 帧解析响应为空")
+            except asyncio.TimeoutError:
+                logger.warning(f"[帧聚合汇总] 第 {idx}/{frame_count} 帧识图超时 ({timeout_sec}s)")
+                break
+            except Exception as e:
+                logger.warning(f"[帧聚合汇总] 第 {idx}/{frame_count} 帧识图异常 (attempt {attempt}): {e}")
+                if attempt == 1:
+                    await asyncio.sleep(2)
+                    continue
+            break
+        return f"[第 {idx} 帧] [处理失败]"
+
+    # ---- 逐帧识图（有限并发） ----
+    
+    async def _describe_frames(self, provider, frames: List[str], max_concurrency: int = 2, frame_timeout_sec: int = 15) -> List[str]:
+        sem = asyncio.Semaphore(max_concurrency)
+        frame_count = len(frames)
+
+        async def _describe_one(idx: int, frame_path: str) -> Optional[str]:
+            async with sem:
+                return await self._describe_single_frame(provider, frame_path, idx, frame_count, timeout_sec=frame_timeout_sec)
+
+        tasks = [_describe_one(idx, fp) for idx, fp in enumerate(frames, 1)]
+        results = await asyncio.gather(*tasks)
+        return [r for r in results if r]
+
+    async def _aggregate_frames_helper(self, frames: List[str], frame_count: int, duration: float, asr_text: Optional[str] = None, max_summary_length: int = 200, frame_descriptions: Optional[List[str]] = None) -> Optional[str]:
         """【公用】帧聚合汇总"""
         if not frames:  
             return None
         
-        # 强制字数限制
-        max_summary_length = max_summary_length or 100
+        max_summary_length = max_summary_length or 200
         
         logger.debug(f"[帧聚合汇总] 开始处理 {len(frames)} 帧图片...")
         
-        # 步骤 1：逐帧识图
-        frame_descriptions = []
-        provider = self._get_vision_provider()
-        
-        if not provider:
-            logger.warning("[帧聚合汇总] 无可用 Vision Provider")
-            return None
-        
-        for idx, frame_path in enumerate(frames, 1):
-            try:
-                start_t = time.time()
-                # 获取 provider 名称用于日志
-                p_name = getattr(provider, "name", "unknown") or getattr(provider, "id", "unknown")
-                logger.debug(f"[帧聚合汇总] 正在请求第 {idx}/{frame_count} 帧 ...")
-                
-                response = await provider.text_chat(
-                    prompt=f"简要描述这一帧（第 {idx}/{frame_count} 帧）的内容，重点关注动作、表情和关键物体。",
-                    system_prompt="你是一个视频分析助手。请用 1-2 句话简洁描述图片内容。",
-                    image_urls=[frame_path],
-                    context=[]
-                )
-                
-                desc = self._extract_completion_text(response)
-                cost = time.time() - start_t
-                if desc:  
-                    frame_descriptions.append(f"[第 {idx} 帧] {desc}")
-                    logger.debug(f"[帧聚合汇总] 第 {idx}/{len(frames)} 帧解析成功 (耗时: {cost:.2f}s). 响应: {desc}")
-                else:
-                    logger.warning(f"[帧聚合汇总] 第 {idx}/{len(frames)} 帧解析响应为空")
-            except Exception as e:
-                logger.warning(f"[帧聚合汇总] 第 {idx}/{len(frames)} 帧识图异常: {e}")
-                frame_descriptions.append(f"[第 {idx} 帧] [处理失败]")
+        # 步骤 1：逐帧识图（支持外部传入，否则自动并行处理）
+        if frame_descriptions is None:
+            provider = self._get_vision_provider()
+            if not provider:
+                logger.warning("[帧聚合汇总] 无可用 Vision Provider")
+                return None
+            frame_descriptions = await self._describe_frames(
+                provider, frames,
+                max_concurrency=2,
+                frame_timeout_sec=15
+            )
         
         if not frame_descriptions:
             return None
+        
+        summary_start_t = time.time()
         
         # 步骤 2：合并帧描述和 ASR
         comprehensive_context = "\n".join(frame_descriptions)
@@ -946,8 +988,7 @@ class VideoFrameProcessor:
             logger.debug(f"[帧聚合汇总] 正在请求汇总摘要...")
             
             summary_prompt = (
-                f"你是一个媒体分析助手。请根据以下提供的逐帧视觉描述和语音转写（如有），"
-                f"生成一份简洁连贯的汇总摘要。要求：\n"
+                f"根据以下逐帧视觉描述和语音转写（如有），生成连贯的汇总摘要。要求：\n"
                 f"1. 重点概括视频/动图的核心内容、动作变化和视觉亮点。\n"
                 f"2. 严格控制字数在 {max_summary_length} 字以内。\n"
                 f"3. 直接输出摘要内容，不要有任何前缀或解释。\n\n"
@@ -957,25 +998,29 @@ class VideoFrameProcessor:
                 f"请生成汇总摘要："
             )
             
-            response = await llm_provider.text_chat(
-                prompt=summary_prompt,
-                system_prompt="你是一个专业的媒体摘要生成器。请直接输出摘要内容。",
-                image_urls=[], # 汇总阶段不传递图片，仅根据文字描述生成
-                context=[]
+            response = await asyncio.wait_for(
+                llm_provider.text_chat(
+                    prompt=summary_prompt,
+                    system_prompt="你是媒体摘要助手。直接输出摘要，不要前缀或解释。",
+                    image_urls=[],
+                    context=[]
+                ),
+                timeout=15
             )
             
             summary = self._extract_completion_text(response)
             
             if summary:
-                # 步骤 4：长度控制
                 if len(summary) > max_summary_length:
                     logger.debug(f"[帧聚合汇总] 摘要长度 {len(summary)} 超过限制 {max_summary_length}，截断处理")
                     summary = summary[:max_summary_length].rsplit('。', 1)[0] + "。"
                 
-                logger.debug(f"[帧聚合汇总] 汇总成功 (耗时: {time.time() - start_t:.2f}s, 字数: {len(summary)}): {summary}")
+                logger.debug(f"[帧聚合汇总] 汇总成功 (耗时: {time.time() - summary_start_t:.2f}s, 字数: {len(summary)}): {summary}")
                 return summary
             else:
                 logger.warning(f"[帧聚合汇总] 汇总摘要响应为空")
+        except asyncio.TimeoutError:
+            logger.warning(f"[帧聚合汇总] 汇总摘要超时")
         except Exception as e:
             logger.warning(f"[帧聚合汇总] LLM 汇总失败: {e}")
         

@@ -13,7 +13,7 @@ from astrbot.api.provider import ProviderRequest
 
 from .reference_parser import _segment_is_emoji_image
 from .json_parser import parse_json_segment_data
-from .runtime_helpers import append_text_part_to_request
+from .runtime_helpers import append_text_part_to_request, transcribe_audio_with_fallback
 from .video_parser import extract_audio_wav, extract_forward_video_keyframes
 
 from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import AiocqhttpMessageEvent
@@ -360,8 +360,8 @@ async def _describe_forward_images(
     for idx, url in enumerate(selected, 1):
         try:
             response = await vision_provider.text_chat(
-                prompt="请用一句中文描述这张图片的关键内容，不超过30字。若无法判断，回复“未识别”。",
-                system_prompt="你是图片内容理解助手，请只输出描述结果，不要额外解释。",
+                prompt="用一句中文描述这张图片，包含主体、动作和场景，不超过50字。",
+                system_prompt="你是图片内容理解助手，请直接输出描述。",
                 image_urls=[url],
                 context=[],
             )
@@ -376,14 +376,10 @@ async def _describe_forward_images(
 async def _transcribe_forward_video_audio(
     event: AstrMessageEvent,
     local_videos: list[str],
-    get_stt_provider: Callable[[AstrMessageEvent], Any],
+    context: Any,
     get_cfg: Callable[[str, Any], Any],
 ) -> list[str]:
     if not local_videos:
-        return []
-
-    stt = get_stt_provider(event)
-    if not stt:
         return []
 
     lines: list[str] = []
@@ -393,15 +389,21 @@ async def _transcribe_forward_video_audio(
             if not wav_path or not os.path.exists(wav_path):
                 continue
             try:
-                asr_text = None
-                if hasattr(stt, "get_text"):
-                    asr_text = await stt.get_text(wav_path)
-                elif hasattr(stt, "speech_to_text"):
-                    asr_res = await stt.speech_to_text(wav_path)
-                    asr_text = asr_res.get("text", "") if isinstance(asr_res, dict) else str(asr_res)
+                asr_text, llm_cleanup_paths = await transcribe_audio_with_fallback(
+                    context=context,
+                    get_cfg=get_cfg,
+                    event=event,
+                    audio_path=wav_path,
+                    audio_is_prepared_wav=True,
+                )
                 asr_text = str(asr_text or "").strip()
                 if asr_text:
                     lines.append(f"[视频语音转写 {idx + 1}] {asr_text}")
+                for cleanup_path in llm_cleanup_paths:
+                    try:
+                        os.remove(cleanup_path)
+                    except Exception as e:
+                        logger.debug(f"[Forward解析] 转发视频 LLM 临时音频清理失败: path={cleanup_path}, err={e}")
             except Exception as e:
                 logger.debug(f"[Forward解析] 转发视频 ASR 失败: idx={idx + 1}, err={e}")
             finally:
@@ -430,8 +432,8 @@ async def _build_forward_video_lines(
             for idx, frame in enumerate(frame_paths, 1):
                 try:
                     response = await vision_provider.text_chat(
-                        prompt=f"请描述这帧画面内容（第{idx}帧），不超过25字。",
-                        system_prompt="你是视频帧分析助手，请直接输出结果。",
+                        prompt=f"描述这帧画面内容（第{idx}帧），关注主体动作、场景和画面文字，不超过50字。",
+                        system_prompt="你是视频帧分析助手，请直接输出描述。",
                         image_urls=[frame],
                         context=[],
                     )
@@ -509,6 +511,7 @@ def _build_forward_context_text(
 
 
 async def process_forward_record_content(
+    context: Any,
     event: AstrMessageEvent,
     req: ProviderRequest,
     forward_id: Optional[str],
@@ -603,7 +606,7 @@ async def process_forward_record_content(
                 asr_lines = await _transcribe_forward_video_audio(
                     event=event,
                     local_videos=f_local_videos,
-                    get_stt_provider=get_stt_provider,
+                    context=context,
                     get_cfg=get_cfg,
                 )
             video_lines = await _build_forward_video_lines(

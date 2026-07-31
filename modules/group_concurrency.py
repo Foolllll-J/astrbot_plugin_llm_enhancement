@@ -12,13 +12,16 @@ from astrbot.core.utils.session_lock import session_lock_manager
 
 
 _ctx_current_event: contextvars.ContextVar[Any | None] = contextvars.ContextVar(
-    "_llme_group_concurrency_event", default=None
+    "_llme_group_concurrency_event",
+    default=None,
 )
 
 
 def _get_runner_event(runner: Any) -> Any:
     return getattr(
-        getattr(getattr(runner, "run_context", None), "context", None), "event", None
+        getattr(getattr(runner, "run_context", None), "context", None),
+        "event",
+        None,
     )
 
 
@@ -66,10 +69,12 @@ class GroupConcurrencyModule:
         for patch in patches:
             if not patch():
                 self._restore_all()
-                logger.warning("[LLMEnhancement][GroupConcurrency] 补丁安装失败，已回滚。")
+                logger.warning(
+                    "[LLMEnhancement][GroupConcurrency] 补丁安装失败，已回滚。"
+                )
                 return False
         self._installed = True
-        logger.info("[LLMEnhancement][GroupConcurrency] 群聊按用户并发功能已启用。")
+        logger.debug("[LLMEnhancement][GroupConcurrency] 群聊按用户并发功能已启用。")
         return True
 
     def terminate(self) -> None:
@@ -85,11 +90,13 @@ class GroupConcurrencyModule:
                 try:
                     if cls_name == "ConversationManager":
                         from astrbot.core.conversation_mgr import ConversationManager
+
                         setattr(ConversationManager, attr, original)
                     elif cls_name == "InternalAgentSubStage":
                         from astrbot.core.pipeline.process_stage.method.agent_sub_stages.internal import (
                             InternalAgentSubStage,
                         )
+
                         setattr(InternalAgentSubStage, attr, original)
                 except Exception:
                     pass
@@ -125,7 +132,9 @@ class GroupConcurrencyModule:
             return False
         self._save("InternalAgentSubStage.process", original)
 
-        async def patched_process(stage_self: Any, event: Any, *args: Any, **kwargs: Any):
+        async def patched_process(
+            stage_self: Any, event: Any, *args: Any, **kwargs: Any
+        ):
             token = _ctx_current_event.set(event)
             try:
                 gen = original(stage_self, event, *args, **kwargs)
@@ -205,14 +214,18 @@ class GroupConcurrencyModule:
     def _install_follow_up_patch(self) -> bool:
         try:
             from astrbot.core.pipeline.process_stage import follow_up as _fu
-            from astrbot.core.pipeline.process_stage.method.agent_sub_stages import internal as _int
+            from astrbot.core.pipeline.process_stage.method.agent_sub_stages import (
+                internal as _int,
+            )
         except Exception:
             return False
 
         orig_register = getattr(_fu, "register_active_runner", None)
         orig_unregister = getattr(_fu, "unregister_active_runner", None)
         orig_try_capture = getattr(_fu, "try_capture_follow_up", None)
-        if not all(callable(x) for x in (orig_register, orig_unregister, orig_try_capture)):
+        if not all(
+            callable(x) for x in (orig_register, orig_unregister, orig_try_capture)
+        ):
             return False
 
         self._save("follow_up.register_active_runner", orig_register)
@@ -265,13 +278,13 @@ class GroupConcurrencyModule:
             if runner_event.get_extra("agent_stop_requested"):
                 return None
             ticket = runner.follow_up(
-                message_text=_fu._event_follow_up_text(event)
+                message_text=_fu._event_follow_up_text(event),
             )
             if not ticket:
                 return None
             order_seq = _fu._allocate_follow_up_order(key)
             monitor_task = asyncio.create_task(
-                _fu._monitor_follow_up_ticket(key, ticket, order_seq)
+                _fu._monitor_follow_up_ticket(key, ticket, order_seq),
             )
             return _fu.FollowUpCapture(
                 umo=key,

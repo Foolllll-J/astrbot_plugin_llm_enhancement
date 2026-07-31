@@ -4,7 +4,6 @@ import json
 import os
 import shutil
 import time
-import tempfile
 from typing import Any, Callable, Optional
 
 from astrbot.api import logger
@@ -15,10 +14,12 @@ from astrbot.core.agent.message import TextPart
 from astrbot.core.config.default import VERSION as ASTRBOT_VERSION
 from astrbot.core.message.message_event_result import MessageEventResult
 
-from .provider_utils import find_provider
+from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import (
+    AiocqhttpMessageEvent,
+)
 
 
-_RECORD_ASR_CACHE_TTL_SEC = 10 * 60
+_RECORD_ASR_CACHE_TTL_SEC = 86400
 _RECORD_ASR_CACHE_MAX_SIZE = 100
 _record_asr_cache: dict[str, dict[str, Any]] = {}
 _DEFAULT_LLM_ASR_PROMPT = (
@@ -49,6 +50,7 @@ def _parse_version_tuple(version_text: str) -> tuple[int, ...]:
 
 
 def is_astrbot_version_at_least(version_text: str) -> bool:
+    """检查当前 AstrBot 版本是否不低于指定版本。"""
     current = _parse_version_tuple(ASTRBOT_VERSION)
     target = _parse_version_tuple(version_text)
     if not target:
@@ -60,6 +62,7 @@ def is_astrbot_version_at_least(version_text: str) -> bool:
 
 
 def supports_extra_user_content_parts() -> bool:
+    """判断当前版本是否支持额外的用户内容片段（TextPart）。"""
     return is_astrbot_version_at_least("4.24.0")
 
 
@@ -69,6 +72,7 @@ def append_text_part_to_request(
     *,
     mark_temp: bool = False,
 ) -> bool:
+    """向请求的额外用户内容片段列表中追加一段文本。"""
     if not supports_extra_user_content_parts():
         return False
 
@@ -167,7 +171,9 @@ class EffectiveDialogHistory:
                 if text:
                     parts.append(text)
             else:
-                comp_type = str(getattr(comp, "type", "") or comp.__class__.__name__).strip()
+                comp_type = str(
+                    getattr(comp, "type", "") or comp.__class__.__name__
+                ).strip()
                 if comp_type:
                     parts.append(f"[{comp_type}]")
         return self.normalize_text(" ".join(parts))
@@ -181,7 +187,9 @@ class EffectiveDialogHistory:
                     if text:
                         parts.append(text)
                 else:
-                    comp_type = str(getattr(comp, "type", "") or comp.__class__.__name__).strip()
+                    comp_type = str(
+                        getattr(comp, "type", "") or comp.__class__.__name__
+                    ).strip()
                     if comp_type:
                         parts.append(f"[{comp_type}]")
             normalized = self.normalize_text(" ".join(parts))
@@ -245,12 +253,13 @@ class EffectiveDialogHistory:
                 "user_name": user_name,
                 "assistant_name": assistant_name,
                 "ts": time.time(),
-            }
+            },
         )
-        self._turns_by_session[umo] = turns[-self._max_turns:]
+        self._turns_by_session[umo] = turns[-self._max_turns :]
 
 
 def clear_effective_dialog_history(history: EffectiveDialogHistory, umo: str) -> int:
+    """清除指定会话的有效对话历史记录。返回清除的消息条数。"""
     if not history:
         return 0
     return history.clear_session(umo)
@@ -268,7 +277,9 @@ def get_llm_provider(
 ):
     """获取当前会话使用的 LLM Provider。"""
     try:
-        using_umo = umo or (getattr(event, "unified_msg_origin", None) if event is not None else None)
+        using_umo = umo or (
+            getattr(event, "unified_msg_origin", None) if event is not None else None
+        )
         if using_umo:
             return context.get_using_provider(umo=using_umo)
         return context.get_using_provider()
@@ -283,7 +294,7 @@ def get_stt_provider(
     umo: Optional[str] = None,
 ):
     """获取配置的 STT Provider，未命中时回退到当前会话 Provider。"""
-    asr_pid = get_cfg("asr_provider_id")
+    asr_pid = get_cfg("audio_asr_provider_id")
     p = resolve_provider(context, asr_pid)
     if p:
         logger.debug(f"[LLMEnhancement] 成功匹配到指定 STT Provider: {asr_pid}")
@@ -293,7 +304,9 @@ def get_stt_provider(
         logger.warning(f"[LLMEnhancement] 未找到指定 STT Provider: {asr_pid}")
 
     try:
-        using_umo = umo or (getattr(event, "unified_msg_origin", None) if event is not None else None)
+        using_umo = umo or (
+            getattr(event, "unified_msg_origin", None) if event is not None else None
+        )
         if using_umo:
             return context.get_using_stt_provider(umo=using_umo)
         return context.get_using_stt_provider()
@@ -315,7 +328,7 @@ def _get_explicit_stt_provider(
     context: Any,
     get_cfg: Callable[[str, Any], Any],
 ):
-    asr_pid = str(get_cfg("asr_provider_id", "") or "").strip()
+    asr_pid = str(get_cfg("audio_asr_provider_id", "") or "").strip()
     if not asr_pid:
         return None
     provider = resolve_provider(context, asr_pid)
@@ -335,7 +348,7 @@ async def _ensure_audio_path_for_llm(
         return normalized, []
 
     try:
-        from .video_parser import extract_audio_wav
+        from .media_parser import extract_audio_wav
     except Exception as e:
         logger.debug(f"[LLMEnhancement] 导入 extract_audio_wav 失败: err={e}")
         return normalized, []
@@ -343,7 +356,9 @@ async def _ensure_audio_path_for_llm(
     try:
         wav_path = await extract_audio_wav(ffmpeg_path, normalized)
     except Exception as e:
-        logger.warning(f"[LLMEnhancement] LLM ASR 音频转 WAV 失败: path={normalized}, err={e}")
+        logger.warning(
+            f"[LLMEnhancement] LLM ASR 音频转 WAV 失败: path={normalized}, err={e}"
+        )
         return normalized, []
 
     if wav_path and os.path.exists(wav_path):
@@ -359,7 +374,7 @@ async def _transcribe_via_llm(
     audio_path: str,
     audio_is_prepared_wav: bool = False,
 ) -> tuple[str, list[str]]:
-    llm_pid = str(get_cfg("asr_llm_provider_id", "") or "").strip()
+    llm_pid = str(get_cfg("audio_asr_llm_provider_id", "") or "").strip()
     if not llm_pid:
         return "", []
 
@@ -369,7 +384,9 @@ async def _transcribe_via_llm(
         return "", []
 
     if not _provider_supports_audio_input(provider):
-        logger.warning(f"[LLMEnhancement] LLM ASR Provider 不支持 audio modality: {llm_pid}")
+        logger.warning(
+            f"[LLMEnhancement] LLM ASR Provider 不支持 audio modality: {llm_pid}"
+        )
         return "", []
 
     llm_audio_path = str(audio_path or "").strip()
@@ -384,13 +401,21 @@ async def _transcribe_via_llm(
         )
 
     try:
-        response = await provider.text_chat(
-            prompt=_DEFAULT_LLM_ASR_PROMPT,
-            audio_urls=[llm_audio_path],
-            contexts=[],
+        response = await asyncio.wait_for(
+            provider.text_chat(
+                prompt=_DEFAULT_LLM_ASR_PROMPT,
+                audio_urls=[llm_audio_path],
+                contexts=[],
+            ),
+            timeout=60,
         )
+    except asyncio.TimeoutError:
+        logger.warning(f"[LLMEnhancement] LLM ASR 调用超时: provider={llm_pid} (60s)")
+        return "", cleanup_paths
     except Exception as e:
-        logger.warning(f"[LLMEnhancement] LLM ASR 调用失败: provider={llm_pid}, err={e}")
+        logger.warning(
+            f"[LLMEnhancement] LLM ASR 调用失败: provider={llm_pid}, err={e}"
+        )
         return "", cleanup_paths
 
     text = str(getattr(response, "completion_text", "") or "").strip()
@@ -405,6 +430,7 @@ async def transcribe_audio_with_fallback(
     audio_path: str,
     audio_is_prepared_wav: bool = False,
 ) -> tuple[str, list[str]]:
+    """转录音频，优先使用显式 STT 提供商，失败后回退到 LLM ASR。返回（识别文本, 待清理路径列表）。"""
     cleanup_paths: list[str] = []
     normalized_audio_path = str(audio_path or "").strip()
     if not normalized_audio_path:
@@ -415,9 +441,15 @@ async def transcribe_audio_with_fallback(
     if explicit_stt:
         try:
             if hasattr(explicit_stt, "get_text"):
-                text = await explicit_stt.get_text(normalized_audio_path)
+                text = await asyncio.wait_for(
+                    explicit_stt.get_text(normalized_audio_path),
+                    timeout=60,
+                )
             elif hasattr(explicit_stt, "speech_to_text"):
-                res = await explicit_stt.speech_to_text(normalized_audio_path)
+                res = await asyncio.wait_for(
+                    explicit_stt.speech_to_text(normalized_audio_path),
+                    timeout=60,
+                )
                 if isinstance(res, dict):
                     text = str(res.get("text") or "")
                 elif hasattr(res, "text"):
@@ -450,14 +482,16 @@ def get_vision_provider(
     umo: Optional[str] = None,
 ):
     """获取配置的视觉 Provider，未命中时回退到当前会话 LLM Provider。"""
-    image_pid = get_cfg("image_provider_id")
+    image_pid = get_cfg("video_image_provider_id")
     p = resolve_provider(context, image_pid)
     if p:
         logger.debug(f"[LLMEnhancement] 成功匹配到指定 Vision Provider: {image_pid}")
         return p
 
     if image_pid:
-        logger.warning(f"[LLMEnhancement] 未找到指定 Vision Provider: {image_pid}，回退到会话 Provider")
+        logger.warning(
+            f"[LLMEnhancement] 未找到指定 Vision Provider: {image_pid}，回退到会话 Provider"
+        )
 
     return get_llm_provider(context=context, event=event, umo=umo)
 
@@ -476,7 +510,7 @@ def _build_record_cache_key(segment: Any) -> str:
                 return str(value)
         return ""
 
-    for attr in ("file_id", "file", "url", "path", "file_path", "id"):
+    for attr in ("file_id", "url", "file", "path", "file_path", "id"):
         value = getattr(segment, attr, None)
         if value not in (None, ""):
             return str(value)
@@ -493,7 +527,10 @@ def _get_record_asr_cache(cache_key: str) -> str:
     if expire_at <= time.time():
         _record_asr_cache.pop(cache_key, None)
         return ""
-    return str(item.get("text") or "")
+    text = str(item.get("text") or "")
+    if text:
+        logger.debug(f"[语音转写] 语音转写缓存命中: {cache_key}")
+    return text
 
 
 def _set_record_asr_cache(cache_key: str, text: str) -> None:
@@ -506,17 +543,10 @@ def _set_record_asr_cache(cache_key: str, text: str) -> None:
         "text": normalized,
         "expire_at": time.time() + _RECORD_ASR_CACHE_TTL_SEC,
     }
+    logger.debug(f"[语音转写] 语音转写已缓存: {cache_key}")
     if len(_record_asr_cache) > _RECORD_ASR_CACHE_MAX_SIZE:
-        now_ts = time.time()
-        expired_keys = [
-            k
-            for k, v in _record_asr_cache.items()
-            if float((v or {}).get("expire_at", 0.0) or 0.0) <= now_ts
-        ]
-        for k in expired_keys:
-            _record_asr_cache.pop(k, None)
-        if len(_record_asr_cache) > _RECORD_ASR_CACHE_MAX_SIZE:
-            _record_asr_cache.clear()
+        oldest_key = next(iter(_record_asr_cache))
+        del _record_asr_cache[oldest_key]
 
 
 def _normalize_record_source(value: Any) -> str:
@@ -528,6 +558,7 @@ async def resolve_record_file_path(
     segment: Any,
 ) -> tuple[Optional[str], bool]:
     """将语音 segment 解析为本地文件路径，返回 `(path, should_cleanup)`。"""
+
     def _build_candidates(data: dict) -> list[str]:
         candidates: list[str] = []
         url = _normalize_record_source(data.get("url"))
@@ -544,7 +575,9 @@ async def resolve_record_file_path(
             candidates.append(file_id)
         return candidates
 
-    async def _resolve_from_candidates(candidates: list[str]) -> tuple[Optional[str], bool]:
+    async def _resolve_from_candidates(
+        candidates: list[str],
+    ) -> tuple[Optional[str], bool]:
         for cand in candidates:
             if cand.startswith("http"):
                 try:
@@ -563,7 +596,7 @@ async def resolve_record_file_path(
             if os.path.exists(cand):
                 return os.path.abspath(cand), False
 
-        # 兜底：针对不是本地路径的 file id，尝试调用平台 get_record 获取文件
+        # 兜底：针对不是本地路径的 file id，尝试调用平台 get_record 获取文件。
         if candidates and event is not None and getattr(event, "bot", None) is not None:
             api = getattr(event.bot, "api", None)
             if api and hasattr(api, "call_action"):
@@ -587,7 +620,8 @@ async def resolve_record_file_path(
             data = {
                 "file": getattr(segment, "file", None),
                 "url": getattr(segment, "url", None),
-                "path": getattr(segment, "path", None) or getattr(segment, "file_path", None),
+                "path": getattr(segment, "path", None)
+                or getattr(segment, "file_path", None),
                 "file_id": getattr(segment, "file_id", None),
             }
             candidates = _build_candidates(data)
@@ -742,6 +776,7 @@ def _history_content_to_text(content: Any) -> str:
 async def get_history_messages(
     context: Any,
     event: AstrMessageEvent,
+    *,
     role: str | None = "assistant",
     count: int | None = 0,
     with_role_prefix: bool = False,
@@ -752,7 +787,9 @@ async def get_history_messages(
         curr_cid = await context.conversation_manager.get_curr_conversation_id(umo)
         if not curr_cid:
             return []
-        conversation = await context.conversation_manager.get_conversation(umo, curr_cid)
+        conversation = await context.conversation_manager.get_conversation(
+            umo, curr_cid
+        )
         if not conversation:
             return []
 
@@ -782,26 +819,15 @@ async def get_history_messages(
         return []
 
 
-
-
-
-def get_discarded_response_ttl_sec(
-    get_cfg: Callable[[str, Any], Any],
-    default_ttl_sec: float,
-) -> float:
-    raw = get_cfg("dynamic_discarded_response_ttl_sec", default_ttl_sec)
-    try:
-        value = float(raw)
-    except Exception:
-        value = default_ttl_sec
-    return max(30.0, min(1800.0, value))
-
-
 def clear_discarded_response_cache(member: Any) -> None:
+    """清空指定成员的被丢弃响应缓存。"""
     member.dynamic_discarded_response_cache = {}
 
 
-def get_valid_discarded_response_cache(member: Any, ttl_sec: float) -> Optional[dict[str, Any]]:
+def get_valid_discarded_response_cache(
+    member: Any, ttl_sec: float
+) -> Optional[dict[str, Any]]:
+    """获取成员的有效丢弃响应缓存，若过期或为空则自动清理并返回 None。"""
     cache = member.dynamic_discarded_response_cache or {}
     if not isinstance(cache, dict) or not cache:
         return None
@@ -820,6 +846,7 @@ def get_valid_discarded_response_cache(member: Any, ttl_sec: float) -> Optional[
 
 
 def is_chain_effectively_empty(chain: list[Any]) -> bool:
+    """判断消息链是否实质为空（仅含空白文本或空列表）。"""
     if not chain:
         return True
     for comp in chain:
@@ -832,6 +859,7 @@ def is_chain_effectively_empty(chain: list[Any]) -> bool:
 
 
 def extract_chain_from_llm_response(resp: LLMResponse) -> list[Any]:
+    """从 LLMResponse 中提取消息链，剔除空文本 Plain 组件后返回深拷贝。"""
     chain: list[Any] = []
     if resp.result_chain and getattr(resp.result_chain, "chain", None):
         chain = list(resp.result_chain.chain or [])
@@ -843,7 +871,9 @@ def extract_chain_from_llm_response(resp: LLMResponse) -> list[Any]:
 
     filtered: list[Any] = []
     for comp in chain:
-        if isinstance(comp, Comp.Plain) and (not str(getattr(comp, "text", "") or "").strip()):
+        if isinstance(comp, Comp.Plain) and (
+            not str(getattr(comp, "text", "") or "").strip()
+        ):
             continue
         filtered.append(comp)
     if not filtered:
@@ -852,7 +882,10 @@ def extract_chain_from_llm_response(resp: LLMResponse) -> list[Any]:
     return copy.deepcopy(filtered)
 
 
-def store_discarded_response_cache(member: Any, response_seq: int, resp: LLMResponse) -> bool:
+def store_discarded_response_cache(
+    member: Any, response_seq: int, resp: LLMResponse
+) -> bool:
+    """缓存被丢弃的 LLM 响应，按序列号保留最新的。"""
     chain = extract_chain_from_llm_response(resp)
     if not chain:
         return False
@@ -863,7 +896,7 @@ def store_discarded_response_cache(member: Any, response_seq: int, resp: LLMResp
             existing_seq = int(existing_cache.get("seq", 0) or 0)
         except Exception:
             existing_seq = 0
-        # Keep the latest discarded response by sequence to avoid stale overwrite.
+        # 按序列保留最新的丢弃响应，避免过期覆盖。
         if existing_seq > incoming_seq:
             return False
     member.dynamic_discarded_response_cache = {
@@ -875,6 +908,7 @@ def store_discarded_response_cache(member: Any, response_seq: int, resp: LLMResp
 
 
 def is_llm_response_empty_without_tool(resp: LLMResponse) -> bool:
+    """判断 LLM 响应是否为空（不含工具调用且无实质文本内容）。"""
     if resp.tools_call_name or resp.tools_call_args:
         return False
     if resp.result_chain and getattr(resp.result_chain, "chain", None):
@@ -883,6 +917,7 @@ def is_llm_response_empty_without_tool(resp: LLMResponse) -> bool:
 
 
 def looks_like_error_result(chain: list[Any]) -> bool:
+    """检查消息链文本是否以已知的错误前缀开头。"""
     plain_text = "".join(
         str(getattr(comp, "text", "") or "")
         for comp in chain
@@ -905,7 +940,9 @@ def looks_like_error_result(chain: list[Any]) -> bool:
         return True
     if _starts_with_error_header(normalized, "LLM 响应错误"):
         return True
-    if _starts_with_error_header(lowered, "error occurred while processing agent request"):
+    if _starts_with_error_header(
+        lowered, "error occurred while processing agent request"
+    ):
         return True
     return False
 
@@ -918,6 +955,7 @@ async def apply_discarded_response_fallback(
     reason: str,
     ttl_sec: float,
 ) -> bool:
+    """尝试将之前丢弃的 LLM 响应回退注入到当前事件的结果中。"""
     cache: Optional[dict[str, Any]] = None
     async with member.lock:
         cache = get_valid_discarded_response_cache(member, ttl_sec=ttl_sec)
@@ -939,6 +977,179 @@ async def apply_discarded_response_fallback(
     event.set_extra("_llme_discard_cache_used", True)
     logger.info(
         "[LLMEnhancement] 使用被丢弃响应缓存进行回退："
-        f"group={gid or 'private'}, uid={uid}, reason={reason}, cached_seq={int(cache.get('seq') or 0)}"
+        f"group={gid or 'private'}, uid={uid}, reason={reason}, cached_seq={int(cache.get('seq') or 0)}",
     )
     return True
+
+
+async def save_caches_to_kv(
+    kv_put_func: Callable[..., Any],
+    cache_sources: tuple,
+    persist_key: str,
+) -> None:
+    """将多个缓存源中未过期的条目持久化到 KV 存储。"""
+    now = time.time()
+    payload = {}
+    total = 0
+    for cid, cache_dict, expire_field in cache_sources:
+        entries = {}
+        for key, val in dict(cache_dict).items():
+            try:
+                expire = float(val.get(expire_field, 0.0) or 0.0)
+            except Exception:
+                expire = 0.0
+            if expire > now:
+                entries[key] = val
+                total += 1
+        if entries:
+            payload[cid] = {"expire_field": expire_field, "entries": entries}
+    try:
+        await kv_put_func(persist_key, payload)
+    except Exception as e:
+        logger.debug(f"[LLMEnhancement] 缓存持久化失败: {e}")
+        return
+    logger.debug(f"[LLMEnhancement] 缓存已持久化到 KV ({total} 条)")
+
+
+async def load_caches_from_kv(
+    kv_get_func: Callable[..., Any],
+    cache_sources: tuple,
+    persist_key: str,
+) -> None:
+    """从 KV 存储中恢复之前持久化的缓存条目，跳过已过期的。"""
+    try:
+        payload = await kv_get_func(persist_key, None)
+    except Exception as e:
+        logger.debug(f"[LLMEnhancement] KV 缓存读取失败: {e}")
+        return
+    if not payload or not isinstance(payload, dict):
+        return
+    now = time.time()
+    restored = 0
+    skipped = 0
+    for cid, meta in payload.items():
+        expire_field = meta.get("expire_field", "expire_at")
+        entries = meta.get("entries", {})
+        if not isinstance(entries, dict):
+            continue
+        target = None
+        for cid2, cache_dict, _ in cache_sources:
+            if cid2 == cid:
+                target = cache_dict
+                break
+        if target is None:
+            continue
+        for key, val in entries.items():
+            try:
+                expire = float(val.get(expire_field, 0.0) or 0.0)
+            except Exception:
+                expire = 0.0
+            if expire > now:
+                target[key] = val
+                restored += 1
+            else:
+                skipped += 1
+    if restored or skipped:
+        logger.debug(
+            f"[LLMEnhancement] 从 KV 恢复了 {restored} 条缓存, 跳过 {skipped} 条过期"
+        )
+
+
+def _normalize_emoji_summary(summary: str) -> str:
+    text = str(summary or "").strip()
+    if text.startswith("[") and text.endswith("]"):
+        text = text[1:-1].strip()
+    return text
+
+
+def _safe_int(value: Any) -> Optional[int]:
+    try:
+        if value is None:
+            return None
+        text = str(value).strip()
+        if not text:
+            return None
+        return int(float(text))
+    except Exception:
+        return None
+
+
+def _is_unavailable_get_msg_payload(payload: Any) -> bool:
+    return isinstance(payload, dict) and payload.get("status") == "deleted"
+
+
+def _append_emoji_summary_suffix(base_text: str, emoji_summary: str) -> str:
+    base = str(base_text or "").strip()
+    summary = _normalize_emoji_summary(emoji_summary)
+    if not base or not summary:
+        return base
+    if summary in base:
+        return base
+    return f"{base}（表情：{summary}）"
+
+
+async def _fetch_messages_by_ids(
+    event: Any,
+    msg_ids: list[str],
+) -> list[dict[str, Any]]:
+    if not isinstance(event, AiocqhttpMessageEvent):
+        return []
+    if not msg_ids:
+        return []
+    bot = getattr(event, "bot", None)
+    api = getattr(bot, "api", None) if bot else None
+    if api is None or not hasattr(api, "call_action"):
+        return []
+
+    messages: list[dict[str, Any]] = []
+    for msg_id in msg_ids:
+        sid = str(msg_id or "").strip()
+        if not sid:
+            continue
+        try:
+            original_msg = await api.call_action("get_msg", message_id=sid)
+        except Exception:
+            continue
+        if isinstance(original_msg, dict) and isinstance(
+            original_msg.get("message"), list
+        ):
+            messages.append(original_msg)
+    return messages
+
+
+def find_provider(context: Any, provider_id: str) -> Optional[Any]:
+    """跨 LLM 和 STT 提供商池按 id/provider_id/name 查找提供商。"""
+    if not provider_id:
+        return None
+
+    all_lists = []
+    try:
+        all_lists.append(context.get_all_providers())
+    except Exception:
+        pass
+    try:
+        all_lists.append(context.get_all_stt_providers())
+    except Exception:
+        pass
+
+    for p_list in all_lists:
+        if not p_list:
+            continue
+        for provider in p_list:
+            candidates = set()
+            for attr in ("id", "provider_id", "name"):
+                val = getattr(provider, attr, None)
+                if val:
+                    candidates.add(str(val))
+
+            cfg = getattr(provider, "provider_config", None)
+            if isinstance(cfg, dict):
+                for key in ("id", "provider_id", "name"):
+                    val = cfg.get(key)
+                    if val:
+                        candidates.add(str(val))
+
+            if provider_id in candidates:
+                return provider
+
+    return None

@@ -10,16 +10,21 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent
 from astrbot.api.provider import ProviderRequest
+from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import (
+    AiocqhttpMessageEvent,
+)
 
 from .reference_parser import _segment_is_emoji_image
 from .json_parser import parse_json_segment_data
-from .runtime_helpers import append_text_part_to_request, transcribe_audio_with_fallback
-from .video_parser import extract_audio_wav, extract_forward_video_keyframes
-
-from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import AiocqhttpMessageEvent
+from .runtime_helpers import (
+    _normalize_emoji_summary,
+    append_text_part_to_request,
+    transcribe_audio_with_fallback,
+)
+from .media_parser import extract_audio_wav, extract_forward_media_keyframes
 
 MAX_RECURSION_DEPTH = 5
-FORWARD_PARSE_CACHE_TTL_SEC = 3600
+FORWARD_PARSE_CACHE_TTL_SEC = 86400
 FORWARD_PARSE_CACHE_MAX_SIZE = 100
 
 _forward_result_cache: Dict[str, Dict[str, Any]] = {}
@@ -27,6 +32,7 @@ _forward_result_cache_lock = asyncio.Lock()
 
 
 def _build_forward_result_cache_key(
+    *,
     forward_id: str,
     max_message_count: int,
     nested_parse_depth: int,
@@ -67,25 +73,31 @@ async def _set_cached_forward_context(cache_key: str, context_text: str) -> None
     now_ts = time.time()
     async with _forward_result_cache_lock:
         expired_keys = [
-            key for key, val in _forward_result_cache.items() if float(val.get("expire", 0.0) or 0.0) <= now_ts
+            key
+            for key, val in _forward_result_cache.items()
+            if float(val.get("expire", 0.0) or 0.0) <= now_ts
         ]
         for key in expired_keys:
             _forward_result_cache.pop(key, None)
 
         if len(_forward_result_cache) >= FORWARD_PARSE_CACHE_MAX_SIZE:
-            _forward_result_cache.clear()
+            oldest_key = next(iter(_forward_result_cache))
+            _forward_result_cache.pop(oldest_key, None)
 
         _forward_result_cache[cache_key] = {
             "expire": now_ts + FORWARD_PARSE_CACHE_TTL_SEC,
             "context": context_text,
         }
+        logger.debug(f"[转发解析] 转发消息已缓存: {cache_key}")
 
 
 def _extract_completion_text(response: Any) -> str:
     if hasattr(response, "completion_text"):
         return str(getattr(response, "completion_text") or "").strip()
     if isinstance(response, dict):
-        return str(response.get("completion_text") or response.get("text") or "").strip()
+        return str(
+            response.get("completion_text") or response.get("text") or ""
+        ).strip()
     return str(response or "").strip()
 
 
@@ -135,13 +147,6 @@ def _inject_forward_context(req: ProviderRequest, context_text: str) -> None:
         req.prompt = user_question + context_prompt
 
 
-def _normalize_emoji_summary(summary: str) -> str:
-    text = str(summary or "").strip()
-    if text.startswith("[") and text.endswith("]"):
-        text = text[1:-1].strip()
-    return text
-
-
 def _build_forward_image_prefix(sender_name: str, seg_data: dict[str, Any]) -> str:
     if not _segment_is_emoji_image(seg_data):
         return ""
@@ -158,7 +163,9 @@ def _extract_core_quoted_image_caption(req: ProviderRequest, max_len: int = 280)
         return ""
 
     marker = "[Image Caption in quoted message]:"
-    xml_tag_pattern = re.compile(r"<image_caption>([\s\S]*?)</image_caption>", re.IGNORECASE)
+    xml_tag_pattern = re.compile(
+        r"<image_caption>([\s\S]*?)</image_caption>", re.IGNORECASE
+    )
     captions: list[str] = []
     for part in parts:
         text = getattr(part, "text", None)
@@ -198,14 +205,17 @@ def _build_caption_sig(text: str) -> str:
 
 
 async def extract_content_recursively(
+    client: Any,
     message_nodes: List[Dict[str, Any]],
     extracted_texts: list[str],
     image_urls: list[str],
     video_sources: list[str],
+    *,
     enable_json_parse: bool = True,
     depth: int = 0,
     max_depth: int = MAX_RECURSION_DEPTH,
 ) -> None:
+    """递归提取转发消息中的文本、图片 URL 和视频源。"""
     if depth > max_depth:
         logger.warning(f"forward_parser: 达到最大递归深度 ({max_depth})，停止解析。")
         extracted_texts.append("  " * depth + "[已达到最大转发嵌套深度，后续内容省略]")
@@ -228,74 +238,107 @@ async def extract_content_recursively(
             content_chain = raw_content
 
         node_text_parts: list[str] = []
-        has_only_forward = False
-        if isinstance(content_chain, list):
-            if len(content_chain) == 1 and isinstance(content_chain[0], dict) and content_chain[0].get("type") == "forward":
-                has_only_forward = True
+        for segment in content_chain:
+            if not isinstance(segment, dict):
+                continue
+            seg_type = segment.get("type")
+            seg_data = segment.get("data", {}) or {}
 
-            for segment in content_chain:
-                if not isinstance(segment, dict):
-                    continue
-                seg_type = segment.get("type")
-                seg_data = segment.get("data", {}) or {}
-
-                if seg_type == "text":
-                    text = seg_data.get("text", "")
-                    if text:
-                        node_text_parts.append(text)
-                elif seg_type == "image":
-                    url = seg_data.get("url")
-                    image_prefix = _build_forward_image_prefix(sender_name, seg_data)
-                    if url:
-                        image_urls.append(str(url))
-                        if image_prefix:
-                            node_text_parts.append(image_prefix)
-                        node_text_parts.append(f"[图片(来自:{sender_name})]")
-                elif seg_type == "video":
-                    url = seg_data.get("url")
-                    file_val = seg_data.get("file")
-                    if url:
-                        video_sources.append(str(url))
-                        node_text_parts.append(f"[视频(来自:{sender_name})]")
-                    elif file_val:
-                        video_sources.append(str(file_val))
-                        node_text_parts.append(f"[视频(来自:{sender_name})]")
-                elif seg_type == "file":
-                    file_name = seg_data.get("name") or seg_data.get("file_name") or seg_data.get("file") or "未知文件"
-                    node_text_parts.append(f"[文件(来自:{sender_name}): {file_name}]")
-                elif seg_type == "json":
-                    if not enable_json_parse:
-                        node_text_parts.append(f"[分享卡片(来自:{sender_name})]")
-                    else:
-                        raw_json = seg_data.get("data")
-                        if raw_json:
-                            raw_json_str = json.dumps(raw_json, ensure_ascii=False) if isinstance(raw_json, dict) else str(raw_json)
-                            news_texts, key_info = parse_json_segment_data(raw_json_str)
-                            if key_info:
-                                node_text_parts.append(f"[分享卡片(来自:{sender_name}): {key_info}]")
-                            elif news_texts:
-                                node_text_parts.append(f"[分享卡片摘要(来自:{sender_name}): {'；'.join(news_texts[:3])}]")
-                            else:
-                                node_text_parts.append(f"[分享卡片(来自:{sender_name}): 未提取到关键信息]")
-                        else:
-                            node_text_parts.append(f"[分享卡片(来自:{sender_name}): 未提取到关键信息]")
-                elif seg_type == "forward":
-                    nested_content = seg_data.get("content")
-                    if isinstance(nested_content, list):
-                        await extract_content_recursively(
-                            nested_content,
-                            extracted_texts,
-                            image_urls,
-                            video_sources,
-                            enable_json_parse=enable_json_parse,
-                            depth=depth + 1,
-                            max_depth=max_depth,
+            if seg_type == "text":
+                text = seg_data.get("text", "")
+                if text:
+                    node_text_parts.append(text)
+            elif seg_type == "image":
+                url = seg_data.get("url")
+                image_prefix = _build_forward_image_prefix(sender_name, seg_data)
+                if url:
+                    image_urls.append(str(url))
+                    if image_prefix:
+                        node_text_parts.append(image_prefix)
+                    node_text_parts.append(f"[图片(来自:{sender_name})]")
+            elif seg_type == "video":
+                url = seg_data.get("url")
+                file_val = seg_data.get("file")
+                if url:
+                    video_sources.append(str(url))
+                    node_text_parts.append(f"[视频(来自:{sender_name})]")
+                elif file_val:
+                    video_sources.append(str(file_val))
+                    node_text_parts.append(f"[视频(来自:{sender_name})]")
+            elif seg_type == "file":
+                file_name = (
+                    seg_data.get("name")
+                    or seg_data.get("file_name")
+                    or seg_data.get("file")
+                    or "未知文件"
+                )
+                node_text_parts.append(f"[文件(来自:{sender_name}): {file_name}]")
+            elif seg_type == "json":
+                if not enable_json_parse:
+                    node_text_parts.append(f"[分享卡片(来自:{sender_name})]")
+                else:
+                    raw_json = seg_data.get("data")
+                    if raw_json:
+                        raw_json_str = (
+                            json.dumps(raw_json, ensure_ascii=False)
+                            if isinstance(raw_json, dict)
+                            else str(raw_json)
                         )
+                        news_texts, key_info = parse_json_segment_data(raw_json_str)
+                        if key_info:
+                            node_text_parts.append(
+                                f"[分享卡片(来自:{sender_name}): {key_info}]"
+                            )
+                        elif news_texts:
+                            node_text_parts.append(
+                                f"[分享卡片摘要(来自:{sender_name}): {'；'.join(news_texts[:3])}]"
+                            )
+                        else:
+                            node_text_parts.append(
+                                f"[分享卡片(来自:{sender_name}): 未提取到关键信息]"
+                            )
                     else:
-                        node_text_parts.append("[转发消息内容缺失或格式错误]")
+                        node_text_parts.append(
+                            f"[分享卡片(来自:{sender_name}): 未提取到关键信息]"
+                        )
+            elif seg_type == "forward":
+                nested_content = seg_data.get("content")
+                nested_id = seg_data.get("id")
+                extracted_texts.append(f"{indent}{sender_name} 转发了聊天记录:")
+                if isinstance(nested_content, list):
+                    await extract_content_recursively(
+                        client,
+                        nested_content,
+                        extracted_texts,
+                        image_urls,
+                        video_sources,
+                        enable_json_parse=enable_json_parse,
+                        depth=depth + 1,
+                        max_depth=max_depth,
+                    )
+                elif nested_id:
+                    try:
+                        forward_data = await client.api.call_action(
+                            "get_forward_msg", id=nested_id
+                        )
+                        if forward_data and "messages" in forward_data:
+                            await extract_content_recursively(
+                                client,
+                                forward_data["messages"],
+                                extracted_texts,
+                                image_urls,
+                                video_sources,
+                                enable_json_parse=enable_json_parse,
+                                depth=depth + 1,
+                                max_depth=max_depth,
+                            )
+                    except Exception as e:
+                        logger.warning(
+                            f"[forward_parser] 递归获取转发消息失败 (id={nested_id}): {e}"
+                        )
 
         full_node_text = "".join(node_text_parts).strip()
-        if full_node_text and not has_only_forward:
+        if full_node_text:
             extracted_texts.append(f"{indent}{sender_name}: {full_node_text}")
 
 
@@ -304,8 +347,10 @@ async def extract_forward_content(
     forward_id: str,
     max_message_count: int,
     nested_parse_depth: int,
+    *,
     enable_json_parse: bool = True,
 ) -> Tuple[list[str], list[str], list[str]]:
+    """解析转发消息内容，返回（文本列表, 图片 URL 列表, 视频源列表）。"""
     extracted_texts: list[str] = []
     image_urls: list[str] = []
     video_sources: list[str] = []
@@ -320,10 +365,13 @@ async def extract_forward_content(
 
     messages = forward_data["messages"]
     if max_message_count > 0 and len(messages) > max_message_count:
-        logger.info(f"[Forward解析] 消息数量超出上限，已截断: before={len(messages)}, limit={max_message_count}")
+        logger.debug(
+            f"[转发解析] 消息数量超出上限，已截断: before={len(messages)}, limit={max_message_count}"
+        )
         messages = messages[:max_message_count]
 
     await extract_content_recursively(
+        client,
         messages,
         extracted_texts,
         image_urls,
@@ -358,17 +406,38 @@ async def _describe_forward_images(
 
     lines: list[str] = []
     for idx, url in enumerate(selected, 1):
-        try:
-            response = await vision_provider.text_chat(
-                prompt="用一句中文描述这张图片，包含主体、动作和场景，不超过50字。",
-                system_prompt="你是图片内容理解助手，请直接输出描述。",
-                image_urls=[url],
-                context=[],
-            )
-            desc = _extract_completion_text(response) or "未识别"
-        except Exception as e:
-            logger.debug(f"[Forward解析] 图片转述失败: idx={idx}, err={e}")
-            desc = "未识别"
+        desc = "未识别"
+        for attempt in (1, 2):
+            try:
+                response = await asyncio.wait_for(
+                    vision_provider.text_chat(
+                        prompt="用一句中文描述这张图片，包含主体、动作和场景，不超过50字。如果无法处理请直接回复【处理失败】。",
+                        system_prompt="你是图片内容理解助手，请直接输出描述。",
+                        image_urls=[url],
+                        context=[],
+                    ),
+                    timeout=60,
+                )
+                raw = _extract_completion_text(response)
+                if raw:
+                    if "处理失败" in raw:
+                        logger.warning(f"[转发解析] 图片转述被拒识: idx={idx}")
+                    else:
+                        desc = raw
+                        break
+                else:
+                    logger.warning(f"[转发解析] 图片转述响应为空: idx={idx}")
+            except asyncio.TimeoutError:
+                logger.warning(f"[转发解析] 图片转述超时: idx={idx}")
+                if attempt == 1:
+                    await asyncio.sleep(2)
+                    continue
+            except Exception as e:
+                logger.debug(f"[转发解析] 图片转述失败: idx={idx}, err={e}")
+                if attempt == 1:
+                    await asyncio.sleep(2)
+                    continue
+            break
         lines.append(desc)
     return lines
 
@@ -403,16 +472,22 @@ async def _transcribe_forward_video_audio(
                     try:
                         os.remove(cleanup_path)
                     except Exception as e:
-                        logger.debug(f"[Forward解析] 转发视频 LLM 临时音频清理失败: path={cleanup_path}, err={e}")
+                        logger.debug(
+                            f"[转发解析] 转发视频 LLM 临时音频清理失败: path={cleanup_path}, err={e}"
+                        )
             except Exception as e:
-                logger.debug(f"[Forward解析] 转发视频 ASR 失败: idx={idx + 1}, err={e}")
+                logger.debug(f"[转发解析] 转发视频 ASR 失败: idx={idx + 1}, err={e}")
             finally:
                 try:
                     os.remove(wav_path)
                 except Exception as e:
-                    logger.debug(f"[Forward解析] 转发视频 WAV 清理失败: path={wav_path}, err={e}")
+                    logger.debug(
+                        f"[转发解析] 转发视频 WAV 清理失败: path={wav_path}, err={e}"
+                    )
         except Exception as e:
-            logger.debug(f"[Forward解析] 转发视频音频提取失败: idx={idx + 1}, path={lv_path}, err={e}")
+            logger.debug(
+                f"[转发解析] 转发视频音频提取失败: idx={idx + 1}, path={lv_path}, err={e}"
+            )
     return lines
 
 
@@ -431,15 +506,23 @@ async def _build_forward_video_lines(
         else:
             for idx, frame in enumerate(frame_paths, 1):
                 try:
-                    response = await vision_provider.text_chat(
-                        prompt=f"描述这帧画面内容（第{idx}帧），关注主体动作、场景和画面文字，不超过50字。",
-                        system_prompt="你是视频帧分析助手，请直接输出描述。",
-                        image_urls=[frame],
-                        context=[],
+                    response = await asyncio.wait_for(
+                        vision_provider.text_chat(
+                            prompt=f"描述这帧画面内容（第{idx}帧），关注主体动作、场景和画面文字，不超过50字。如果无法处理请直接回复【处理失败】。",
+                            system_prompt="你是视频帧分析助手，请直接输出描述。",
+                            image_urls=[frame],
+                            context=[],
+                        ),
+                        timeout=60,
                     )
                     desc = _extract_completion_text(response) or "未识别"
+                except asyncio.TimeoutError:
+                    logger.warning(f"[转发解析] 转发视频关键帧识别超时: idx={idx}")
+                    desc = "未识别"
                 except Exception as e:
-                    logger.debug(f"[Forward解析] 转发视频关键帧识别失败: idx={idx}, err={e}")
+                    logger.debug(
+                        f"[转发解析] 转发视频关键帧识别失败: idx={idx}, err={e}"
+                    )
                     desc = "未识别"
                 lines.append(f"[视频关键帧 {idx}] {desc}")
 
@@ -459,7 +542,9 @@ def _embed_media_into_records(
     records: list[str] = []
     image_idx = 0
     has_video_placeholder = False
-    video_inline = "；".join([str(x).strip() for x in video_lines if str(x).strip()][:4]).strip()
+    video_inline = "；".join(
+        [str(x).strip() for x in video_lines if str(x).strip()][:4]
+    ).strip()
 
     for line in base_records:
         curr_line = str(line or "")
@@ -506,7 +591,9 @@ def _build_forward_context_text(
     if merged_records:
         sections.append("原始聊天记录:\n" + "\n".join(merged_records))
     if core_quote_image_caption:
-        sections.append(f"引用图片补充说明（来自框架转述）:\n{core_quote_image_caption}")
+        sections.append(
+            f"引用图片补充说明（来自框架转述）:\n{core_quote_image_caption}"
+        )
     return "\n\n".join(sections).strip()
 
 
@@ -530,10 +617,14 @@ async def process_forward_record_content(
 
     try:
         max_forward_messages = int(get_cfg("forward_message_max_count", 50) or 50)
-        nested_parse_depth = int(get_cfg("nested_parse_depth", MAX_RECURSION_DEPTH) or MAX_RECURSION_DEPTH)
+        nested_parse_depth = int(
+            get_cfg("nested_parse_depth", MAX_RECURSION_DEPTH) or MAX_RECURSION_DEPTH
+        )
         json_parse_enable = bool(get_cfg("json_parse_enable", True))
         max_forward_video_count = int(get_cfg("forward_video_max_count", 2) or 2)
-        max_forward_video_frame_count = int(get_cfg("forward_video_max_frame_count", 1) or 1)
+        max_forward_video_frame_count = int(
+            get_cfg("forward_video_max_frame_count", 1) or 1
+        )
         frame_interval_sec = int(get_cfg("video_frame_interval_sec", 12) or 12)
         max_mb = int(get_cfg("video_max_size_mb", 50) or 50)
         asr_enabled = bool(get_cfg("video_asr_enable", True))
@@ -541,10 +632,6 @@ async def process_forward_record_content(
         core_quote_image_caption = _extract_core_quoted_image_caption(req)
         core_quote_image_caption_exists = bool(core_quote_image_caption)
         core_quote_image_caption_sig = _build_caption_sig(core_quote_image_caption)
-        logger.debug(
-            f"[Forward解析] Core图片转述检测: exists={core_quote_image_caption_exists}, "
-            f"caption_len={len(core_quote_image_caption)}, sig={core_quote_image_caption_sig}"
-        )
         result_cache_key = _build_forward_result_cache_key(
             forward_id=forward_id,
             max_message_count=max_forward_messages,
@@ -563,12 +650,16 @@ async def process_forward_record_content(
         if cached_context:
             _inject_forward_context(req, cached_context)
             logger.debug(
-                f"[Forward解析] 最终上下文缓存命中: forward_id={forward_id}, context_len={len(cached_context)}"
+                f"[转发解析] 最终上下文缓存命中: forward_id={forward_id}, context_len={len(cached_context)}",
             )
             await cleanup_paths(getattr(req, "_cleanup_paths", []))
             return True
 
-        extracted_texts, image_urls, forward_video_sources = await extract_forward_content(
+        (
+            extracted_texts,
+            image_urls,
+            forward_video_sources,
+        ) = await extract_forward_content(
             event.bot,
             forward_id,
             max_message_count=max_forward_messages,
@@ -580,14 +671,22 @@ async def process_forward_record_content(
 
         vision_provider = get_vision_provider(event)
         if core_quote_image_caption_exists and image_urls:
-            logger.debug("[Forward解析] 检测到 Core 已完成引用图片转述，跳过转发图片二次转述。")
+            logger.debug(
+                "[转发解析] 检测到 Core 已完成引用图片转述，跳过转发图片二次转述。"
+            )
             image_lines = []
         else:
-            image_lines = await _describe_forward_images(image_urls, vision_provider, max_forward_images)
+            image_lines = await _describe_forward_images(
+                image_urls, vision_provider, max_forward_images
+            )
 
         video_lines: list[str] = []
-        if forward_video_sources and max_forward_video_count > 0 and max_forward_video_frame_count > 0:
-            f_frames, f_cleanup, f_local_videos = await extract_forward_video_keyframes(
+        if (
+            forward_video_sources
+            and max_forward_video_count > 0
+            and max_forward_video_frame_count > 0
+        ):
+            f_frames, f_cleanup, f_local_videos = await extract_forward_media_keyframes(
                 event,
                 forward_video_sources,
                 max_count=max_forward_video_count,
@@ -596,7 +695,7 @@ async def process_forward_record_content(
                 ffmpeg_path=get_cfg("ffmpeg_path", ""),
                 max_mb=max_mb,
                 max_duration=7200,
-                timeout_sec=10,
+                timeout_sec=60,
             )
             if f_cleanup:
                 await _schedule_delayed_cleanup(f_cleanup, delay_sec=60)
@@ -630,7 +729,7 @@ async def process_forward_record_content(
         _inject_forward_context(req, context_text)
         logger.info(
             f"[转发消息] 成功注入完整解析内容: text={len(extracted_texts)}, image={len(image_lines)}, "
-            f"video={len(video_lines)}, context_len={len(context_text)}"
+            f"video={len(video_lines)}, context_len={len(context_text)}",
         )
 
         await cleanup_paths(getattr(req, "_cleanup_paths", []))

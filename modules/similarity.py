@@ -2,9 +2,16 @@ import asyncio
 import math
 import re
 from collections import defaultdict, deque, OrderedDict
-from typing import Any
+from typing import Any, TypedDict
 
 import jieba
+
+
+class GroupData(TypedDict):
+    idf: defaultdict[str, int]
+    total_docs: int
+    docs: deque[set[str]]
+
 
 class Similarity:
     """
@@ -20,18 +27,33 @@ class Similarity:
         token_cache_size: int = 1024,
     ):
         """初始化相关性计算参数。"""
-        self._GROUP_DATA = defaultdict(
-            lambda: {
-                "idf": defaultdict(int),
-                "total_docs": 0,
-                "docs": deque(),
-            }
+        self._GROUP_DATA: defaultdict[str, GroupData] = defaultdict(
+            lambda: GroupData(
+                idf=defaultdict(int),
+                total_docs=0,
+                docs=deque(),
+            ),
         )
 
         self.stopwords = stopwords or {
-            "的", "了", "吗", "吧", "啊", "哦", "嗯", "恩",
-            "你", "我", "他", "她", "它", "这", "那", "就",
-            "都", "又",
+            "的",
+            "了",
+            "吗",
+            "吧",
+            "啊",
+            "哦",
+            "嗯",
+            "恩",
+            "你",
+            "我",
+            "他",
+            "她",
+            "它",
+            "这",
+            "那",
+            "就",
+            "都",
+            "又",
         }
 
         self.bot_template_threshold = bot_template_threshold
@@ -51,7 +73,7 @@ class Similarity:
                     texts.append(item)
                 elif isinstance(item, dict) and "text" in item:
                     texts.append(item["text"])
-                elif hasattr(item, "text"): # 处理可能的消息对象
+                elif hasattr(item, "text"):  # 处理可能的消息对象。
                     texts.append(getattr(item, "text"))
             return " ".join(texts)
         return str(msg)
@@ -62,7 +84,18 @@ class Similarity:
             return False
         if "?" in s or "？" in s:
             return True
-        cues = ("请问", "求教", "求助", "怎么", "如何", "为什么", "啥意思", "什么", "吗", "呢")
+        cues = (
+            "请问",
+            "求教",
+            "求助",
+            "怎么",
+            "如何",
+            "为什么",
+            "啥意思",
+            "什么",
+            "吗",
+            "呢",
+        )
         return any(c in s for c in cues)
 
     def _has_min_semantic_content(self, text: str, tokens: list[str]) -> bool:
@@ -70,7 +103,7 @@ class Similarity:
         if len(tokens) >= 2:
             return True
 
-        # 单 token 时，要求至少有 3 个连续中文，避免“在吗/啊/嗯”这类空泛触发
+        # 单 token 时，要求至少有 3 个连续中文，避免“在吗/啊/嗯”这类空泛触发。
         zh_spans = re.findall(r"[\u4e00-\u9fa5]{3,}", text)
         if zh_spans:
             return True
@@ -145,15 +178,13 @@ class Similarity:
         for m_raw in msgs:
             if not m_raw:
                 continue
-            
+
             m = self._to_plain_text(m_raw)
 
-            # 去重
             if m in seen:
                 continue
             seen.add(m)
 
-            # 噪音过滤
             if self._is_noise_msg(m):
                 continue
 
@@ -168,20 +199,20 @@ class Similarity:
 
     def _update_idf(self, group_id: str, tokens: set):
         data = self._GROUP_DATA[group_id]
-        docs = data["docs"]  # type: ignore
+        docs = data["docs"]
 
         while len(docs) >= self.idf_window_docs:
             old_tokens = docs.popleft()
             for t in old_tokens:
-                data["idf"][t] -= 1  # type: ignore
-                if data["idf"][t] <= 0:  # type: ignore
-                    del data["idf"][t]  # type: ignore
-            data["total_docs"] = max(0, data["total_docs"] - 1)  # type: ignore
+                data["idf"][t] -= 1
+                if data["idf"][t] <= 0:
+                    del data["idf"][t]
+            data["total_docs"] = max(0, data["total_docs"] - 1)
 
         docs.append(tokens)
         for t in tokens:
-            data["idf"][t] += 1 # type: ignore
-        data["total_docs"] += 1  # type: ignore
+            data["idf"][t] += 1
+        data["total_docs"] += 1
 
     def _tfidf_vector(self, group_id: str, tokens: list):
         data = self._GROUP_DATA[group_id]
@@ -193,7 +224,7 @@ class Similarity:
 
         vec = {}
         for t, c in tf.items():
-            idf = math.log((total_docs + 1) / (data["idf"][t] + 1)) + 1  # type: ignore
+            idf = math.log((total_docs + 1) / (data["idf"][t] + 1)) + 1
             vec[t] = c * idf
 
         return vec
@@ -235,9 +266,10 @@ class Similarity:
         if self._is_noise_msg(raw_user):
             return 0.0
 
-        # 分词
         user_tokens = await self._tokenize(raw_user)
-        if (not user_tokens) or (not self._has_min_semantic_content(raw_user, user_tokens)):
+        if (not user_tokens) or (
+            not self._has_min_semantic_content(raw_user, user_tokens)
+        ):
             return 0.0
 
         # 更新历史（可关闭）

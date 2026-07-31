@@ -8,12 +8,12 @@ from dataclasses import dataclass, field
 from html import unescape
 from typing import Any, Dict, List, Optional
 from urllib.parse import parse_qs, urljoin, urlparse
+import aiohttp
 
 import astrbot.api.message_components as Comp
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent
 
-import aiohttp
 
 URL_REGEX = re.compile(r"https?://[^\s<>'\"`]+", flags=re.IGNORECASE)
 TRAILING_PUNCTUATION = ".,!?;:，。！？；：）】》」’”"
@@ -71,11 +71,11 @@ DOWNLOAD_QUERY_HINTS = {
 }
 DEFAULT_TIMEOUT_SEC = 8
 DEFAULT_MAX_DOWNLOAD_KB = 512
-DEFAULT_CACHE_TTL_SEC = 600
+DEFAULT_CACHE_TTL_SEC = 86400
 MAX_URL_INJECT_COUNT = 3
 MAX_REDIRECTS = 5
 MAX_INJECT_CHARS_PER_URL = 600
-URL_CACHE_MAX_SIZE = 256
+URL_CACHE_MAX_SIZE = 100
 
 _url_inject_cache: Dict[str, Dict[str, Any]] = {}
 _url_inject_cache_lock = asyncio.Lock()
@@ -85,7 +85,6 @@ _url_inject_cache_lock = asyncio.Lock()
 class UrlInjectResult:
     injected: bool = False
     details: List[str] = field(default_factory=list)
-
 
 
 def _is_error_summary(summary: str) -> bool:
@@ -133,7 +132,7 @@ def _strip_html(html: str) -> str:
     article_match = re.search(
         r'<(?:article|main|div[^>]*?(?:class|id)=["\'][^"\']*(?:content|article|post|entry|main|body)[^"\']*["\'][^>]*)>([\s\S]*?)</(?:article|main|div)>',
         html,
-        flags=re.IGNORECASE
+        flags=re.IGNORECASE,
     )
     if article_match:
         text_source = article_match.group(0)
@@ -144,7 +143,12 @@ def _strip_html(html: str) -> str:
     text = re.sub(r"<script[\s\S]*?</script>", " ", text_source, flags=re.IGNORECASE)
     text = re.sub(r"<style[\s\S]*?</style>", " ", text, flags=re.IGNORECASE)
     text = re.sub(r"<!--[\s\S]*?-->", " ", text)  # 删除HTML注释
-    text = re.sub(r"<(?:nav|header|footer|aside|menu|sidebar)[\s\S]*?</(?:nav|header|footer|aside|menu|sidebar)>", " ", text, flags=re.IGNORECASE)
+    text = re.sub(
+        r"<(?:nav|header|footer|aside|menu|sidebar)[\s\S]*?</(?:nav|header|footer|aside|menu|sidebar)>",
+        " ",
+        text,
+        flags=re.IGNORECASE,
+    )
 
     # 3. 删除所有标签
     text = re.sub(r"<[^>]+>", " ", text)
@@ -175,7 +179,7 @@ def _detect_cloudflare(html: str, headers: Dict[str, str]) -> bool:
         "enable javascript and cookies",
         "checking your browser",
         "ddos protection by cloudflare",
-        "ray id:",  # Cloudflare Ray ID
+        "ray id:",  # Cloudflare 风控标识（Ray ID）
     ]
     if any(keyword in html_lower for keyword in cf_keywords):
         return True
@@ -184,7 +188,9 @@ def _detect_cloudflare(html: str, headers: Dict[str, str]) -> bool:
 
 
 def _extract_title(html: str) -> str:
-    match = re.search(r"<title[^>]*>(.*?)</title>", html, flags=re.IGNORECASE | re.DOTALL)
+    match = re.search(
+        r"<title[^>]*>(.*?)</title>", html, flags=re.IGNORECASE | re.DOTALL
+    )
     if not match:
         return ""
     return _normalize_text(unescape(match.group(1)), 120)
@@ -192,7 +198,7 @@ def _extract_title(html: str) -> str:
 
 def _extract_meta_description(html: str) -> str:
     """提取 meta description，优先 Open Graph 和 Twitter Cards"""
-    # 优先级：og:description > twitter:description > name="description"
+    # 优先级：og:description > twitter:description > name="description"。
     for pattern in [
         r'property="og:description"[^>]+content="([^"]*)"',
         r'content="([^"]*)"[^>]+property="og:description"',
@@ -302,7 +308,7 @@ def _is_domain_blocked(host: str, blocked_domains: List[str]) -> bool:
         domain = _normalize_domain(item)
         if not domain:
             continue
-        if normalized_host == domain or normalized_host.endswith("." + domain):
+        if domain in normalized_host:
             return True
     return False
 
@@ -312,7 +318,12 @@ def _is_private_ip(ip_text: str) -> bool:
         ip_obj = ipaddress.ip_address(ip_text)
     except Exception:
         return False
-    if ip_obj.is_loopback or ip_obj.is_link_local or ip_obj.is_multicast or ip_obj.is_unspecified:
+    if (
+        ip_obj.is_loopback
+        or ip_obj.is_link_local
+        or ip_obj.is_multicast
+        or ip_obj.is_unspecified
+    ):
         return True
     return ip_obj.is_private
 
@@ -381,7 +392,13 @@ def _is_html_like_content_type(content_type: str) -> bool:
     ct = str(content_type or "").split(";", 1)[0].strip().lower()
     if not ct:
         return True
-    if ct in {"text/html", "application/xhtml+xml", "text/plain", "application/json", "text/markdown"}:
+    if ct in {
+        "text/html",
+        "application/xhtml+xml",
+        "text/plain",
+        "application/json",
+        "text/markdown",
+    }:
         return True
     if ct.startswith("text/"):
         return True
@@ -417,11 +434,16 @@ async def _set_cached_summary(cache_key: str, summary: str, ttl_sec: int) -> Non
     ttl_sec = max(1, int(ttl_sec))
     now_ts = time.time()
     async with _url_inject_cache_lock:
-        expired_keys = [key for key, val in _url_inject_cache.items() if float(val.get("expire", 0.0) or 0.0) <= now_ts]
+        expired_keys = [
+            key
+            for key, val in _url_inject_cache.items()
+            if float(val.get("expire", 0.0) or 0.0) <= now_ts
+        ]
         for key in expired_keys:
             _url_inject_cache.pop(key, None)
         if len(_url_inject_cache) >= URL_CACHE_MAX_SIZE:
-            _url_inject_cache.clear()
+            oldest_key = next(iter(_url_inject_cache))
+            _url_inject_cache.pop(oldest_key, None)
         _url_inject_cache[cache_key] = {"expire": now_ts + ttl_sec, "summary": text}
 
 
@@ -429,6 +451,7 @@ async def _fetch_by_aiohttp(
     url: str,
     timeout_sec: int,
     max_bytes: int,
+    *,
     should_block_private_network: bool,
     blocked_domains: List[str],
 ) -> Optional[Dict[str, Any]]:
@@ -444,16 +467,28 @@ async def _fetch_by_aiohttp(
                 host = str(parsed.hostname or "").strip().lower()
                 if _is_domain_blocked(host, blocked_domains):
                     return {"blocked": True, "reason": "blocked_domain", "url": current}
-                if should_block_private_network and await _is_private_network_url(current):
-                    return {"blocked": True, "reason": "private_network", "url": current}
+                if should_block_private_network and await _is_private_network_url(
+                    current
+                ):
+                    return {
+                        "blocked": True,
+                        "reason": "private_network",
+                        "url": current,
+                    }
 
-                async with session.get(current, timeout=timeout_sec, allow_redirects=False) as resp:
+                async with session.get(
+                    current, timeout=timeout_sec, allow_redirects=False
+                ) as resp:
                     status = int(resp.status)
-                    resp_headers = {str(k).lower(): str(v) for k, v in resp.headers.items()}
+                    resp_headers = {
+                        str(k).lower(): str(v) for k, v in resp.headers.items()
+                    }
                     if 300 <= status < 400:
                         location = str(resp_headers.get("location") or "").strip()
                         if not location:
-                            return {"error": f"redirect_without_location(status={status})"}
+                            return {
+                                "error": f"redirect_without_location(status={status})"
+                            }
                         current = urljoin(current, location)
                         continue
 
@@ -481,14 +516,7 @@ async def _fetch_by_aiohttp(
                         "truncated": truncated,
                         "final_url": current,
                     }
-    except Exception as e:
-        parsed = urlparse(str(url or ""))
-        host = str(parsed.hostname or "").strip().lower()
-        logger.debug(
-            "[LLMEnhancement] URL 解析 aiohttp 抓取失败: "
-            f"url={url}, host={host or 'unknown'}, timeout_sec={timeout_sec}, "
-            f"exc_type={type(e).__name__}, err={_preview_text(repr(e), 240)}"
-        )
+    except Exception:
         return None
 
 
@@ -496,6 +524,7 @@ async def _fetch_by_urllib(
     url: str,
     timeout_sec: int,
     max_bytes: int,
+    *,
     should_block_private_network: bool,
     blocked_domains: List[str],
 ) -> Dict[str, Any]:
@@ -504,17 +533,24 @@ async def _fetch_by_urllib(
 
     def _do() -> Dict[str, Any]:
         current = url
-        opener = urllib.request.build_opener(urllib.request.HTTPHandler, urllib.request.HTTPSHandler)
+        opener = urllib.request.build_opener(
+            urllib.request.HTTPHandler, urllib.request.HTTPSHandler
+        )
         opener.addheaders = [
             ("User-Agent", "AstrBot-LLMEnhancement/1.0"),
-            ("Accept", "text/html,application/xhtml+xml,text/plain,application/json,*/*;q=0.8"),
+            (
+                "Accept",
+                "text/html,application/xhtml+xml,text/plain,application/json,*/*;q=0.8",
+            ),
         ]
         for _ in range(MAX_REDIRECTS + 1):
             try:
                 req = urllib.request.Request(current, method="GET")
                 with opener.open(req, timeout=timeout_sec) as resp:
                     final_url = str(resp.geturl() or current)
-                    headers = {str(k).lower(): str(v) for k, v in dict(resp.headers).items()}
+                    headers = {
+                        str(k).lower(): str(v) for k, v in dict(resp.headers).items()
+                    }
                     status = int(getattr(resp, "status", 200) or 200)
                     cl = headers.get("content-length")
                     if cl and cl.isdigit() and int(cl) > max_bytes:
@@ -573,7 +609,9 @@ async def _try_tavily_extract(
         key = keys[attempt]
         try:
             timeout = aiohttp.ClientTimeout(total=timeout_sec)
-            async with aiohttp.ClientSession(timeout=timeout, trust_env=True) as session:
+            async with aiohttp.ClientSession(
+                timeout=timeout, trust_env=True
+            ) as session:
                 async with session.post(
                     "https://api.tavily.com/extract",
                     json={"urls": [url], "extract_depth": "basic"},
@@ -585,8 +623,8 @@ async def _try_tavily_extract(
                     if resp.status != 200:
                         reason = await resp.text()
                         logger.warning(
-                            f"[LLMEnhancement] Tavily 提取第 {attempt+1}/{max_attempts} 次失败 "
-                            f"(HTTP {resp.status}): {reason}"
+                            f"[LLMEnhancement] Tavily 提取第 {attempt + 1}/{max_attempts} 次失败 "
+                            f"(HTTP {resp.status}): {reason}",
                         )
                         continue
                     data = await resp.json()
@@ -595,15 +633,72 @@ async def _try_tavily_extract(
                         continue
                     raw_content = results[0].get("raw_content", "").strip()
                     if raw_content:
-                        return _normalize_text(raw_content, limit=MAX_INJECT_CHARS_PER_URL)
+                        return _normalize_text(
+                            raw_content, limit=MAX_INJECT_CHARS_PER_URL
+                        )
         except asyncio.TimeoutError:
             logger.warning(
-                f"[LLMEnhancement] Tavily 提取第 {attempt+1}/{max_attempts} 次超时"
+                f"[LLMEnhancement] Tavily 提取第 {attempt + 1}/{max_attempts} 次超时",
             )
             continue
         except Exception as e:
             logger.warning(
-                f"[LLMEnhancement] Tavily 提取第 {attempt+1}/{max_attempts} 次异常: {e}"
+                f"[LLMEnhancement] Tavily 提取第 {attempt + 1}/{max_attempts} 次异常: {e}",
+            )
+            continue
+    return None
+
+
+async def _try_exa_extract(
+    url: str,
+    api_keys: List[str],
+    timeout_sec: int,
+) -> Optional[str]:
+    if not api_keys:
+        return None
+    keys = list(api_keys)
+    random.shuffle(keys)
+    max_attempts = min(2, len(keys))
+    for attempt in range(max_attempts):
+        key = keys[attempt]
+        try:
+            timeout = aiohttp.ClientTimeout(total=timeout_sec)
+            async with aiohttp.ClientSession(
+                timeout=timeout, trust_env=True
+            ) as session:
+                async with session.post(
+                    "https://api.exa.ai/contents",
+                    json={
+                        "ids": [url],
+                        "text": {"maxCharacters": MAX_INJECT_CHARS_PER_URL},
+                    },
+                    headers={
+                        "x-api-key": key,
+                        "Content-Type": "application/json",
+                    },
+                ) as resp:
+                    if resp.status != 200:
+                        reason = await resp.text()
+                        logger.warning(
+                            f"[LLMEnhancement] Exa 提取第 {attempt + 1}/{max_attempts} 次失败 "
+                            f"(HTTP {resp.status}): {reason}",
+                        )
+                        continue
+                    data = await resp.json()
+                    results = data.get("results", [])
+                    if not results:
+                        continue
+                    text = results[0].get("text", "").strip()
+                    if text:
+                        return _normalize_text(text, limit=MAX_INJECT_CHARS_PER_URL)
+        except asyncio.TimeoutError:
+            logger.warning(
+                f"[LLMEnhancement] Exa 提取第 {attempt + 1}/{max_attempts} 次超时",
+            )
+            continue
+        except Exception as e:
+            logger.warning(
+                f"[LLMEnhancement] Exa 提取第 {attempt + 1}/{max_attempts} 次异常: {e}",
             )
             continue
     return None
@@ -613,9 +708,11 @@ async def _fetch_url_summary(
     url: str,
     timeout_sec: int,
     max_bytes: int,
+    *,
     should_block_private_network: bool,
     blocked_domains: List[str],
-    tavily_api_keys: Optional[List[str]] = None,
+    url_parse_provider: str = "exa",
+    url_parse_api_keys: Optional[List[str]] = None,
 ) -> str:
     parsed = urlparse(url)
     host = str(parsed.hostname or "").strip().lower()
@@ -629,10 +726,17 @@ async def _fetch_url_summary(
     if _looks_like_download_url(url):
         return f"链接 {url} 看起来是下载链接，请先下载文件后再发送文件内容进行解析。"
 
-    if tavily_api_keys:
-        tavily_result = await _try_tavily_extract(url, tavily_api_keys, timeout_sec)
-        if tavily_result is not None:
-            return tavily_result
+    if url_parse_api_keys:
+        if url_parse_provider == "exa":
+            provider_result = await _try_exa_extract(
+                url, url_parse_api_keys, timeout_sec
+            )
+        else:
+            provider_result = await _try_tavily_extract(
+                url, url_parse_api_keys, timeout_sec
+            )
+        if provider_result is not None:
+            return provider_result
 
     response = await _fetch_by_aiohttp(
         url=url,
@@ -642,10 +746,6 @@ async def _fetch_url_summary(
         blocked_domains=blocked_domains,
     )
     if response is None:
-        logger.debug(
-            "[LLMEnhancement] URL 解析 aiohttp 抓取失败，回退 urllib: "
-            f"url={url}, timeout_sec={timeout_sec}, max_bytes={max_bytes}"
-        )
         response = await _fetch_by_urllib(
             url=url,
             timeout_sec=timeout_sec,
@@ -705,16 +805,15 @@ async def _fetch_url_summary(
     final_url = str(response.get("final_url") or url)
 
     if not snippet and not meta_desc:
-        return (
-            f"链接 {final_url} 已访问，但未提取到有效正文。"
-            + ("（已按下载上限截断）" if truncated else "")
+        return f"链接 {final_url} 已访问，但未提取到有效正文。" + (
+            "（已按下载上限截断）" if truncated else ""
         )
 
     suffix = "（已按下载上限截断）" if truncated else ""
 
-    # 优先使用 meta description，如果有的话
+    # 优先使用 meta description，如果有的话。
     if meta_desc and not snippet:
-        # 只有 meta 描述，没有正文
+        # 只有 meta 描述，没有正文。
         if title:
             return f"链接 {final_url} 的页面信息：标题《{title}》；描述：{meta_desc}{suffix}"
         return f"链接 {final_url} 的页面描述：{meta_desc}{suffix}"
@@ -735,10 +834,13 @@ async def extract_url_infos_from_chain(
     chain: List[Any],
     timeout_sec: int = DEFAULT_TIMEOUT_SEC,
     max_download_kb: int = DEFAULT_MAX_DOWNLOAD_KB,
+    *,
     block_private_network: bool = True,
     blocked_domains: Optional[List[str]] = None,
-    tavily_api_keys: Optional[List[str]] = None,
+    url_parse_provider: str = "exa",
+    url_parse_api_keys: Optional[List[str]] = None,
 ) -> UrlInjectResult:
+    """从消息链中提取所有 URL 并获取页面摘要信息，返回 UrlInjectResult。"""
     result = UrlInjectResult()
     urls = _extract_urls_from_chain(event, chain)
     if not urls:
@@ -753,14 +855,20 @@ async def extract_url_infos_from_chain(
     except Exception:
         max_download_kb = DEFAULT_MAX_DOWNLOAD_KB
 
-    blocked_domains = [str(x or "").strip() for x in (blocked_domains or []) if str(x or "").strip()]
-    should_block_private_network = bool(block_private_network) and (not bool(event.is_admin()))
+    blocked_domains = [
+        str(x or "").strip() for x in (blocked_domains or []) if str(x or "").strip()
+    ]
+    should_block_private_network = bool(block_private_network) and (
+        not bool(event.is_admin())
+    )
     max_bytes = max_download_kb * 1024
-    blocked_domains_sig = "|".join(sorted(_normalize_domain(x) for x in blocked_domains if _normalize_domain(x)))
+    blocked_domains_sig = "|".join(
+        sorted(_normalize_domain(x) for x in blocked_domains if _normalize_domain(x))
+    )
 
     summaries: List[str] = []
     for url in urls[:MAX_URL_INJECT_COUNT]:
-        # B站 URL 优先走 API 元数据（分支替代普通网页抓取）
+        # B站 URL 优先走 API 元数据（分支替代普通网页抓取）。
         bili_text = await _try_fetch_single_bili_metadata(url)
         if bili_text:
             summaries.append(bili_text)
@@ -768,7 +876,8 @@ async def extract_url_infos_from_chain(
 
         cache_key = (
             f"{url}|{timeout_sec}|{max_download_kb}|"
-            f"private={int(should_block_private_network)}|blocked={blocked_domains_sig}"
+            f"private={int(should_block_private_network)}|blocked={blocked_domains_sig}|"
+            f"provider={url_parse_provider}|keys_hash={hash(str(url_parse_api_keys))}"
         )
         summary = await _get_cached_summary(cache_key)
         if not summary:
@@ -778,25 +887,19 @@ async def extract_url_infos_from_chain(
                 max_bytes=max_bytes,
                 should_block_private_network=should_block_private_network,
                 blocked_domains=blocked_domains,
-                tavily_api_keys=tavily_api_keys,
+                url_parse_provider=url_parse_provider,
+                url_parse_api_keys=url_parse_api_keys,
             )
             if summary:
                 await _set_cached_summary(cache_key, summary, DEFAULT_CACHE_TTL_SEC)
 
-        # 只注入成功解析的内容，跳过失败/被拦截/下载链接等错误消息
+        # 只注入成功解析的内容，跳过失败/被拦截/下载链接等错误消息。
         if summary and not _is_error_summary(summary):
             summaries.append(_normalize_text(summary, limit=MAX_INJECT_CHARS_PER_URL))
 
     if summaries:
         result.injected = True
         result.details = summaries
-        logger.debug(
-            "[LLMEnhancement] URL 注入完成: "
-            f"url_count={len(urls[:MAX_URL_INJECT_COUNT])}, injected_count={len(summaries)}, "
-            f"timeout_sec={timeout_sec}, max_download_kb={max_download_kb}, "
-            f"block_private={bool(block_private_network)}, admin_bypass={bool(event.is_admin())}, "
-            f"effective_block_private={should_block_private_network}"
-        )
     return result
 
 
@@ -805,12 +908,17 @@ async def extract_url_summary_from_text(
     max_urls: int = 3,
     timeout_sec: int = DEFAULT_TIMEOUT_SEC,
     max_download_kb: int = DEFAULT_MAX_DOWNLOAD_KB,
-    tavily_api_keys: Optional[List[str]] = None,
+    url_parse_provider: str = "exa",
+    url_parse_api_keys: Optional[List[str]] = None,
+    blocked_domains: Optional[List[str]] = None,
 ) -> str:
     """从纯文本中提取 URL，分别尝试 B站元数据（API）或普通网页摘要，返回已合并的摘要文本。"""
     urls = _extract_urls_from_text(text)
     if not urls:
         return ""
+    blocked_domains = [
+        str(x or "").strip() for x in (blocked_domains or []) if str(x or "").strip()
+    ]
     max_bytes = max_download_kb * 1024
     summaries: list[str] = []
     for url in urls[:max_urls]:
@@ -823,8 +931,9 @@ async def extract_url_summary_from_text(
             timeout_sec=timeout_sec,
             max_bytes=max_bytes,
             should_block_private_network=False,
-            blocked_domains=[],
-            tavily_api_keys=tavily_api_keys,
+            blocked_domains=blocked_domains,
+            url_parse_provider=url_parse_provider,
+            url_parse_api_keys=url_parse_api_keys,
         )
         if summary and not _is_error_summary(summary):
             summaries.append(_normalize_text(summary, limit=MAX_INJECT_CHARS_PER_URL))
@@ -832,8 +941,8 @@ async def extract_url_summary_from_text(
 
 
 _BILI_PATTERNS = [
-    re.compile(r'https?://www\.bilibili\.com/video/(BV\w+)', re.IGNORECASE),
-    re.compile(r'https?://b23\.tv/(\w+)', re.IGNORECASE),
+    re.compile(r"https?://www\.bilibili\.com/video/(BV\w+)", re.IGNORECASE),
+    re.compile(r"https?://b23\.tv/(\w+)", re.IGNORECASE),
 ]
 _BILI_API_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -866,10 +975,14 @@ async def _try_fetch_single_bili_metadata(url: str) -> Optional[str]:
             code = m.group(1)
             if pat is _BILI_PATTERNS[1]:
                 try:
-                    async with aiohttp.ClientSession(headers=_BILI_API_HEADERS, trust_env=True) as sess:
-                        async with sess.head(url, allow_redirects=True, timeout=10) as resp:
+                    async with aiohttp.ClientSession(
+                        headers=_BILI_API_HEADERS, trust_env=True
+                    ) as sess:
+                        async with sess.head(
+                            url, allow_redirects=True, timeout=10
+                        ) as resp:
                             resolved = str(resp.url)
-                            bv_m = re.search(r'/video/(BV\w+)', resolved, re.I)
+                            bv_m = re.search(r"/video/(BV\w+)", resolved, re.I)
                             if bv_m:
                                 bvid = bv_m.group(1)
                 except Exception:

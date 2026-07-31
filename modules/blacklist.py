@@ -27,19 +27,19 @@ except Exception:
 CACHE_TTL_SEC = 15
 CACHE_MAX_SIZE = 4096
 FONT_PATH = (
-    Path(__file__).resolve().parents[1]
-    / "resources"
-    / "font"
-    / "MiSans-Regular.ttf"
+    Path(__file__).resolve().parents[1] / "resources" / "font" / "MiSans-Regular.ttf"
 )
 _FONT_CACHE: dict[int, object] = {}
 BLACKLIST_WORDING_HINT = (
-    "向用户转述时请使用“拉黑/解除拉黑”表述，"
-    "不要使用“解封/解禁”表述。"
+    "向用户转述时请使用“拉黑/解除拉黑”表述，不要使用“解封/解禁”表述。"
 )
-BOT_ADMIN_BLOCK_MESSAGE = (
-    "这个人是管理员，我不能把他拉黑。"
-)
+BOT_ADMIN_BLOCK_MESSAGE = "这个人是管理员，我不能把他拉黑。"
+
+
+def _fmt_user(uid: str, name: str = "") -> str:
+    if name:
+        return f"{name}({uid})"
+    return uid
 
 
 def _parse_iso_datetime(iso_text: Optional[str]) -> Optional[datetime]:
@@ -80,50 +80,6 @@ def _calc_text_width(lines: list[str], font, font_size: int) -> int:
             line_width = len(line) * max(font_size // 2, 8)
         max_width = max(max_width, line_width)
     return max(max_width, 100)
-
-
-def _render_text_to_image_base64(text: str) -> Optional[str]:
-    if not text or not text.strip():
-        return None
-    if Image is None or ImageDraw is None or ImageFont is None:
-        return None
-
-    try:
-        font_size = 24
-        padding = 20
-        line_spacing = 6
-        min_width = 420
-        max_width = 1400
-
-        font = _load_font(font_size)
-        if font is None:
-            return None
-
-        lines = text.strip().splitlines()
-        line_height = font_size + line_spacing
-        text_height = max(line_height * max(len(lines), 1), font_size)
-        text_width = _calc_text_width(lines, font, font_size)
-        width = max(min_width, min(text_width + padding * 2, max_width))
-        height = text_height + padding * 2
-
-        image = Image.new("RGB", (width, height), (18, 18, 18))
-        draw = ImageDraw.Draw(image)
-        y = padding
-        for line in lines:
-            if line:
-                draw.text((padding, y), line, font=font, fill=(245, 245, 245))
-            y += line_height
-
-        buffer = io.BytesIO()
-        image.save(buffer, format="PNG")
-        return base64.b64encode(buffer.getvalue()).decode("utf-8")
-    except Exception as e:
-        logger.warning(f"[LLMEnhancement] 黑名单文本渲染图片失败，回退纯文本: {e}")
-        return None
-
-
-async def text_to_image_base64(text: str) -> Optional[str]:
-    return await asyncio.to_thread(_render_text_to_image_base64, text)
 
 
 def _truncate_text_to_fit(text: str, font, max_px: int) -> str:
@@ -195,7 +151,7 @@ def _render_table_to_image_base64(
         sep_w = 1
         n_cols = len(headers)
 
-        # natural width (float precision), then int-ceil to avoid truncation
+        # 自然宽度（浮点精度），然后向上取整避免截断。
         nat_widths: list[float] = []
         for i in range(n_cols):
             h_w = header_font.getlength(headers[i])
@@ -218,7 +174,7 @@ def _render_table_to_image_base64(
                 were_capped.append(False)
             col_widths.append(w)
 
-        # only truncate cells in capped columns
+        # 仅截断受限列中的单元格。
         out_rows: list[list[str]] = []
         for row in rows:
             out_row: list[str] = []
@@ -241,9 +197,19 @@ def _render_table_to_image_base64(
         footer_bot = 14
 
         title_area_h = title_top + int(title_font.size) + title_bot
-        footer_area_h = (int(footer_font.size) + 4) * len(footers or []) + footer_top + footer_bot
+        footer_area_h = (
+            (int(footer_font.size) + 4) * len(footers or []) + footer_top + footer_bot
+        )
         if show_header:
-            total_h = title_area_h + sep_y + header_h + sep_y + body_h * len(rows) + sep_w + footer_area_h
+            total_h = (
+                title_area_h
+                + sep_y
+                + header_h
+                + sep_y
+                + body_h * len(rows)
+                + sep_w
+                + footer_area_h
+            )
         else:
             total_h = title_area_h + sep_y + body_h * len(rows) + sep_w + footer_area_h
 
@@ -254,45 +220,57 @@ def _render_table_to_image_base64(
         draw.text((total_w // 2, y), title, font=title_font, fill=c_title, anchor="mt")
         y = title_area_h
 
-        # separator under title
+        # 标题下方分隔线
         draw.rectangle([(0, y), (total_w - 1, y + sep_y - 1)], fill=c_sep)
         y += sep_y
 
         if show_header:
-            # header row
+            # 表头行
             draw.rectangle([(0, y), (total_w, y + header_h)], fill=c_header_bg)
             x = sep_w
             for i, h in enumerate(headers):
-                draw.text((x + cell_pad_x, y + cell_pad_y), h, font=header_font, fill=c_header_text)
+                draw.text(
+                    (x + cell_pad_x, y + cell_pad_y),
+                    h,
+                    font=header_font,
+                    fill=c_header_text,
+                )
                 x += col_widths[i]
                 if i < n_cols - 1:
                     draw.line([(x, y), (x, y + header_h)], fill=c_sep, width=sep_w)
             y += header_h
 
-            # separator below header
+            # 表头下方分隔线
             draw.rectangle([(0, y), (total_w - 1, y + sep_y - 1)], fill=c_sep)
             y += sep_y
 
-        # data rows
+        # 数据行
         for ri, row in enumerate(out_rows):
             row_bg = c_row_even if ri % 2 == 0 else c_row_odd
             draw.rectangle([(0, y), (total_w, y + body_h)], fill=row_bg)
             x = sep_w
             for ci in range(n_cols):
-                draw.text((x + cell_pad_x, y + cell_pad_y), row[ci], font=body_font, fill=c_row_text)
+                draw.text(
+                    (x + cell_pad_x, y + cell_pad_y),
+                    row[ci],
+                    font=body_font,
+                    fill=c_row_text,
+                )
                 x += col_widths[ci]
                 if ci < n_cols - 1:
                     draw.line([(x, y), (x, y + body_h)], fill=c_sep, width=sep_w)
             y += body_h
 
-        # bottom border
+        # 底部边框
         draw.rectangle([(0, y), (total_w - 1, y + sep_w - 1)], fill=c_sep)
         y += sep_w
 
-        # footers
+        # 页脚
         y += footer_top
-        for ft in (footers or []):
-            draw.text((total_w // 2, y), ft, font=footer_font, fill=c_footer, anchor="mt")
+        for ft in footers or []:
+            draw.text(
+                (total_w // 2, y), ft, font=footer_font, fill=c_footer, anchor="mt"
+            )
             y += int(footer_font.size) + 4
 
         buffer = io.BytesIO()
@@ -312,6 +290,7 @@ async def table_to_image_base64(
     max_col_widths: list[int] | None = None,
     show_header: bool = True,
 ) -> Optional[str]:
+    """将表格数据渲染为图片并返回 Base64 编码的字符串。"""
     return await asyncio.to_thread(
         _render_table_to_image_base64,
         title=title,
@@ -357,10 +336,10 @@ class BlacklistDatabase:
                 expire_time TEXT,
                 reason TEXT
             )
-            """
+            """,
         )
         await self._db.execute(
-            "CREATE INDEX IF NOT EXISTS idx_blacklist_expire_time ON blacklist(expire_time)"
+            "CREATE INDEX IF NOT EXISTS idx_blacklist_expire_time ON blacklist(expire_time)",
         )
         await self._db.commit()
 
@@ -380,7 +359,9 @@ class BlacklistDatabase:
         row = await cursor.fetchone()
         return int(row[0]) if row else 0
 
-    async def get_blacklist_users(self, page: int = 1, page_size: int = 10) -> list[tuple]:
+    async def get_blacklist_users(
+        self, page: int = 1, page_size: int = 10
+    ) -> list[tuple]:
         if not self._db:
             return []
         offset = max(page - 1, 0) * page_size
@@ -479,9 +460,11 @@ class BlacklistManager:
         self._get_cfg = get_cfg
         self._cache: Dict[str, Tuple[bool, float]] = {}
 
-    def _set_cache(self, user_id: str, blocked: bool, now_ts: float) -> None:
+    def _set_cache(self, user_id: str, *, blocked: bool, now_ts: float) -> None:
         if len(self._cache) >= CACHE_MAX_SIZE:
-            expired_keys = [k for k, (_, exp_ts) in self._cache.items() if exp_ts <= now_ts]
+            expired_keys = [
+                k for k, (_, exp_ts) in self._cache.items() if exp_ts <= now_ts
+            ]
             for key in expired_keys:
                 self._cache.pop(key, None)
             if len(self._cache) >= CACHE_MAX_SIZE:
@@ -503,22 +486,12 @@ class BlacklistManager:
     def _clear_cache(self) -> None:
         self._cache.clear()
 
-    def _cfg_int(self, key: str, default: int, *, min_value: Optional[int] = None) -> int:
-        raw = self._get_cfg(key, default)
-        try:
-            value = int(raw)
-        except Exception:
-            value = default
-        if min_value is not None and value < min_value:
-            value = min_value
-        return value
-
     def _cfg_str(self, key: str, default: str) -> str:
         raw = self._get_cfg(key, default)
         return str(raw if raw is not None else default).strip()
 
     def max_blacklist_duration(self) -> int:
-        return self._cfg_int("max_blacklist_duration", 86400, min_value=0)
+        return max(0, int(self._get_cfg("max_blacklist_duration", 86400)))
 
     def allow_blacklist_bot_admin(self) -> bool:
         return bool(self._get_cfg("allow_blacklist_bot_admin", False))
@@ -551,7 +524,9 @@ class BlacklistManager:
                 admin_ids.add(text)
         return admin_ids
 
-    def _is_target_bot_admin(self, event: AstrMessageEvent, target_user_id: str) -> bool:
+    def _is_target_bot_admin(
+        self, event: AstrMessageEvent, target_user_id: str
+    ) -> bool:
         target_id = str(target_user_id or "").strip()
         if not target_id:
             return False
@@ -586,7 +561,9 @@ class BlacklistManager:
             return False
         return True
 
-    def _parse_duration_seconds(self, duration: Any) -> tuple[Optional[int], Optional[str]]:
+    def _parse_duration_seconds(
+        self, duration: Any
+    ) -> tuple[Optional[int], Optional[str]]:
         if duration is None or duration == "":
             return 0, None
         if isinstance(duration, bool):
@@ -615,14 +592,14 @@ class BlacklistManager:
         if text.isdigit():
             return text, ""
 
-        # OneBot CQ at 格式: [CQ:at,qq=123456]
+        # OneBot CQ at 格式: [CQ:at,qq=123456]。
         cq_match = re.search(r"\[CQ:at,qq=([^,\]]+)", text, flags=re.IGNORECASE)
         if cq_match:
             target = str(cq_match.group(1) or "").strip()
             if target and target.lower() != "all":
                 return target, ""
 
-        # aiocqhttp message_str 中常见格式: @昵称(123456)
+        # aiocqhttp message_str 中常见格式: @昵称(123456)。
         named_match = re.search(r"@?([^\(\)\s]+)?\(([^()\s]+)\)$", text)
         if named_match:
             target_name = str(named_match.group(1) or "").strip()
@@ -630,7 +607,7 @@ class BlacklistManager:
             if target_id and target_id.lower() != "all":
                 return target_id, target_name
 
-        # 通用兜底：提取 at 风格文本中的 id
+        # 通用兜底：提取 at 风格文本中的 id。
         generic_match = re.search(r"@([A-Za-z0-9_\-:]+)$", text)
         if generic_match:
             target = str(generic_match.group(1) or "").strip()
@@ -639,8 +616,12 @@ class BlacklistManager:
 
         return None, ""
 
-    def _extract_first_mention_target(self, event: AstrMessageEvent) -> tuple[Optional[str], str]:
-        if not hasattr(event, "message_obj") or not hasattr(event.message_obj, "message"):
+    def _extract_first_mention_target(
+        self, event: AstrMessageEvent
+    ) -> tuple[Optional[str], str]:
+        if not hasattr(event, "message_obj") or not hasattr(
+            event.message_obj, "message"
+        ):
             return None, ""
 
         self_id = str(event.get_self_id() or "")
@@ -648,15 +629,23 @@ class BlacklistManager:
             if not isinstance(seg, Comp.At):
                 continue
             target_id = str(getattr(seg, "qq", "") or "").strip()
-            if not target_id or target_id.lower() == "all" or (self_id and target_id == self_id):
+            if (
+                not target_id
+                or target_id.lower() == "all"
+                or (self_id and target_id == self_id)
+            ):
                 continue
             target_name = str(getattr(seg, "name", "") or "").strip()
             return target_id, target_name
 
         return None, ""
 
-    def _extract_all_mention_targets(self, event: AstrMessageEvent) -> list[tuple[str, str]]:
-        if not hasattr(event, "message_obj") or not hasattr(event.message_obj, "message"):
+    def _extract_all_mention_targets(
+        self, event: AstrMessageEvent
+    ) -> list[tuple[str, str]]:
+        if not hasattr(event, "message_obj") or not hasattr(
+            event.message_obj, "message"
+        ):
             return []
 
         self_id = str(event.get_self_id() or "")
@@ -665,13 +654,19 @@ class BlacklistManager:
             if not isinstance(seg, Comp.At):
                 continue
             target_id = str(getattr(seg, "qq", "") or "").strip()
-            if not target_id or target_id.lower() == "all" or (self_id and target_id == self_id):
+            if (
+                not target_id
+                or target_id.lower() == "all"
+                or (self_id and target_id == self_id)
+            ):
                 continue
             target_name = str(getattr(seg, "name", "") or "").strip()
             results.append((target_id, target_name))
         return results
 
-    def _resolve_target_user(self, event: AstrMessageEvent, user_ref: str = "") -> tuple[Optional[str], str]:
+    def _resolve_target_user(
+        self, event: AstrMessageEvent, user_ref: str = ""
+    ) -> tuple[Optional[str], str]:
         target_id, target_name = self._parse_user_ref(user_ref)
         if target_id:
             if not target_name:
@@ -692,7 +687,7 @@ class BlacklistManager:
             return cached
 
         blocked = await self._is_user_blacklisted_now(user_id)
-        self._set_cache(user_id, blocked, now_ts)
+        self._set_cache(user_id, blocked=blocked, now_ts=now_ts)
         return blocked
 
     async def intercept_event(self, event: AstrMessageEvent) -> bool:
@@ -704,7 +699,7 @@ class BlacklistManager:
         if not blocked:
             return False
 
-        logger.debug(f"[LLMEnhancement] 用户 {sender_id} 在黑名单中，已拦截消息。")
+        logger.debug(f"[LLMEnhancement] {sender_id} 在黑名单中，已拦截消息。")
         event.stop_event()
         return True
 
@@ -717,7 +712,7 @@ class BlacklistManager:
         if not blocked:
             return False
 
-        logger.debug(f"[LLMEnhancement] 用户 {sender_id} 在黑名单中，已拦截 LLM 请求。")
+        logger.debug(f"[LLMEnhancement] {sender_id} 在黑名单中，已拦截 LLM 请求。")
         event.stop_event()
         return True
 
@@ -799,7 +794,9 @@ class BlacklistManager:
             clipped += " " * pad
         return clipped
 
-    async def command_ls(self, page: int = 1, page_size: int = 10) -> BlacklistCommandResult:
+    async def command_ls(
+        self, page: int = 1, page_size: int = 10
+    ) -> BlacklistCommandResult:
         await self._cleanup_expired_on_query()
 
         page = max(1, int(page or 1))
@@ -823,7 +820,12 @@ class BlacklistManager:
             self._pad_for_table("原因", 20),
         ]
         text_header_row = " | ".join(text_headers)
-        text_lines = ["黑名单列表", "=" * len(text_header_row), text_header_row, "-" * len(text_header_row)]
+        text_lines = [
+            "黑名单列表",
+            "=" * len(text_header_row),
+            text_header_row,
+            "-" * len(text_header_row),
+        ]
 
         table_headers = ["序号", "用户ID", "用户名", "加入时间", "过期时间", "原因"]
         table_rows: list[list[str]] = []
@@ -835,19 +837,23 @@ class BlacklistManager:
                 self._pad_for_table(str(user_id or ""), 14),
                 self._pad_for_table(str(user_name or "未知"), 12),
                 self._pad_for_table(self._format_datetime_compact(ban_time), 11),
-                self._pad_for_table(self._format_datetime_compact(expire_time, check_expire=True), 11),
+                self._pad_for_table(
+                    self._format_datetime_compact(expire_time, check_expire=True), 11
+                ),
                 self._pad_for_table(str(reason or "无"), 20),
             ]
             text_lines.append(" | ".join(text_cells))
 
-            table_rows.append([
-                str(idx),
-                str(user_id or ""),
-                str(user_name or "未知"),
-                self._format_datetime_compact(ban_time),
-                self._format_datetime_compact(expire_time, check_expire=True),
-                str(reason or "无"),
-            ])
+            table_rows.append(
+                [
+                    str(idx),
+                    str(user_id or ""),
+                    str(user_name or "未知"),
+                    self._format_datetime_compact(ban_time),
+                    self._format_datetime_compact(expire_time, check_expire=True),
+                    str(reason or "无"),
+                ]
+            )
 
         table_footers = [f"第 {page}/{total_pages} 页，共 {total_count} 条记录"]
         text_lines.append(table_footers[0])
@@ -873,31 +879,38 @@ class BlacklistManager:
             image_base64 = None
         return BlacklistCommandResult(text=text, image_base64=image_base64)
 
-    async def command_info(self, event: AstrMessageEvent, user_ref: str = "") -> BlacklistCommandResult:
+    async def command_info(
+        self, event: AstrMessageEvent, user_ref: str = ""
+    ) -> BlacklistCommandResult:
         await self._cleanup_expired_on_query()
 
-        target_id, _ = self._resolve_target_user(event, user_ref)
+        target_id, target_name = self._resolve_target_user(event, user_ref)
         if not target_id:
             return BlacklistCommandResult(text="请提供用户 ID 或 @目标用户。")
 
         user = await self._db.get_user_info(target_id)
         if not user:
-            return BlacklistCommandResult(text=f"用户 {target_id} 不在黑名单中。")
+            return BlacklistCommandResult(
+                text=f"{_fmt_user(target_id, target_name)} 不在黑名单中。"
+            )
 
         _uid, user_name, ban_time, expire_time, reason = user
+        display_name = user_name or ""
         text_lines = [
-            f"用户 {target_id} 的黑名单信息",
+            f"{_fmt_user(target_id, display_name)} 的黑名单信息",
             "=" * 36,
-            f"用户名: {user_name or '未知'}",
+            f"用户名: {display_name or '未知'}",
             f"加入时间: {self._format_datetime(ban_time)}",
             f"过期时间: {self._format_datetime(expire_time, show_remaining=True, check_expire=True)}",
             f"原因: {reason or '无'}",
         ]
         text = "\n".join(text_lines)
         if self._should_render_image():
-            expire_str = self._format_datetime(expire_time, show_remaining=True, check_expire=True)
+            expire_str = self._format_datetime(
+                expire_time, show_remaining=True, check_expire=True
+            )
             image_base64 = await table_to_image_base64(
-                title=f"用户 {target_id}",
+                title=f"{_fmt_user(target_id, display_name)}",
                 headers=["字段", "值"],
                 rows=[
                     ["用户名", user_name or "未知"],
@@ -922,8 +935,13 @@ class BlacklistManager:
         mention_id, _mention_name = self._extract_first_mention_target(event)
         user_ref_text = str(user_ref or "").strip()
         duration_text = str(duration or "").strip()
-        # 部分平台指令解析不会把 @ 写入 message_str，这里将被错位的参数纠正回来
-        if mention_id and user_ref_text.isdigit() and duration_text and not duration_text.isdigit():
+        # 部分平台指令解析不会把 @ 写入 message_str，这里将被错位的参数纠正回来。
+        if (
+            mention_id
+            and user_ref_text.isdigit()
+            and duration_text
+            and not duration_text.isdigit()
+        ):
             reason = duration_text
             duration = user_ref_text
             user_ref = ""
@@ -934,7 +952,7 @@ class BlacklistManager:
 
         mentions = self._extract_all_mention_targets(event)
         if len(mentions) > 1:
-            # 多个 @ → 批量模式
+            # 多个 @ → 批量模式。
             ids = [m[0] for m in mentions]
             names = [m[1] for m in mentions]
         else:
@@ -954,11 +972,13 @@ class BlacklistManager:
         if duration_sec and duration_sec > 0:
             expire_time = (datetime.now() + timedelta(seconds=duration_sec)).isoformat()
 
-        success_ids: list[str] = []
+        success_items: list[tuple[str, str]] = []
         fail_messages: list[str] = []
         for tid, tname in zip(ids, names):
-            if (not self.allow_blacklist_bot_admin()) and self._is_target_bot_admin(event, tid):
-                fail_messages.append(f"用户 {tid} 是 Bot 管理员")
+            if (not self.allow_blacklist_bot_admin()) and self._is_target_bot_admin(
+                event, tid
+            ):
+                fail_messages.append(f"{_fmt_user(tid, tname)} 是 Bot 管理员")
                 continue
 
             ok = await self._db.add_user(
@@ -969,21 +989,24 @@ class BlacklistManager:
                 reason=reason or "",
             )
             if not ok:
-                fail_messages.append(f"用户 {tid} 写入失败")
+                fail_messages.append(f"{_fmt_user(tid, tname)} 写入失败")
                 continue
 
             self._invalidate_cache(tid)
-            success_ids.append(tid)
+            success_items.append((tid, tname))
 
         parts: list[str] = []
-        if success_ids:
-            if len(success_ids) > 1:
-                part = f"已拉黑 {len(success_ids)} 人"
+        if success_items:
+            if len(success_items) > 1:
+                part = f"已拉黑 {len(success_items)} 人"
             else:
+                sid, sname = success_items[0]
                 if duration_sec and duration_sec > 0:
-                    part = f"用户 {success_ids[0]} 已加入黑名单，时长 {duration_sec} 秒"
+                    part = (
+                        f"{_fmt_user(sid, sname)} 已加入黑名单，时长 {duration_sec} 秒"
+                    )
                 else:
-                    part = f"用户 {success_ids[0]} 已永久加入黑名单"
+                    part = f"{_fmt_user(sid, sname)} 已永久加入黑名单"
             parts.append(part)
         if fail_messages:
             parts.append(f"失败 {len(fail_messages)} 人：{'；'.join(fail_messages)}")
@@ -1003,7 +1026,7 @@ class BlacklistManager:
                     return "请提供用户 ID 或 @目标用户。"
                 ids = [target_id] if target_id else []
 
-        success_ids: list[str] = []
+        success_items: list[tuple[str, str]] = []
         not_found_ids: list[str] = []
         fail_messages: list[str] = []
         for tid in ids:
@@ -1012,19 +1035,24 @@ class BlacklistManager:
                 not_found_ids.append(tid)
                 continue
 
+            _uid, user_name, _bt, _et, _rs = user
             ok = await self._db.remove_user(tid)
             if not ok:
-                fail_messages.append(f"用户 {tid} 删除失败")
+                fail_messages.append(f"{_fmt_user(tid, user_name)} 删除失败")
                 continue
             self._invalidate_cache(tid)
-            success_ids.append(tid)
+            success_items.append((tid, user_name))
 
         parts: list[str] = []
-        if success_ids:
-            part = f"已解除拉黑 {len(success_ids)} 人" if len(success_ids) > 1 else f"用户 {success_ids[0]} 已解除拉黑"
+        if success_items:
+            part = (
+                f"已解除拉黑 {len(success_items)} 人"
+                if len(success_items) > 1
+                else f"{_fmt_user(success_items[0][0], success_items[0][1])} 已解除拉黑"
+            )
             parts.append(part)
         if not_found_ids:
-            parts.append(f"不在黑名单中：{'，'.join(not_found_ids)}")
+            parts.append(f"用户 ID {'、'.join(not_found_ids)} 不在黑名单中")
         if fail_messages:
             parts.append("；".join(fail_messages))
         return "，".join(parts) + "。" if parts else "操作失败。"
@@ -1061,7 +1089,7 @@ class BlacklistManager:
 
         sender_id = str(event.get_sender_id() or "")
 
-        # 权限检查：非管理员只能操作自己
+        # 权限检查：非管理员只能操作自己。
         self_only_tools = self._get_cfg("self_only_tools", [])
         for target_user_id in user_id_list:
             permission_error = check_self_only_operation(
@@ -1073,7 +1101,6 @@ class BlacklistManager:
             if permission_error:
                 return permission_error
 
-        # 解析 duration
         parsed_duration, err = self._parse_duration_seconds(duration)
         if err:
             return json.dumps(
@@ -1091,7 +1118,9 @@ class BlacklistManager:
         ban_time = datetime.now().isoformat()
         expire_time = None
         if actual_duration > 0:
-            expire_time = (datetime.now() + timedelta(seconds=actual_duration)).isoformat()
+            expire_time = (
+                datetime.now() + timedelta(seconds=actual_duration)
+            ).isoformat()
 
         target_name = str(user_name or "").strip()
         if not target_name:
@@ -1105,30 +1134,50 @@ class BlacklistManager:
             target_user_id = str(target_user_id or "").strip()
             if not target_user_id:
                 fail_count += 1
-                results.append({"user_id": target_user_id, "success": False, "error": "empty user_id"})
+                results.append(
+                    {
+                        "user_id": target_user_id,
+                        "success": False,
+                        "error": "empty user_id",
+                    }
+                )
                 continue
 
             is_self_defense = target_user_id == sender_id
 
             # Bot 管理员检查
-            if (not self.allow_blacklist_bot_admin()) and self._is_target_bot_admin(event, target_user_id):
+            if (not self.allow_blacklist_bot_admin()) and self._is_target_bot_admin(
+                event, target_user_id
+            ):
                 fail_count += 1
-                results.append({"user_id": target_user_id, "success": False, "error": BOT_ADMIN_BLOCK_MESSAGE})
+                results.append(
+                    {
+                        "user_id": target_user_id,
+                        "success": False,
+                        "error": BOT_ADMIN_BLOCK_MESSAGE,
+                    }
+                )
                 continue
 
             # 检查是否已在黑名单
             if await self._db.get_user_info(target_user_id):
-                results.append({
-                    "success": True,
-                    "message": f"用户 {target_user_id} 已在黑名单中，无需重复添加。",
-                    "user_id": target_user_id,
-                    "wording_hint": BLACKLIST_WORDING_HINT,
-                })
+                results.append(
+                    {
+                        "success": True,
+                        "message": f"{_fmt_user(target_user_id, target_name)} 已在黑名单中，无需重复添加。",
+                        "user_id": target_user_id,
+                        "wording_hint": BLACKLIST_WORDING_HINT,
+                    }
+                )
                 success_count += 1
                 continue
 
-            # 写入数据库
-            current_target_name = target_name if target_user_id != sender_id else (str(event.get_sender_name() or "") or target_name)
+            # 写入数据库前先确定本次展示名，避免误用 sender 名称。
+            current_target_name = (
+                target_name
+                if target_user_id != sender_id
+                else (str(event.get_sender_name() or "") or target_name)
+            )
             ok = await self._db.add_user(
                 user_id=target_user_id,
                 user_name=current_target_name,
@@ -1138,33 +1187,52 @@ class BlacklistManager:
             )
             if not ok:
                 fail_count += 1
-                results.append({"user_id": target_user_id, "success": False, "error": "数据库写入异常。"})
+                results.append(
+                    {
+                        "user_id": target_user_id,
+                        "success": False,
+                        "error": "数据库写入异常。",
+                    }
+                )
                 continue
 
             self._invalidate_cache(target_user_id)
-            logger.info(f"[LLMEnhancement] 用户 {target_user_id} 已由 {sender_id} 通过 LLM 工具拉黑。")
-            results.append({
-                "success": True,
-                "message": f"用户 {target_user_id} 已拉黑。",
-                "user_id": target_user_id,
-                "user_name": current_target_name,
-                "duration": actual_duration if actual_duration > 0 else "永久",
-                "reason": reason,
-                "hint": "操作已生效。" if not is_self_defense else "操作已生效，将来这段时间内对方向你发送的消息将被屏蔽。",
-                "wording_hint": BLACKLIST_WORDING_HINT,
-            })
+            logger.info(
+                f"[LLMEnhancement] {target_user_id} 已由 {sender_id} 通过 LLM 工具拉黑。"
+            )
+            results.append(
+                {
+                    "success": True,
+                    "message": f"{_fmt_user(target_user_id, current_target_name)} 已拉黑。",
+                    "user_id": target_user_id,
+                    "user_name": current_target_name,
+                    "duration": actual_duration if actual_duration > 0 else "永久",
+                    "reason": reason,
+                    "hint": "操作已生效。"
+                    if not is_self_defense
+                    else "操作已生效，将来这段时间内对方向你发送的消息将被屏蔽。",
+                    "wording_hint": BLACKLIST_WORDING_HINT,
+                }
+            )
             success_count += 1
 
         if len(user_id_list) == 1:
             if results and results[0].get("success"):
                 return json.dumps(results[0], ensure_ascii=False)
-            return json.dumps(results[0] if results else {"success": False, "message": "操作失败。"}, ensure_ascii=False)
+            return json.dumps(
+                results[0] if results else {"success": False, "message": "操作失败。"},
+                ensure_ascii=False,
+            )
 
-        return json.dumps({
-            "success_count": success_count,
-            "fail_count": fail_count,
-            "results": results
-        }, ensure_ascii=False, indent=2)
+        return json.dumps(
+            {
+                "success_count": success_count,
+                "fail_count": fail_count,
+                "results": results,
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
 
     async def tool_unblock_user(self, event: AstrMessageEvent, user_ids: str) -> str:
         await self._cleanup_expired_on_query()
@@ -1178,7 +1246,7 @@ class BlacklistManager:
 
         sender_id = str(event.get_sender_id() or "")
 
-        # 权限检查：非管理员只能操作自己
+        # 权限检查：非管理员只能操作自己。
         self_only_tools = self._get_cfg("self_only_tools", [])
         for target_user_id in user_id_list:
             permission_error = check_self_only_operation(
@@ -1198,18 +1266,26 @@ class BlacklistManager:
             target_user_id = str(target_user_id or "").strip()
             if not target_user_id:
                 fail_count += 1
-                results.append({"user_id": target_user_id, "success": False, "error": "empty user_id"})
+                results.append(
+                    {
+                        "user_id": target_user_id,
+                        "success": False,
+                        "error": "empty user_id",
+                    }
+                )
                 continue
 
             user = await self._db.get_user_info(target_user_id)
             if not user:
-                results.append({
-                    "success": True,
-                    "message": f"用户 {target_user_id} 不在黑名单中。",
-                    "user_id": target_user_id,
-                    "user_name": "",
-                    "wording_hint": BLACKLIST_WORDING_HINT,
-                })
+                results.append(
+                    {
+                        "success": True,
+                        "message": f"{target_user_id} 不在黑名单中。",
+                        "user_id": target_user_id,
+                        "user_name": "",
+                        "wording_hint": BLACKLIST_WORDING_HINT,
+                    }
+                )
                 success_count += 1
                 continue
 
@@ -1217,32 +1293,51 @@ class BlacklistManager:
             ok = await self._db.remove_user(target_user_id)
             if not ok:
                 fail_count += 1
-                results.append({"user_id": target_user_id, "success": False, "error": "数据库删除失败。"})
+                results.append(
+                    {
+                        "user_id": target_user_id,
+                        "success": False,
+                        "error": "数据库删除失败。",
+                    }
+                )
                 continue
 
             self._invalidate_cache(target_user_id)
-            logger.info(f"[LLMEnhancement] 用户 {target_user_id} 已由 {sender_id} 通过 LLM 工具解除拉黑。")
-            results.append({
-                "success": True,
-                "message": f"用户 {target_user_id} 已解除拉黑。",
-                "user_id": target_user_id,
-                "user_name": user_name or "",
-                "wording_hint": BLACKLIST_WORDING_HINT,
-            })
+            logger.info(
+                f"[LLMEnhancement] {target_user_id} 已由 {sender_id} 通过 LLM 工具解除拉黑。"
+            )
+            results.append(
+                {
+                    "success": True,
+                    "message": f"{_fmt_user(target_user_id, user_name)} 已解除拉黑。",
+                    "user_id": target_user_id,
+                    "user_name": user_name or "",
+                    "wording_hint": BLACKLIST_WORDING_HINT,
+                }
+            )
             success_count += 1
 
         if len(user_id_list) == 1:
             if results and results[0].get("success"):
                 return json.dumps(results[0], ensure_ascii=False)
-            return json.dumps(results[0] if results else {"success": False, "message": "操作失败。"}, ensure_ascii=False)
+            return json.dumps(
+                results[0] if results else {"success": False, "message": "操作失败。"},
+                ensure_ascii=False,
+            )
 
-        return json.dumps({
-            "success_count": success_count,
-            "fail_count": fail_count,
-            "results": results
-        }, ensure_ascii=False, indent=2)
+        return json.dumps(
+            {
+                "success_count": success_count,
+                "fail_count": fail_count,
+                "results": results,
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
 
-    async def tool_list_blacklist(self, event: AstrMessageEvent, page: int = 1, page_size: int = 20) -> str:
+    async def tool_list_blacklist(
+        self, event: AstrMessageEvent, page: int = 1, page_size: int = 20
+    ) -> str:
         await self._cleanup_expired_on_query()
 
         page = max(1, int(page or 1))
@@ -1279,7 +1374,7 @@ class BlacklistManager:
                     "ban_time": ban_time,
                     "expire_time": expire_time if expire_time else "永久",
                     "reason": reason if reason else "无",
-                }
+                },
             )
 
         return json.dumps(
@@ -1297,7 +1392,9 @@ class BlacklistManager:
             ensure_ascii=False,
         )
 
-    async def tool_get_blacklist_status(self, event: AstrMessageEvent, user_ids: str) -> str:
+    async def tool_get_blacklist_status(
+        self, event: AstrMessageEvent, user_ids: str
+    ) -> str:
         await self._cleanup_expired_on_query()
 
         user_id_list = _parse_user_id_list(user_ids)
@@ -1320,36 +1417,55 @@ class BlacklistManager:
             target_id = str(target_id or "").strip()
             if not target_id:
                 fail_count += 1
-                results.append({"user_id": target_id, "is_blacklisted": False, "error": "empty user_id"})
+                results.append(
+                    {
+                        "user_id": target_id,
+                        "is_blacklisted": False,
+                        "error": "empty user_id",
+                    }
+                )
                 continue
 
             user_info = await self._db.get_user_info(target_id)
             if user_info:
                 uid, user_name, ban_time, expire_time, reason = user_info
-                results.append({
-                    "is_blacklisted": True,
-                    "user_id": uid,
-                    "user_name": user_name or "",
-                    "ban_time": ban_time,
-                    "expire_time": expire_time if expire_time else "永久",
-                    "reason": reason if reason else "无",
-                    "expire_time_hint": "expire_time 表示黑名单失效时间，失效后意味着你将其移出黑名单。",
-                    "wording_hint": BLACKLIST_WORDING_HINT,
-                })
+                results.append(
+                    {
+                        "is_blacklisted": True,
+                        "user_id": uid,
+                        "user_name": user_name or "",
+                        "ban_time": ban_time,
+                        "expire_time": expire_time if expire_time else "永久",
+                        "reason": reason if reason else "无",
+                        "expire_time_hint": "expire_time 表示黑名单失效时间，失效后意味着你将其移出黑名单。",
+                        "wording_hint": BLACKLIST_WORDING_HINT,
+                    }
+                )
                 success_count += 1
             else:
-                results.append({
-                    "is_blacklisted": False,
-                    "user_id": target_id,
-                    "wording_hint": BLACKLIST_WORDING_HINT,
-                })
+                results.append(
+                    {
+                        "is_blacklisted": False,
+                        "user_id": target_id,
+                        "wording_hint": BLACKLIST_WORDING_HINT,
+                    }
+                )
                 success_count += 1
 
         if len(user_id_list) == 1:
-            return json.dumps(results[0] if results else {"is_blacklisted": False, "message": "查询失败。"}, ensure_ascii=False)
+            return json.dumps(
+                results[0]
+                if results
+                else {"is_blacklisted": False, "message": "查询失败。"},
+                ensure_ascii=False,
+            )
 
-        return json.dumps({
-            "success_count": success_count,
-            "fail_count": fail_count,
-            "results": results
-        }, ensure_ascii=False, indent=2)
+        return json.dumps(
+            {
+                "success_count": success_count,
+                "fail_count": fail_count,
+                "results": results,
+            },
+            ensure_ascii=False,
+            indent=2,
+        )

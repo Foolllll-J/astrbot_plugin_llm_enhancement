@@ -131,7 +131,7 @@ def _read_text_excerpt(path: str, max_chars: int) -> str:
                 logger.debug(
                     "[LLMEnhancement] 文件摘录解码结果: "
                     f"file={os.path.basename(path)}, selected={detected_enc}(chardet-first), "
-                    f"chardet={detected_enc}({detected_confidence:.2f})"
+                    f"chardet={detected_enc}({detected_confidence:.2f})",
                 )
                 if len(text) > safe_max:
                     return text[: max(1, safe_max - 3)] + "..."
@@ -146,7 +146,15 @@ def _read_text_excerpt(path: str, max_chars: int) -> str:
 
     if detected_enc:
         _push_encoding(detected_enc)
-    for enc in ("utf-8-sig", "utf-8", "gb18030", "gbk", "utf-16", "utf-16-le", "utf-16-be"):
+    for enc in (
+        "utf-8-sig",
+        "utf-8",
+        "gb18030",
+        "gbk",
+        "utf-16",
+        "utf-16-le",
+        "utf-16-be",
+    ):
         _push_encoding(enc)
 
     text = ""
@@ -178,14 +186,14 @@ def _read_text_excerpt(path: str, max_chars: int) -> str:
         logger.debug(
             "[LLMEnhancement] 文件摘录解码失败: "
             f"file={os.path.basename(path)}, bytes={len(raw)}, "
-            f"chardet={detected_enc or 'none'}({detected_confidence:.2f})"
+            f"chardet={detected_enc or 'none'}({detected_confidence:.2f})",
         )
         return ""
 
     logger.debug(
         "[LLMEnhancement] 文件摘录解码结果: "
         f"file={os.path.basename(path)}, selected={selected_encoding or 'unknown'}({selected_mode or 'unknown'}), "
-        f"chardet={detected_enc or 'none'}({detected_confidence:.2f})"
+        f"chardet={detected_enc or 'none'}({detected_confidence:.2f})",
     )
 
     if len(text) > safe_max:
@@ -205,21 +213,27 @@ def _read_pdf_excerpt(path: str, max_chars: int) -> str:
     if max_chars <= 0:
         return ""
     if PdfReader is None:
-        logger.debug("[LLMEnhancement] PDF 文本注入已启用，但未安装 pypdf，跳过 PDF 解析")
+        logger.debug(
+            "[LLMEnhancement] PDF 文本注入已启用，但未安装 pypdf，跳过 PDF 解析"
+        )
         return ""
 
     safe_max = min(max_chars, PDF_PARSE_MAX_CHARS)
     try:
         reader = PdfReader(path)
     except Exception as e:
-        logger.debug(f"[LLMEnhancement] 读取 PDF 失败: file={os.path.basename(path)}, err={e}")
+        logger.debug(
+            f"[LLMEnhancement] 读取 PDF 失败: file={os.path.basename(path)}, err={e}"
+        )
         return ""
 
     if getattr(reader, "is_encrypted", False):
         try:
             reader.decrypt("")
         except Exception as e:
-            logger.debug(f"[LLMEnhancement] PDF 已加密且解密失败: file={os.path.basename(path)}, err={e}")
+            logger.debug(
+                f"[LLMEnhancement] PDF 已加密且解密失败: file={os.path.basename(path)}, err={e}"
+            )
             return ""
 
     parts: list[str] = []
@@ -259,9 +273,13 @@ async def _resolve_file_url_by_id(event: AstrMessageEvent, file_id: str) -> str:
     actions = []
     if gid:
         try:
-            actions.append(("get_group_file_url", {"group_id": int(gid), "file_id": file_id}))
+            actions.append(
+                ("get_group_file_url", {"group_id": int(gid), "file_id": file_id})
+            )
         except Exception:
-            actions.append(("get_group_file_url", {"group_id": gid, "file_id": file_id}))
+            actions.append(
+                ("get_group_file_url", {"group_id": gid, "file_id": file_id})
+            )
     else:
         actions.append(("get_private_file_url", {"file_id": file_id}))
 
@@ -345,7 +363,11 @@ async def extract_file_infos_from_chain(
                 file_seg_count += 1
                 file_name = str(getattr(seg, "name", "") or "")
                 seg_file_name = file_name
-                if file_name and (not _is_text_file_name(file_name)) and (not _is_pdf_file_name(file_name)):
+                if (
+                    file_name
+                    and (not _is_text_file_name(file_name))
+                    and (not _is_pdf_file_name(file_name))
+                ):
                     skip_non_text += 1
                     _record_failure(file_name, "文件类型不支持文本摘要解析")
                     continue
@@ -362,15 +384,21 @@ async def extract_file_infos_from_chain(
                     continue
 
                 file_name = str(
-                    data.get("name") or data.get("file_name") or data.get("file") or ""
+                    data.get("name") or data.get("file_name") or data.get("file") or "",
                 ).strip()
                 seg_file_name = file_name
-                if file_name and (not _is_text_file_name(file_name)) and (not _is_pdf_file_name(file_name)):
+                if (
+                    file_name
+                    and (not _is_text_file_name(file_name))
+                    and (not _is_pdf_file_name(file_name))
+                ):
                     skip_non_text += 1
                     _record_failure(file_name, "文件类型不支持文本摘要解析")
                     continue
 
-                local_path = _normalize_local_path(str(data.get("file") or data.get("path") or ""))
+                local_path = _normalize_local_path(
+                    str(data.get("file") or data.get("path") or "")
+                )
                 if not local_path:
                     file_url = str(data.get("url") or "").strip()
                     if not file_url:
@@ -379,7 +407,9 @@ async def extract_file_infos_from_chain(
                             file_url = await _resolve_file_url_by_id(event, file_id)
 
                     if file_url:
-                        file_comp = Comp.File(name=file_name or "file.bin", url=file_url)
+                        file_comp = Comp.File(
+                            name=file_name or "file.bin", url=file_url
+                        )
                         download_path = await file_comp.get_file()
                         local_path = _normalize_local_path(download_path)
                     else:
@@ -391,7 +421,9 @@ async def extract_file_infos_from_chain(
 
             if not local_path or not os.path.isfile(local_path):
                 skip_path_missing += 1
-                _record_failure(file_name or seg_file_name, "文件下载失败或本地文件不存在")
+                _record_failure(
+                    file_name or seg_file_name, "文件下载失败或本地文件不存在"
+                )
                 continue
 
             effective_name = str(file_name or os.path.basename(local_path) or "")
@@ -410,11 +442,13 @@ async def extract_file_infos_from_chain(
                     logger.debug(
                         "[LLMEnhancement] 文件超过注入大小上限，跳过文本提取: "
                         f"file={effective_name or os.path.basename(local_path)}, "
-                        f"size_bytes={file_size}, limit_mb={max_file_size_mb}"
+                        f"size_bytes={file_size}, limit_mb={max_file_size_mb}",
                     )
                     continue
 
-            is_pdf = _is_pdf_file_name(effective_name) or _looks_like_pdf_file(local_path)
+            is_pdf = _is_pdf_file_name(effective_name) or _looks_like_pdf_file(
+                local_path
+            )
 
             if is_pdf:
                 excerpt = _read_pdf_excerpt(local_path, max_chars)
@@ -437,7 +471,11 @@ async def extract_file_infos_from_chain(
             seen.add(key)
             results.append((effective_name or os.path.basename(local_path), excerpt))
 
-            if cleanup_paths is not None and download_path and os.path.exists(download_path):
+            if (
+                cleanup_paths is not None
+                and download_path
+                and os.path.exists(download_path)
+            ):
                 if download_path not in cleanup_paths:
                     cleanup_paths.append(download_path)
         except Exception as e:
@@ -457,7 +495,7 @@ async def extract_file_infos_from_chain(
             f"skip_non_text={skip_non_text}, skip_path_missing={skip_path_missing}, "
             f"skip_too_large={skip_too_large}, skip_empty_excerpt={skip_empty_excerpt}, "
             f"skip_duplicate={skip_duplicate}, errors={error_count}, max_chars={max_chars}, "
-            f"max_file_size_mb={max_file_size_mb}"
+            f"max_file_size_mb={max_file_size_mb}",
         )
 
     return results

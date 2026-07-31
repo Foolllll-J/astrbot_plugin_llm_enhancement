@@ -16,14 +16,18 @@ from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent
 from astrbot.api.provider import ProviderRequest
 import astrbot.api.message_components as Comp
-from .provider_utils import find_provider
-from .runtime_helpers import append_text_part_to_request, transcribe_audio_with_fallback
-
 from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import (
     AiocqhttpMessageEvent,
 )
+from .runtime_helpers import (
+    _is_unavailable_get_msg_payload,
+    append_text_part_to_request,
+    find_provider,
+    transcribe_audio_with_fallback,
+    _provider_supports_audio_input,
+)
 
-VIDEO_SUMMARY_CACHE_TTL_SEC = 3600
+VIDEO_SUMMARY_CACHE_TTL_SEC = 86400
 VIDEO_SUMMARY_CACHE_MAX_SIZE = 100
 
 
@@ -33,7 +37,8 @@ class MediaScenario(Enum):
     NONE = "none"  # 无媒体
     FORWARD_MESSAGE = "forward_message"  # 转发消息（包含文本/图片/视频）
     VIDEO = "video"  # 视频（统一抽帧流程）
-    GIF_ANIMATED = "gif_animated"  # GIF 动图
+    GIF_DIRECT = "gif_direct"  # GIF 直送 Vision Provider 单次描述
+    GIF_ANIMATED = "gif_animated"  # GIF 动图（抽帧模式）
 
 
 class MediaContext:
@@ -85,7 +90,7 @@ def is_gif_file(path: str) -> bool:
     except OSError:
         return False
 
-    # GIF87a, GIF89a
+    # GIF87a、GIF89a 格式
     if header in (b"GIF87a", b"GIF89a"):
         return True
 
@@ -93,10 +98,6 @@ def is_gif_file(path: str) -> bool:
         return True
 
     return False
-
-
-def _is_unavailable_get_msg_payload(payload: Any) -> bool:
-    return isinstance(payload, dict) and payload.get("status") == "deleted"
 
 
 def extract_videos_from_chain(chain: List[object]) -> List[str]:
@@ -130,7 +131,7 @@ def extract_videos_from_chain(chain: List[object]) -> List[str]:
     for seg in chain:
         try:
             if isinstance(seg, dict):
-                # 处理 OneBot v11 原始字典格式
+                # 处理 OneBot v11 原始字典格式。
                 stype = seg.get("type")
                 sdata = seg.get("data", {})
                 if stype == "video":
@@ -199,7 +200,7 @@ def extract_videos_from_chain(chain: List[object]) -> List[str]:
                         if isinstance(c, list):
                             videos.extend(extract_videos_from_chain(c))
             elif hasattr(Comp, "Forward") and isinstance(seg, getattr(Comp, "Forward")):
-                # Forward 组件可能包含 nodes
+                # Forward 组件可能包含 nodes。
                 nodes = getattr(seg, "nodes", None) or getattr(seg, "content", None)
                 if isinstance(nodes, list):
                     for node in nodes:
@@ -209,6 +210,98 @@ def extract_videos_from_chain(chain: List[object]) -> List[str]:
         except Exception:
             continue
     return videos
+
+
+def extract_audios_from_chain(chain: List[object]) -> List[str]:
+    """从消息链中提取音频文件 URL / 路径（仅 file 类型段）。"""
+    audios: List[str] = []
+    if not isinstance(chain, list):
+        return audios
+
+    audio_exts = (
+        ".amr",
+        ".mp3",
+        ".wav",
+        ".m4a",
+        ".aac",
+        ".ogg",
+        ".opus",
+        ".flac",
+        ".wma",
+    )
+
+    def _looks_like_audio(name_or_url: str) -> bool:
+        if not isinstance(name_or_url, str) or not name_or_url:
+            return False
+        s = name_or_url.lower()
+        return any(s.endswith(ext) for ext in audio_exts)
+
+    for seg in chain:
+        try:
+            if isinstance(seg, dict):
+                stype = seg.get("type")
+                sdata = seg.get("data", {})
+                if stype == "file":
+                    u = sdata.get("url")
+                    f = sdata.get("file")
+                    n = sdata.get("name")
+                    cand = None
+                    if isinstance(u, str) and u and _looks_like_audio(u):
+                        cand = u
+                    elif (
+                        isinstance(f, str)
+                        and f
+                        and (_looks_like_audio(f) or os.path.isabs(f))
+                    ):
+                        cand = f
+                    elif isinstance(n, str) and n and _looks_like_audio(n):
+                        if isinstance(u, str) and u:
+                            cand = u
+                        elif isinstance(f, str) and f:
+                            cand = f
+                    if cand:
+                        audios.append(cand)
+            elif isinstance(seg, Comp.File):
+                u = getattr(seg, "url", None)
+                f = getattr(seg, "file", None)
+                n = getattr(seg, "name", None)
+                cand = None
+                if isinstance(u, str) and u and _looks_like_audio(u):
+                    cand = u
+                elif (
+                    isinstance(f, str)
+                    and f
+                    and (_looks_like_audio(f) or os.path.isabs(f))
+                ):
+                    cand = f
+                elif isinstance(n, str) and n and _looks_like_audio(n):
+                    if isinstance(u, str) and u:
+                        cand = u
+                    elif isinstance(f, str) and f:
+                        cand = f
+                if isinstance(cand, str) and cand:
+                    audios.append(cand)
+            elif hasattr(Comp, "Node") and isinstance(seg, getattr(Comp, "Node")):
+                content = getattr(seg, "content", None)
+                if isinstance(content, list):
+                    audios.extend(extract_audios_from_chain(content))
+            elif hasattr(Comp, "Nodes") and isinstance(seg, getattr(Comp, "Nodes")):
+                nodes = getattr(seg, "nodes", None) or getattr(seg, "content", None)
+                if isinstance(nodes, list):
+                    for node in nodes:
+                        c = getattr(node, "content", None)
+                        if isinstance(c, list):
+                            audios.extend(extract_audios_from_chain(c))
+            elif hasattr(Comp, "Forward") and isinstance(seg, getattr(Comp, "Forward")):
+                nodes = getattr(seg, "nodes", None) or getattr(seg, "content", None)
+                if isinstance(nodes, list):
+                    for node in nodes:
+                        c = getattr(node, "content", None)
+                        if isinstance(c, list):
+                            audios.extend(extract_audios_from_chain(c))
+        except Exception:
+            continue
+    return audios
 
 
 async def napcat_resolve_file_url(
@@ -253,7 +346,7 @@ async def napcat_resolve_file_url(
                 {"action": "get_image", "params": {"file": cand}},
                 {"action": "get_image", "params": {"file_id": cand}},
                 {"action": "get_private_file_url", "params": {"file_id": cand}},
-            ]
+            ],
         )
         if gid:
             actions.append(
@@ -285,28 +378,29 @@ async def napcat_resolve_file_url(
     return None
 
 
-async def download_video_to_temp(url: str, size_mb_limit: int) -> Optional[str]:
-    """下载媒体到临时文件。"""
+async def download_media_to_temp(url: str, size_mb_limit: int) -> Optional[str]:
+    """下载媒体到临时文件。若已是本地文件则直接返回。"""
+    if os.path.isfile(url):
+        return url
     max_bytes = size_mb_limit * 1024 * 1024
 
     try:
         async with aiohttp.ClientSession() as sess:
-            async with sess.get(url, timeout=30) as resp:
+            async with sess.get(url, timeout=60) as resp:
                 if resp.status != 200:
                     logger.warning(
-                        f"[VideoFrameProcessor] 下载失败: HTTP {resp.status} (URL: {url})"
+                        f"[媒体处理] 下载失败: HTTP {resp.status} (URL: {url})"
                     )
                     return None
 
-                # 检查内容长度
                 cl = resp.headers.get("Content-Length")
                 if cl and cl.isdigit() and int(cl) > max_bytes:
                     logger.warning(
-                        f"[VideoFrameProcessor] 下载终止: 文件过大 ({int(cl) / (1024 * 1024):.1f}MB > {size_mb_limit}MB)"
+                        f"[媒体处理] 下载终止: 文件过大 ({int(cl) / (1024 * 1024):.1f}MB > {size_mb_limit}MB)"
                     )
                     return None
 
-                # 根据 Content-Type 决定后缀
+                # 根据 Content-Type 决定后缀。
                 content_type = resp.headers.get("Content-Type", "").lower()
                 if "image/gif" in content_type:
                     ext = ".gif"
@@ -317,7 +411,6 @@ async def download_video_to_temp(url: str, size_mb_limit: int) -> Optional[str]:
                 else:
                     ext = ".mp4"  # 默认
 
-                # 创建临时文件
                 tmp = tempfile.NamedTemporaryFile(
                     prefix="llm_media_", suffix=ext, delete=False
                 )
@@ -330,20 +423,18 @@ async def download_video_to_temp(url: str, size_mb_limit: int) -> Optional[str]:
                         total += len(chunk)
                         if total > max_bytes:
                             os.remove(tmp_path)
-                            logger.warning(
-                                "[VideoFrameProcessor] 下载终止: 实际下载数据超过限制"
-                            )
+                            logger.warning("[媒体处理] 下载终止: 实际下载数据超过限制")
                             return None
                         f.write(chunk)
                 return tmp_path
     except Exception as e:
-        logger.error(f"[VideoFrameProcessor] 下载异常: {e} (URL: {url})")
+        logger.error(f"[媒体处理] 下载异常: {e} (URL: {url})")
     return None
 
 
 def probe_duration_sec(ffmpeg_path: str, video_path: str) -> Optional[float]:
     """探测视频时长。"""
-    # 优先使用与 ffmpeg 同目录的 ffprobe
+    # 优先使用与 ffmpeg 同目录的 ffprobe。
     ffprobe_path = None
     if ffmpeg_path:
         ffmpeg_dir = os.path.dirname(ffmpeg_path)
@@ -418,7 +509,7 @@ async def sample_frames_equidistant(
     return frames
 
 
-async def extract_forward_video_keyframes(
+async def extract_forward_media_keyframes(
     event: AstrMessageEvent,
     video_sources: List[str],
     max_count: int,
@@ -427,7 +518,7 @@ async def extract_forward_video_keyframes(
     ffmpeg_path: str,
     max_mb: int,
     max_duration: int,
-    timeout_sec: int,
+    timeout_sec: int = 60,
 ) -> Tuple[List[str], List[str], List[str]]:
     """
     将聊天记录中的视频源转换为关键帧图片。
@@ -448,7 +539,7 @@ async def extract_forward_video_keyframes(
         video_path = src_str
         is_temp_video = False
 
-        # 兼容 file:// 本地路径
+        # 兼容 file:// 本地路径。
         if video_path.startswith("file://"):
             fp = video_path[7:]
             if fp.startswith("/") and len(fp) > 3 and fp[2] == ":":
@@ -460,7 +551,7 @@ async def extract_forward_video_keyframes(
             ("http://", "https://")
         ):
             if os.path.isabs(video_path):
-                # 一些平台会回传不可访问的容器内绝对路径，尝试用文件名回退解析
+                # 一些平台会回传不可访问的容器内绝对路径，尝试用文件名回退解析。
                 fallback_id = os.path.basename(video_path)
                 if not fallback_id:
                     logger.debug(
@@ -496,7 +587,8 @@ async def extract_forward_video_keyframes(
             logger.debug(f"video_parser: 正在下载并解析合并转发中的视频: {video_path}")
             try:
                 downloaded = await asyncio.wait_for(
-                    download_video_to_temp(video_path, max_mb), timeout=timeout_sec
+                    download_media_to_temp(video_path, max_mb),
+                    timeout=timeout_sec,
                 )
                 if downloaded:
                     video_path = downloaded
@@ -513,7 +605,7 @@ async def extract_forward_video_keyframes(
         # 3. 探测时长
         duration = await asyncio.to_thread(probe_duration_sec, ffmpeg_path, video_path)
 
-        # 安全限制：硬编码 120 分钟 (7200秒)
+        # 安全限制：硬编码 120 分钟 (7200秒)。
         safety_max_duration = 7200
 
         if duration is None or duration > safety_max_duration or duration <= 0:
@@ -531,7 +623,7 @@ async def extract_forward_video_keyframes(
                 actual_interval = duration / sample_count
                 logger.debug(
                     f"[聊天记录解析] 视频时长 {duration:.1f}s 超过间隔覆盖范围，调整抽帧间隔: "
-                    f"{interval_sec}s -> {actual_interval:.1f}s (上限 {max_frame_count} 帧)"
+                    f"{interval_sec}s -> {actual_interval:.1f}s (上限 {max_frame_count} 帧)",
                 )
         else:
             sample_count = max(1, max_frame_count)
@@ -557,7 +649,7 @@ async def extract_audio_wav(ffmpeg_path: str, video_path: str) -> Optional[str]:
     out_path = tmp.name
     tmp.close()
 
-    # ffmpeg -i input.mp4 -vn -ac 1 -ar 16000 -f wav output.wav
+    # ffmpeg 命令参考：-i input.mp4 -vn -ac 1 -ar 16000 -f wav output.wav
     cmd = [
         ffmpeg_path or "ffmpeg",
         "-y",
@@ -609,14 +701,13 @@ async def prepare_video_context(
     frames = []
     cleanup_paths = []
     final_video_path = None
-    status = None  # 记录失败原因
+    status = None  # 记录失败原因。
 
     start_time = time.time()
 
     for src in video_sources:
-        # 检查总耗时
         if time.time() - start_time > process_timeout:
-            logger.warning("video_parser: processing timeout")
+            logger.warning(f"视频解析超时（{process_timeout}s），来源: {src}")
             status = "timeout"
             break
 
@@ -635,9 +726,9 @@ async def prepare_video_context(
         # 2. 下载远程视频
         if video_path.startswith(("http://", "https://")):
             try:
-                # 注意：download_video_to_temp 内部已经处理了大小限制
+                # 注意：download_media_to_temp 内部已经处理了大小限制。
                 downloaded = await asyncio.wait_for(
-                    download_video_to_temp(video_path, max_mb),
+                    download_media_to_temp(video_path, max_mb),
                     timeout=process_timeout - (time.time() - start_time),
                 )
                 if downloaded:
@@ -645,7 +736,7 @@ async def prepare_video_context(
                     is_temp_video = True
                     cleanup_paths.append(video_path)
                 else:
-                    # 如果返回 None，很可能是因为文件过大
+                    # 如果返回 None，很可能是因为文件过大。
                     status = "too_large"
                     continue
             except Exception:
@@ -659,7 +750,7 @@ async def prepare_video_context(
         # 3. 探测时长
         duration = await asyncio.to_thread(probe_duration_sec, ffmpeg_path, video_path)
 
-        # 安全限制：硬编码 120 分钟 (7200秒)
+        # 安全限制：硬编码 120 分钟 (7200秒)。
         safety_max_duration = 7200
 
         if duration is None or duration > safety_max_duration or duration <= 0:
@@ -668,7 +759,7 @@ async def prepare_video_context(
                     os.remove(video_path)
                 except Exception as e:
                     logger.debug(
-                        f"video_parser: failed to remove temp video {video_path}: {e}"
+                        f"[媒体处理] 临时视频文件清理失败: {video_path}, err={e}"
                     )
                 cleanup_paths.remove(video_path)
             status = "too_long"
@@ -690,7 +781,7 @@ async def prepare_video_context(
     return frames, cleanup_paths, final_video_path, status
 
 
-class VideoFrameProcessor:
+class MediaFrameProcessor:
     """统一的视频/GIF 帧处理器"""
 
     # 视频总结缓存: {message_id: {"summary": str, "expire": float}}
@@ -709,9 +800,7 @@ class VideoFrameProcessor:
             if video_key in cls._summary_cache:
                 item = cls._summary_cache[video_key]
                 if time.time() < item["expire"]:
-                    logger.debug(
-                        f"[VideoFrameProcessor] 视频总结缓存命中: {video_key[:50]}..."
-                    )
+                    logger.debug(f"[媒体处理] 视频总结缓存命中: {video_key[:50]}...")
                     return item["summary"]
                 else:
                     del cls._summary_cache[video_key]
@@ -721,17 +810,56 @@ class VideoFrameProcessor:
     async def set_cached_summary(
         cls, video_key: str, summary: str, ttl: int = VIDEO_SUMMARY_CACHE_TTL_SEC
     ):
-        """设置视频总结缓存，默认有效期 1 小时"""
+        """设置视频总结缓存，默认有效期 24 小时"""
         async with cls._cache_lock:
-            # 简单的容量清理：如果缓存超过上限，清空全部
+            # FIFO：超限时移除最早插入的键。
             if len(cls._summary_cache) >= VIDEO_SUMMARY_CACHE_MAX_SIZE:
-                cls._summary_cache.clear()
+                oldest_key = next(iter(cls._summary_cache))
+                del cls._summary_cache[oldest_key]
 
             cls._summary_cache[video_key] = {
                 "summary": summary,
                 "expire": time.time() + ttl,
             }
-            logger.debug(f"[VideoFrameProcessor] 视频总结已缓存: {video_key}")
+            logger.debug(f"[媒体处理] 视频总结已缓存: {video_key}")
+
+    def _get_source_file_key(self) -> Optional[str]:
+        """从事件消息链中提取 CQ file 字段作为内容指纹。"""
+        try:
+            message_obj = getattr(self.event, "message_obj", None)
+            chain = getattr(message_obj, "message", []) if message_obj else None
+            if not isinstance(chain, list):
+                return None
+            for seg in chain:
+                if isinstance(seg, dict):
+                    data = seg.get("data") or {}
+                    file_val = str(data.get("file") or "").strip()
+                    if file_val:
+                        return file_val
+                elif hasattr(seg, "type") and hasattr(seg, "data"):
+                    file_val = str(getattr(seg.data, "file", "") or "").strip()
+                    if file_val:
+                        return file_val
+        except Exception:
+            pass
+        return None
+
+    async def _get_cached_summary_dual(self, msg_id: str) -> Optional[str]:
+        """按 msg_id → file 键序查找缓存。"""
+        cached = await self.get_cached_summary(msg_id)
+        if cached:
+            return cached
+        file_key = self._get_source_file_key()
+        if file_key:
+            cached = await self.get_cached_summary(f"file:{file_key}")
+        return cached
+
+    async def _set_cached_summary_dual(self, msg_id: str, summary: str) -> None:
+        """同时以 msg_id 和 file 键写入缓存。"""
+        await self.set_cached_summary(msg_id, summary)
+        file_key = self._get_source_file_key()
+        if file_key:
+            await self.set_cached_summary(f"file:{file_key}", summary)
 
     async def process_long_video(
         self,
@@ -741,15 +869,18 @@ class VideoFrameProcessor:
         sender_name: str = None,
         msg_id: str = None,
     ) -> bool:
-        """【场景：视频】多帧抽取 + ASR → 帧聚合汇总"""
-        logger.debug(
-            f"[VideoFrameProcessor] 开始处理视频: {video_path}, msg_id: {msg_id}"
-        )
+        """【场景：视频】frame_pass → 抽帧直传；full_analysis → 逐帧汇总"""
+        logger.debug(f"[媒体处理] 开始处理视频: {video_path}, msg_id: {msg_id}")
         try:
-            # 1. 尝试从缓存获取
-            cached_summary = None
-            if msg_id:
-                cached_summary = await self.get_cached_summary(msg_id)
+            video_mode = (
+                str(self._get_cfg("video_mode", "full_analysis") or "full_analysis")
+                .strip()
+                .lower()
+            )
+
+            # frame_pass 不缓存。
+            if video_mode != "frame_pass" and msg_id:
+                cached_summary = await self._get_cached_summary_dual(msg_id)
                 if cached_summary:
                     self._inject_summary(
                         req,
@@ -784,7 +915,7 @@ class VideoFrameProcessor:
                     )
                     return True
                 logger.debug(
-                    "[VideoFrameProcessor] 视频解析跳过: status=%s, sender=%s, msg_id=%s",
+                    "[媒体处理] 视频解析跳过: status=%s, sender=%s, msg_id=%s",
                     status,
                     sender_name or "",
                     msg_id or "",
@@ -797,33 +928,79 @@ class VideoFrameProcessor:
                 )
                 return True
 
-            # 注册清理路径
             if cleanup_paths:
                 req._cleanup_paths.extend(cleanup_paths)
 
-            # 步骤：并发 ASR + 逐帧识图
+            # frame_pass: 抽帧直传主模型，可选音频。
+            if video_mode == "frame_pass":
+                req.image_urls = [str(f) for f in frames]
+                append_text_part_to_request(
+                    req, "\n\n用户发了一个视频，以下为其关键帧：\n"
+                )
+                if self._get_cfg("video_asr_enable", False) and local_video_path:
+                    audio_mode = (
+                        str(self._get_cfg("audio_mode", "asr") or "asr").strip().lower()
+                    )
+                    if audio_mode == "passthrough":
+                        provider = self._get_current_provider()
+                        if provider and _provider_supports_audio_input(provider):
+                            audio_path = await extract_audio_wav(
+                                self._get_cfg("ffmpeg_path", ""),
+                                local_video_path,
+                            )
+                            if audio_path:
+                                if (
+                                    not hasattr(req, "audio_urls")
+                                    or req.audio_urls is None
+                                ):
+                                    req.audio_urls = []
+                                req.audio_urls.append(audio_path)
+                                req._cleanup_paths = req._cleanup_paths or []
+                                req._cleanup_paths.append(audio_path)
+                        else:
+                            asr_text = await self._extract_and_transcribe_audio(
+                                local_video_path
+                            )
+                            if asr_text:
+                                append_text_part_to_request(
+                                    req, f"[语音转写] {asr_text}\n"
+                                )
+                    else:
+                        asr_text = await self._extract_and_transcribe_audio(
+                            local_video_path
+                        )
+                        if asr_text:
+                            append_text_part_to_request(req, f"[语音转写] {asr_text}\n")
+                for frame in frames:
+                    req._cleanup_paths = req._cleanup_paths or []
+                    req._cleanup_paths.append(frame)
+                return True
+
+            # full_analysis: 并发 ASR + 逐帧识图 → 汇总。
             asr_text = None
             asr_task = None
-            if self._get_cfg("video_asr_enable", True) and local_video_path:
+            if self._get_cfg("video_asr_enable", False) and local_video_path:
                 asr_task = asyncio.create_task(
-                    self._extract_and_transcribe_audio(local_video_path)
+                    self._extract_and_transcribe_audio(local_video_path),
                 )
 
             frame_descriptions = None
             provider = self._get_vision_provider()
             if provider and frames:
                 frame_descriptions = await self._describe_frames(
-                    provider, frames, max_concurrency=2, frame_timeout_sec=15
+                    provider,
+                    frames,
+                    max_concurrency=2,
+                    frame_timeout_sec=60,
                 )
 
             if asr_task:
                 try:
-                    asr_text = await asyncio.wait_for(asr_task, timeout=35)
+                    asr_text = await asyncio.wait_for(asr_task, timeout=60)
                 except asyncio.TimeoutError:
-                    logger.warning("[VideoFrameProcessor] ASR 超时")
+                    logger.warning("[媒体处理] ASR 超时")
                     asr_text = None
 
-            # 步骤：帧聚合汇总（已传入预计算的帧描述和 ASR）
             summary = await self._aggregate_frames_helper(
                 frames,
                 len(frames),
@@ -835,28 +1012,27 @@ class VideoFrameProcessor:
 
             if summary:
                 if msg_id:
-                    await self.set_cached_summary(msg_id, summary)
+                    await self._set_cached_summary_dual(msg_id, summary)
                 else:
-                    logger.warning("[VideoFrameProcessor] msg_id 为空，跳过缓存写入")
+                    logger.warning("[媒体处理] msg_id 为空，跳过缓存写入")
 
                 self._inject_summary(req, summary, "视频转述", sender_name=sender_name)
                 logger.debug(
-                    f"[VideoFrameProcessor] 视频总结成功并注入，来源: {sender_name or '当前消息'}"
+                    f"[媒体处理] 视频总结成功并注入，来源: {sender_name or '当前消息'}"
                 )
-                # 注册清理
                 for frame in frames:
                     req._cleanup_paths = req._cleanup_paths or []
                     req._cleanup_paths.append(frame)
                 return True
             else:
-                logger.warning("[VideoFrameProcessor] 视频转述生成失败，回退到首帧")
+                logger.warning("[媒体处理] 视频转述生成失败，回退到首帧")
                 req.image_urls.append(frames[0])
                 for frame in frames:
                     req._cleanup_paths = req._cleanup_paths or []
                     req._cleanup_paths.append(frame)
                 return True
         except Exception as e:
-            logger.warning(f"[VideoFrameProcessor] 视频处理失败: {e}")
+            logger.warning(f"[媒体处理] 视频处理失败: {e}")
             return False
 
     async def process_gif(
@@ -866,15 +1042,19 @@ class VideoFrameProcessor:
         sender_name: str = None,
         msg_id: str = None,
     ) -> bool:
-        """【场景：GIF 动图】强制抽帧 → 帧聚合汇总"""
-        logger.debug(
-            f"[VideoFrameProcessor] 开始处理 GIF: {gif_path}, msg_id: {msg_id}"
-        )
+        """【场景：GIF 动图】frame_pass → 抽帧直传；full_analysis → 逐帧汇总"""
         try:
-            # 1. 尝试从缓存获取
-            cached_summary = None
-            if msg_id:
-                cached_summary = await self.get_cached_summary(msg_id)
+            # 1. 尝试从缓存获取（仅 full_analysis）
+            gif_mode = (
+                str(self._get_cfg("gif_mode", "full_analysis") or "full_analysis")
+                .strip()
+                .lower()
+            )
+            logger.debug(
+                f"[GIF处理] GIF 处理: {gif_path}, mode: {gif_mode}, msg_id: {msg_id}"
+            )
+            if gif_mode != "frame_pass" and msg_id:
+                cached_summary = await self._get_cached_summary_dual(msg_id)
                 if cached_summary:
                     self._inject_summary(
                         req,
@@ -884,72 +1064,83 @@ class VideoFrameProcessor:
                     )
                     return True
 
-            logger.debug(f"[VideoFrameProcessor] GIF 处理: {gif_path}")
-
             ffmpeg_path = self._get_cfg("ffmpeg_path")
             duration = await self._probe_duration(gif_path)
             if not duration or duration <= 0:
                 duration = 1.0
 
-            # GIF 不再尝试直接解析，统一走抽帧
-
-            # GIF 固定参数：1秒/帧，最多 10 帧。使用 math.ceil 确保 1.1s -> 2 帧
-            sample_count = max(1, min(math.ceil(duration), 10))
+            # 参数化抽帧
+            interval = float(self._get_cfg("gif_frame_interval_sec", 0.5) or 0.5)
+            max_frames = int(self._get_cfg("gif_max_frames", 3) or 3)
+            ideal = max(1, math.ceil(duration / interval)) if interval > 0 else 1
+            sample_count = max(1, min(ideal, max_frames))
 
             logger.debug(
-                f"[VideoFrameProcessor] GIF 抽帧: 时长 {duration:.2f}s, 抽帧数 {sample_count}"
+                f"[GIF处理] GIF 抽帧: 时长 {duration:.2f}s, 间隔 {interval}s, 上限 {max_frames}, 实抽 {sample_count}"
             )
 
             frame_paths = await sample_frames_equidistant(
-                ffmpeg_path, gif_path, duration, sample_count
+                ffmpeg_path,
+                gif_path,
+                duration,
+                sample_count,
             )
 
             if not frame_paths:
-                logger.warning(
-                    f"[VideoFrameProcessor] GIF 解析未产生有效帧: {gif_path}"
-                )
+                logger.warning(f"[GIF处理] GIF 解析未产生有效帧: {gif_path}")
                 return False
 
             frames = [str(p) for p in frame_paths]
-            frame_count = len(frames)
 
-            if frame_count == 1:
-                logger.debug("[VideoFrameProcessor] GIF仅抽取到1帧，跳过汇总流程")
-                req.image_urls = [frames[0]]
+            # frame_pass: 抽帧直传主模型。
+            if gif_mode == "frame_pass":
+                req.image_urls.extend([str(f) for f in frames])
+                append_text_part_to_request(
+                    req, "\n\n用户发了一张动图，以下为其关键帧：\n"
+                )
                 for frame in frames:
                     req._cleanup_paths = req._cleanup_paths or []
                     req._cleanup_paths.append(frame)
                 return True
 
-            # GIF 帧聚合
+            # full_analysis: 帧聚合汇总。
+            frame_count = len(frames)
+            if frame_count == 1:
+                logger.debug("[GIF处理] GIF仅抽取到1帧，跳过汇总流程")
+                req.image_urls.append(frames[0])
+                for frame in frames:
+                    req._cleanup_paths = req._cleanup_paths or []
+                    req._cleanup_paths.append(frame)
+                return True
+
             summary = await self._aggregate_frames_helper(
-                frames, frame_count, duration, asr_text=None, max_summary_length=50
+                frames,
+                frame_count,
+                duration,
+                asr_text=None,
+                max_summary_length=50,
             )
 
             if summary:
                 if msg_id:
-                    await self.set_cached_summary(msg_id, summary)
+                    await self._set_cached_summary_dual(msg_id, summary)
                 else:
-                    logger.warning(
-                        "[VideoFrameProcessor] GIF msg_id 为空，跳过缓存写入"
-                    )
+                    logger.warning("[GIF处理] GIF msg_id 为空，跳过缓存写入")
 
                 self._inject_summary(req, summary, "内容摘要", sender_name=sender_name)
-                # 只保留最后一帧
-                req.image_urls = [frames[-1]]
-                logger.debug("[VideoFrameProcessor] GIF 总结成功")
+                req.image_urls.append(frames[-1])
+                logger.debug("[GIF处理] GIF 总结成功")
             else:
-                logger.warning("[VideoFrameProcessor] GIF 总结为空，回退到首帧")
-                req.image_urls = [frames[0]]
+                logger.warning("[GIF处理] GIF 总结为空，回退到首帧")
+                req.image_urls.append(frames[0])
 
-            # 注册清理
             for frame in frames:
                 req._cleanup_paths = req._cleanup_paths or []
                 req._cleanup_paths.append(frame)
             return True
 
         except Exception as e:
-            logger.error(f"[VideoFrameProcessor] GIF 处理异常: {e}", exc_info=True)
+            logger.error(f"[GIF处理] GIF 处理异常: {e}", exc_info=True)
             return False
 
     # ==================== 私有辅助方法 ====================
@@ -959,15 +1150,15 @@ class VideoFrameProcessor:
         try:
             duration = (
                 await asyncio.to_thread(
-                    probe_duration_sec, self._get_cfg("ffmpeg_path", ""), media_path
+                    probe_duration_sec,
+                    self._get_cfg("ffmpeg_path", ""),
+                    media_path,
                 )
                 or 0
             )
             return duration
         except Exception as e:
-            logger.debug(
-                f"[VideoFrameProcessor] 时长探测失败: path={media_path}, err={e}"
-            )
+            logger.debug(f"[媒体处理] 时长探测失败: path={media_path}, err={e}")
             return 0
 
     async def _extract_video_frames(
@@ -975,24 +1166,24 @@ class VideoFrameProcessor:
     ) -> Tuple[List[str], List[str], Optional[str], Optional[str]]:
         """多帧抽取（读取配置参数）"""
         interval = self._get_cfg("video_frame_interval_sec", 12)
-        max_frame_count = self._get_cfg("video_max_frame_count", 10)
+        max_frame_count = self._get_cfg("video_max_frame_count", 8)
 
         sample_count = 1
         if duration > 0:
-            # 动态计算抽帧数：取 (时长/间隔) 和 (抽帧上限) 的较小值
+            # 动态计算抽帧数：取 (时长/间隔) 和 (抽帧上限) 的较小值。
             ideal_count = math.ceil(duration / interval) if interval > 0 else 1
             sample_count = max(1, min(ideal_count, max_frame_count))
 
-            # 如果实际抽帧数因为达到上限而被压缩，日志记录一下
+            # 如果实际抽帧数因为达到上限而被压缩，日志记录一下。
             if ideal_count > max_frame_count:
                 actual_interval = duration / sample_count
                 logger.debug(
-                    f"[VideoFrameProcessor] 视频时长 {duration:.1f}s 超过间隔覆盖范围，调整抽帧间隔: {interval}s -> {actual_interval:.1f}s (上限 {max_frame_count} 帧)"
+                    f"[媒体处理] 视频时长 {duration:.1f}s 超过间隔覆盖范围，调整抽帧间隔: {interval}s -> {actual_interval:.1f}s (上限 {max_frame_count} 帧)"
                 )
         else:
-            sample_count = self._get_cfg("video_sample_count", 3)
+            sample_count = self._get_cfg("video_sample_count", 4)
 
-        logger.debug(f"[VideoFrameProcessor] 视频多帧抽取: {sample_count} 帧")
+        logger.debug(f"[媒体处理] 视频多帧抽取: {sample_count} 帧")
 
         try:
             (
@@ -1004,31 +1195,31 @@ class VideoFrameProcessor:
                 self.event,
                 [video_path],
                 max_mb=self._get_cfg("video_max_size_mb", 50),
-                max_duration=7200,  # 硬编码安全限制 120 分钟
+                max_duration=7200,  # 硬编码安全限制 120 分钟。
                 sample_count=sample_count,
                 ffmpeg_path=self._get_cfg("ffmpeg_path", ""),
-                process_timeout=30,
+                process_timeout=120,
             )
 
             return frames or [], cleanup_paths or [], local_video_path, status
         except Exception as e:
-            logger.warning(f"[VideoFrameProcessor] 帧抽取失败: {e}")
+            logger.warning(f"[媒体处理] 帧抽取失败: {e}")
             return [], [], None, "error"
 
     async def _extract_and_transcribe_audio(self, video_path: str) -> Optional[str]:
         """ASR：提取音频并转录"""
         try:
-            logger.debug("[VideoFrameProcessor] ASR: 正在从视频中提取音频...")
+            logger.debug("[媒体处理] ASR: 正在从视频中提取音频...")
             ffmpeg_path = self._get_cfg("ffmpeg_path", "")
             wav_path = await extract_audio_wav(ffmpeg_path, video_path)
 
             if not wav_path or not os.path.exists(wav_path):
-                logger.warning("[VideoFrameProcessor] ASR: 提取音频 WAV 失败")
+                logger.warning("[媒体处理] ASR: 提取音频 WAV 失败")
                 return None
 
             asr_text = None
             try:
-                logger.debug("[VideoFrameProcessor] ASR: 正在请求转录...")
+                logger.debug("[媒体处理] ASR: 正在请求转录...")
                 asr_text, llm_cleanup_paths = await transcribe_audio_with_fallback(
                     context=self.context,
                     get_cfg=self._get_cfg,
@@ -1041,26 +1232,28 @@ class VideoFrameProcessor:
                         os.remove(cleanup_path)
                     except Exception as e:
                         logger.debug(
-                            f"[VideoFrameProcessor] ASR LLM 临时音频清理失败: path={cleanup_path}, err={e}"
+                            f"[媒体处理] ASR LLM 临时音频清理失败: path={cleanup_path}, err={e}"
                         )
 
                 if asr_text:
-                    logger.debug(f"[VideoFrameProcessor] ASR 成功: {asr_text[:100]}...")
+                    logger.debug(f"[媒体处理] ASR 成功: {asr_text[:100]}...")
                 else:
-                    logger.debug("[VideoFrameProcessor] ASR 成功，但未识别到文字内容")
+                    logger.warning(
+                        "[媒体处理] ASR 未返回有效文本（Provider 可能不支持音频，或音频内容为空）"
+                    )
             except Exception as e:
-                logger.warning(f"[VideoFrameProcessor] ASR 调用失败: {e}")
+                logger.warning(f"[媒体处理] ASR 调用失败: {e}")
             finally:
                 try:
                     os.remove(wav_path)
                 except Exception as e:
                     logger.debug(
-                        f"[VideoFrameProcessor] ASR wav 清理失败: path={wav_path}, err={e}"
+                        f"[媒体处理] ASR wav 清理失败: path={wav_path}, err={e}"
                     )
 
             return asr_text
         except Exception as e:
-            logger.warning(f"[VideoFrameProcessor] ASR 处理失败: {e}")
+            logger.warning(f"[媒体处理] ASR 处理失败: {e}")
             return None
 
     # ---- 逐帧识图（单帧） ----
@@ -1071,15 +1264,15 @@ class VideoFrameProcessor:
         frame_path: str,
         idx: int,
         frame_count: int,
-        timeout_sec: int = 15,
+        timeout_sec: int = 60,
     ) -> Optional[str]:
         start_t = time.time()
-        logger.debug(f"[帧聚合汇总] 正在请求第 {idx}/{frame_count} 帧 ...")
+        logger.debug(f"[帧聚合] 正在请求第 {idx}/{frame_count} 帧 ...")
         for attempt in (1, 2):
             try:
                 response = await asyncio.wait_for(
                     provider.text_chat(
-                        prompt=f"简要描述这一帧（第 {idx}/{frame_count} 帧）的内容，重点关注动作、表情和关键物体。",
+                        prompt=f"简要描述这一帧（第 {idx}/{frame_count} 帧）的内容，重点关注动作、表情和关键物体。如果无法处理请直接回复【处理失败】。",
                         system_prompt="你是一个视频分析助手。请用 1-2 句话简洁描述图片内容。",
                         image_urls=[frame_path],
                         context=[],
@@ -1089,22 +1282,26 @@ class VideoFrameProcessor:
                 desc = self._extract_completion_text(response)
                 cost = time.time() - start_t
                 if desc:
-                    logger.debug(
-                        f"[帧聚合汇总] 第 {idx}/{frame_count} 帧解析成功 (耗时: {cost:.2f}s). 响应: {desc}"
-                    )
-                    return f"[第 {idx} 帧] {desc}"
+                    if "处理失败" in desc:
+                        logger.warning(f"[帧聚合] 第 {idx}/{frame_count} 帧被拒识")
+                    else:
+                        logger.debug(
+                            f"[帧聚合] 第 {idx}/{frame_count} 帧解析成功 (耗时: {cost:.2f}s). 响应: {desc}"
+                        )
+                        return f"[第 {idx} 帧] {desc}"
                 else:
-                    logger.warning(
-                        f"[帧聚合汇总] 第 {idx}/{frame_count} 帧解析响应为空"
-                    )
+                    logger.warning(f"[帧聚合] 第 {idx}/{frame_count} 帧解析响应为空")
             except asyncio.TimeoutError:
                 logger.warning(
-                    f"[帧聚合汇总] 第 {idx}/{frame_count} 帧识图超时 ({timeout_sec}s)"
+                    f"[帧聚合] 第 {idx}/{frame_count} 帧识图超时 ({timeout_sec}s)"
                 )
+                if attempt == 1:
+                    await asyncio.sleep(2)
+                    continue
                 break
             except Exception as e:
                 logger.warning(
-                    f"[帧聚合汇总] 第 {idx}/{frame_count} 帧识图异常 (attempt {attempt}): {e}"
+                    f"[帧聚合] 第 {idx}/{frame_count} 帧识图异常 (attempt {attempt}): {e}"
                 )
                 if attempt == 1:
                     await asyncio.sleep(2)
@@ -1119,7 +1316,7 @@ class VideoFrameProcessor:
         provider,
         frames: List[str],
         max_concurrency: int = 2,
-        frame_timeout_sec: int = 15,
+        frame_timeout_sec: int = 60,
     ) -> List[str]:
         sem = asyncio.Semaphore(max_concurrency)
         frame_count = len(frames)
@@ -1153,38 +1350,54 @@ class VideoFrameProcessor:
 
         max_summary_length = max_summary_length or 200
 
-        logger.debug(f"[帧聚合汇总] 开始处理 {len(frames)} 帧图片...")
+        logger.debug(f"[帧聚合] 开始处理 {len(frames)} 帧图片...")
 
-        # 步骤 1：逐帧识图（支持外部传入，否则自动并行处理）
+        # 1. 逐帧识图（支持外部传入，否则自动并行处理）
         if frame_descriptions is None:
             provider = self._get_vision_provider()
             if not provider:
-                logger.warning("[帧聚合汇总] 无可用 Vision Provider")
+                logger.warning("[帧聚合] 无可用 Vision Provider")
                 return None
             frame_descriptions = await self._describe_frames(
-                provider, frames, max_concurrency=2, frame_timeout_sec=15
+                provider,
+                frames,
+                max_concurrency=2,
+                frame_timeout_sec=60,
             )
 
         if not frame_descriptions:
             return None
 
+        # 预检：全部帧描述均为处理失败 → 仅在有 ASR 时继续（仅用音频生成摘要）。
+        if all(d.endswith("[处理失败]") for d in frame_descriptions if d):
+            if not asr_text:
+                logger.warning("[帧聚合] 所有帧画面分析均失败且无 ASR 内容，跳过汇总")
+                return None
+            logger.warning("[帧聚合] 所有帧画面分析均失败，仅基于 ASR 音频转写生成摘要")
+            frame_descriptions = None
+
         summary_start_t = time.time()
 
-        # 步骤 2：合并帧描述和 ASR
-        comprehensive_context = "\n".join(frame_descriptions)
+        # 2. 合并帧描述和 ASR
+        comprehensive_context = ""
+        if frame_descriptions:
+            comprehensive_context = "\n".join(frame_descriptions)
 
         if asr_text:
-            comprehensive_context += f"\n\n[视频语音转写]\n{asr_text}"
-            logger.debug("[帧聚合汇总] 已融合 ASR 内容")
+            if comprehensive_context:
+                comprehensive_context += f"\n\n[视频语音转写]\n{asr_text}"
+            else:
+                comprehensive_context = f"[视频语音转写]\n{asr_text}"
+            logger.debug("[帧聚合] 已融合 ASR 内容")
 
-        # 步骤 3：LLM 汇总
+        # 3. LLM 汇总
         try:
             llm_provider = self._get_summary_provider()
             if not llm_provider:
-                logger.warning("[帧聚合汇总] 无可用 LLM Provider")
+                logger.warning("[帧聚合] 无可用 LLM Provider")
                 return None
 
-            logger.debug("[帧聚合汇总] 正在请求汇总摘要...")
+            logger.debug("[帧聚合] 正在请求汇总摘要...")
 
             summary_prompt = (
                 f"根据以下逐帧视觉描述和语音转写（如有），生成连贯的汇总摘要。要求：\n"
@@ -1204,7 +1417,7 @@ class VideoFrameProcessor:
                     image_urls=[],
                     context=[],
                 ),
-                timeout=15,
+                timeout=30,
             )
 
             summary = self._extract_completion_text(response)
@@ -1212,20 +1425,20 @@ class VideoFrameProcessor:
             if summary:
                 if len(summary) > max_summary_length:
                     logger.debug(
-                        f"[帧聚合汇总] 摘要长度 {len(summary)} 超过限制 {max_summary_length}，截断处理"
+                        f"[帧聚合] 摘要长度 {len(summary)} 超过限制 {max_summary_length}，截断处理"
                     )
                     summary = summary[:max_summary_length].rsplit("。", 1)[0] + "。"
 
                 logger.debug(
-                    f"[帧聚合汇总] 汇总成功 (耗时: {time.time() - summary_start_t:.2f}s, 字数: {len(summary)}): {summary}"
+                    f"[帧聚合] 汇总成功 (耗时: {time.time() - summary_start_t:.2f}s, 字数: {len(summary)}): {summary}"
                 )
                 return summary
             else:
-                logger.warning("[帧聚合汇总] 汇总摘要响应为空")
+                logger.warning("[帧聚合] 汇总摘要响应为空")
         except asyncio.TimeoutError:
-            logger.warning("[帧聚合汇总] 汇总摘要超时")
+            logger.warning("[帧聚合] 汇总摘要超时")
         except Exception as e:
-            logger.warning(f"[帧聚合汇总] LLM 汇总失败: {e}")
+            logger.warning(f"[帧聚合] LLM 汇总失败: {e}")
 
         return None
 
@@ -1245,23 +1458,28 @@ class VideoFrameProcessor:
         )
         if not append_text_part_to_request(req, context_prompt, mark_temp=False):
             req.prompt = user_question + context_prompt
-        logger.debug(f"[VideoFrameProcessor] 成功注入{label}")
 
     def _find_provider(self, provider_id: str):
         """通用方法：从所有 Provider（包含 LLM 和 STT）中查找匹配的 ID/Name"""
         return find_provider(self.context, provider_id)
 
+    def _get_current_provider(self):
+        """获取当前会话 Provider"""
+        try:
+            return self.context.get_using_provider(umo=self.event.unified_msg_origin)
+        except Exception as e:
+            logger.debug(f"[媒体处理] 获取会话 Provider 失败: err={e}")
+        return None
+
     def _get_vision_provider(self):
         """获取 Vision Provider"""
-        provider_id = self._get_cfg("image_provider_id")
+        provider_id = self._get_cfg("video_image_provider_id")
         p = self._find_provider(provider_id)
         if p:
             return p
 
         if provider_id:
-            logger.warning(
-                f"[VideoFrameProcessor] 指定的 Vision Provider {provider_id} 未找到"
-            )
+            logger.warning(f"[媒体处理] 指定的 Vision Provider {provider_id} 未找到")
 
         # 自动选择（当前正在使用的）
         try:
@@ -1271,23 +1489,19 @@ class VideoFrameProcessor:
             if default_p:
                 return default_p
         except Exception as e:
-            logger.debug(
-                f"[VideoFrameProcessor] 获取会话 Vision Provider 失败: err={e}"
-            )
+            logger.debug(f"[媒体处理] 获取会话 Vision Provider 失败: err={e}")
 
         return None
 
     def _get_stt_provider(self):
         """获取 STT Provider"""
-        asr_pid = self._get_cfg("asr_provider_id")
+        asr_pid = self._get_cfg("audio_asr_provider_id")
         p = self._find_provider(asr_pid)
         if p:
             return p
 
         if asr_pid:
-            logger.warning(
-                f"[VideoFrameProcessor] 未找到指定的 STT Provider: {asr_pid}"
-            )
+            logger.warning(f"[媒体处理] 未找到指定的 STT Provider: {asr_pid}")
 
         try:
             stt_p = self.context.get_using_stt_provider(
@@ -1295,7 +1509,7 @@ class VideoFrameProcessor:
             )
             return stt_p
         except Exception as e:
-            logger.debug(f"[VideoFrameProcessor] 获取会话 STT Provider 失败: err={e}")
+            logger.debug(f"[媒体处理] 获取会话 STT Provider 失败: err={e}")
 
         return None
 
@@ -1307,9 +1521,7 @@ class VideoFrameProcessor:
             return p
 
         if provider_id:
-            logger.warning(
-                f"[VideoFrameProcessor] 未找到指定的视频摘要 Provider: {provider_id}"
-            )
+            logger.warning(f"[媒体处理] 未找到指定的视频摘要 Provider: {provider_id}")
 
         try:
             default_p = self.context.get_using_provider(
@@ -1318,7 +1530,7 @@ class VideoFrameProcessor:
             if default_p:
                 return default_p
         except Exception as e:
-            logger.debug(f"[VideoFrameProcessor] 获取会话摘要 Provider 失败: err={e}")
+            logger.debug(f"[媒体处理] 获取会话摘要 Provider 失败: err={e}")
 
         return None
 
@@ -1431,7 +1643,7 @@ async def _extract_videos_from_telegram_update(event: AstrMessageEvent) -> List[
                     ".wmv",
                     ".m4v",
                     ".gif",
-                )
+                ),
             ):
                 try:
                     file_obj = await doc_obj.get_file()
@@ -1462,39 +1674,8 @@ async def _probe_duration_helper(get_cfg, media_path: str) -> float:
         )
         return duration
     except Exception as e:
-        logger.warning(f"[探测时长] 异常: {e}")
+        logger.warning(f"[时长探测] 异常: {e}")
         return 0
-
-
-async def _extract_videos_via_get_msg(
-    event: AstrMessageEvent, msg_ids: List[str]
-) -> List[str]:
-    if not isinstance(event, AiocqhttpMessageEvent):
-        return []
-    if not msg_ids:
-        return []
-    try:
-        client = event.bot
-    except Exception:
-        return []
-
-    videos: List[str] = []
-    for msg_id in msg_ids:
-        try:
-            original_msg = await client.api.call_action("get_msg", message_id=msg_id)
-            if _is_unavailable_get_msg_payload(original_msg):
-                continue
-            if original_msg and "message" in original_msg:
-                extracted = extract_videos_from_chain(original_msg["message"])
-                if extracted:
-                    videos.extend(extracted)
-        except Exception:
-            continue
-    deduped: List[str] = []
-    for item in videos:
-        if item and item not in deduped:
-            deduped.append(item)
-    return deduped
 
 
 async def _extract_video_sources_with_msg_ids_via_get_msg(
@@ -1541,18 +1722,9 @@ async def detect_media_scenario(
 ) -> MediaContext:
     """检测当前媒体场景并返回上下文。"""
     ctx = MediaContext()
-    image_urls: Any = getattr(req, "image_urls", None)
-    allow_gif_from_image_urls = bool(get_cfg("gif_parse_enable", False))
 
     if video_sources and len(video_sources) > 0:
         ctx.media_path = video_sources[0]
-    elif (
-        allow_gif_from_image_urls
-        and image_urls
-        and isinstance(image_urls, list)
-        and len(image_urls) > 0
-    ):
-        ctx.media_path = image_urls[0]
     else:
         ctx.scenario = MediaScenario.NONE
         return ctx
@@ -1565,7 +1737,7 @@ async def detect_media_scenario(
     if first_path.startswith(("http://", "https://")):
         try:
             max_size = get_cfg("video_max_size_mb", 50)
-            local_path = await download_video_to_temp(first_path, max_size)
+            local_path = await download_media_to_temp(first_path, max_size)
             if local_path:
                 ctx.media_path = local_path
                 ctx.cleanup_paths.append(local_path)
@@ -1579,12 +1751,18 @@ async def detect_media_scenario(
 
     ctx.media_path = first_path
     if is_gif_file(first_path):
-        if not bool(get_cfg("gif_parse_enable", False)):
+        if not bool(get_cfg("gif_parse_enable", True)):
             logger.debug(
-                "[VideoFrameProcessor] GIF 解析已关闭，保留框架原生图片处理链: %s",
-                first_path,
+                "[GIF处理] GIF 解析已关闭，保留框架原生图片处理链: %s", first_path
             )
             ctx.scenario = MediaScenario.NONE
+            return ctx
+        gif_mode = (
+            str(get_cfg("gif_mode", "full_analysis") or "full_analysis").strip().lower()
+        )
+        if gif_mode == "direct":
+            ctx.scenario = MediaScenario.GIF_DIRECT
+            ctx.media_path = first_path
             return ctx
         ctx.duration = await _probe_duration_helper(get_cfg, first_path)
         if ctx.duration <= 0:
@@ -1611,6 +1789,10 @@ async def detect_media_scenario(
             pass
 
     if is_video_format:
+        if not bool(get_cfg("video_parse_enable", True)):
+            logger.debug("[媒体处理] 视频解析已关闭，跳过: %s", first_path)
+            ctx.scenario = MediaScenario.NONE
+            return ctx
         ctx.duration = await _probe_duration_helper(get_cfg, first_path)
         if ctx.duration <= 0:
             ctx.scenario = MediaScenario.NONE
@@ -1622,6 +1804,62 @@ async def detect_media_scenario(
     return ctx
 
 
+async def _scan_gifs_from_image_urls(
+    req: ProviderRequest,
+    get_cfg,
+) -> Tuple[List[Tuple[str, MediaScenario, List[str]]], List[str]]:
+    """扫描 req.image_urls 中的 GIF 文件并分类。
+
+    Returns:
+        gif_infos: [(local_path, scenario, cleanup_paths), ...]
+        rest_urls: 非 GIF 图片 URL 保留列表
+    """
+    image_urls = getattr(req, "image_urls", []) or []
+    if not image_urls:
+        return [], []
+
+    gif_infos: List[Tuple[str, MediaScenario, List[str]]] = []
+    rest: List[str] = []
+
+    for url in image_urls:
+        first_path = url
+        cleanup: List[str] = []
+
+        if isinstance(first_path, str) and first_path.startswith(
+            ("http://", "https://")
+        ):
+            try:
+                max_size = int(get_cfg("video_max_size_mb", 50))
+                local_path = await download_media_to_temp(first_path, max_size)
+                if local_path:
+                    cleanup.append(local_path)
+                    first_path = local_path
+                else:
+                    rest.append(url)
+                    continue
+            except Exception:
+                rest.append(url)
+                continue
+
+        if not is_gif_file(first_path):
+            rest.append(url)
+            continue
+
+        gif_mode = (
+            str(get_cfg("gif_mode", "full_analysis") or "full_analysis").strip().lower()
+        )
+        if gif_mode == "direct":
+            gif_infos.append((first_path, MediaScenario.GIF_DIRECT, cleanup))
+        else:
+            duration = await _probe_duration_helper(get_cfg, first_path)
+            if duration and duration > 0:
+                gif_infos.append((first_path, MediaScenario.GIF_ANIMATED, cleanup))
+            else:
+                rest.append(url)
+
+    return gif_infos, rest
+
+
 async def process_media_content(
     context: Any,
     event: AstrMessageEvent,
@@ -1631,7 +1869,9 @@ async def process_media_content(
     get_cfg,
 ) -> bool:
     """处理视频/GIF 媒体注入。"""
-    if not get_cfg("video_parse_enable", True):
+    if not get_cfg("video_parse_enable", True) and not get_cfg(
+        "gif_parse_enable", True
+    ):
         return False
 
     dynamic_batch_msg_ids = (
@@ -1664,7 +1904,7 @@ async def process_media_content(
             ]
             logger.debug(
                 "[LLMEnhancement] 媒体解析 get_msg 兜底命中："
-                f"batch_msg_ids={dynamic_batch_msg_ids}, source_msg_id={video_source_msg_id}, fetched_video_sources={fetched_video_sources}"
+                f"batch_msg_ids={dynamic_batch_msg_ids}, source_msg_id={video_source_msg_id}, fetched_video_sources={fetched_video_sources}",
             )
     elif not raw_video_sources:
         current_msg_id = getattr(
@@ -1685,7 +1925,7 @@ async def process_media_content(
                 ]
                 logger.debug(
                     "[LLMEnhancement] 媒体解析 get_msg 兜底命中："
-                    f"msg_id={current_msg_id}, source_msg_id={video_source_msg_id}, fetched_video_sources={fetched_video_sources}"
+                    f"msg_id={current_msg_id}, source_msg_id={video_source_msg_id}, fetched_video_sources={fetched_video_sources}",
                 )
 
     if not video_sources and reply_seg:
@@ -1706,7 +1946,7 @@ async def process_media_content(
             reply_chain_sources = extract_videos_from_chain(reply_chain)
             if reply_chain_sources:
                 video_sources.extend(
-                    [src for src in reply_chain_sources if src not in video_sources]
+                    [src for src in reply_chain_sources if src not in video_sources],
                 )
 
     if video_sources:
@@ -1730,11 +1970,10 @@ async def process_media_content(
 
     media_ctx = await detect_media_scenario(req, get_cfg, video_sources)
     req._cleanup_paths.extend(media_ctx.cleanup_paths)
-    processor = VideoFrameProcessor(context, event, get_cfg)
+    processor = MediaFrameProcessor(context, event, get_cfg)
 
-    if media_ctx.scenario in [MediaScenario.VIDEO, MediaScenario.GIF_ANIMATED]:
-        if media_ctx.media_path in req.image_urls:
-            req.image_urls.remove(media_ctx.media_path)
+    # VIDEO 场景（优先，走完整抽帧+ASR+汇总管线）
+    if media_ctx.scenario == MediaScenario.VIDEO:
         if len(req.image_urls) > 0:
             req.image_urls = [
                 url
@@ -1744,8 +1983,6 @@ async def process_media_content(
                     for s in [".mp4", ".mov", ".avi", ".wmv", ".flv", ".m4v"]
                 )
             ]
-
-    if media_ctx.scenario == MediaScenario.VIDEO:
         quoted_sender = getattr(req, "_quoted_sender", None) if reply_seg else None
         current_msg_id = getattr(
             getattr(event, "message_obj", None), "message_id", None
@@ -1762,7 +1999,55 @@ async def process_media_content(
             sender_name=quoted_sender,
             msg_id=msg_id,
         )
-    elif media_ctx.scenario == MediaScenario.GIF_ANIMATED:
+
+    # GIF 处理：合并来自 video_sources 的第一张 GIF + image_urls 中的多 GIF。
+    gif_batch: List[Tuple[str, MediaScenario, List[str]]] = []
+    if media_ctx.scenario in (MediaScenario.GIF_DIRECT, MediaScenario.GIF_ANIMATED):
+        gif_batch.append((media_ctx.media_path, media_ctx.scenario, []))
+    if not video_sources and get_cfg("gif_parse_enable", True):
+        extra_gifs, rest_urls = await _scan_gifs_from_image_urls(req, get_cfg)
+        req.image_urls = rest_urls
+        gif_batch.extend(extra_gifs)
+
+    # ==================== 音频文件 ASR ====================
+    audio_handled = False
+    audio_sources = extract_audios_from_chain(all_components)
+    if audio_sources:
+        audio_mode = str(get_cfg("audio_mode", "asr") or "asr").strip().lower()
+        if audio_mode != "off":
+            for audio_url in audio_sources:
+                try:
+                    if (
+                        audio_url
+                        and (
+                            not audio_url.startswith(("http://", "https://", "file://"))
+                        )
+                        and (not os.path.isabs(audio_url))
+                    ):
+                        resolved = await napcat_resolve_file_url(event, audio_url)
+                        if resolved:
+                            audio_url = resolved
+                    audio_path = await download_media_to_temp(
+                        audio_url, size_mb_limit=10
+                    )
+                    if not audio_path:
+                        continue
+                    text, cleanup_paths = await transcribe_audio_with_fallback(
+                        context=context,
+                        get_cfg=get_cfg,
+                        event=event,
+                        audio_path=audio_path,
+                    )
+                    req._cleanup_paths.extend(cleanup_paths)
+                    text = str(text or "").strip()
+                    if text:
+                        append_text_part_to_request(req, f"\n\n[音频文件转写] {text}\n")
+                        audio_handled = True
+                except Exception as e:
+                    logger.debug(f"[LLMEnhancement] 音频文件 ASR 失败: {e}")
+
+    if gif_batch:
+        handled = False
         quoted_sender = getattr(req, "_quoted_sender", None) if reply_seg else None
         current_msg_id = getattr(
             getattr(event, "message_obj", None), "message_id", None
@@ -1772,11 +2057,54 @@ async def process_media_content(
             if reply_seg
             else str(video_source_msg_id or current_msg_id)
         )
-        return await processor.process_gif(
-            req,
-            media_ctx.media_path,
-            sender_name=quoted_sender,
-            msg_id=msg_id,
-        )
+        for gif_path, scenario, cleanups in gif_batch:
+            req._cleanup_paths.extend(cleanups)
+            if scenario == MediaScenario.GIF_DIRECT:
+                cached_desc = await MediaFrameProcessor.get_cached_summary(msg_id)
+                gif_file_key = (
+                    processor._get_source_file_key() if not cached_desc else None
+                )
+                if not cached_desc and gif_file_key:
+                    cached_desc = await MediaFrameProcessor.get_cached_summary(
+                        f"file:{gif_file_key}"
+                    )
+                if cached_desc:
+                    append_text_part_to_request(req, f"\n\n[GIF 描述] {cached_desc}\n")
+                    handled = True
+                else:
+                    gif_pid = get_cfg("gif_provider_id", "")
+                    provider = (
+                        processor._find_provider(gif_pid)
+                        if gif_pid
+                        else processor._get_vision_provider()
+                    )
+                    if provider:
+                        try:
+                            response = await provider.text_chat(
+                                prompt="请用中文描述这个动图的内容，包含：主体动作变化、场景切换、表情互动、画面中的文字。控制在60字以内。如果无法处理请直接回复【处理失败】。",
+                                image_urls=[gif_path],
+                                context=[],
+                            )
+                            desc = processor._extract_completion_text(response)
+                            if desc and "处理失败" not in desc:
+                                append_text_part_to_request(
+                                    req, f"\n\n[GIF 描述] {desc}\n"
+                                )
+                                await MediaFrameProcessor.set_cached_summary(
+                                    msg_id, desc
+                                )
+                                if gif_file_key:
+                                    await MediaFrameProcessor.set_cached_summary(
+                                        f"file:{gif_file_key}", desc
+                                    )
+                                handled = True
+                        except Exception as e:
+                            logger.warning(f"[LLMEnhancement] GIF direct 描述失败: {e}")
+            elif scenario == MediaScenario.GIF_ANIMATED:
+                if await processor.process_gif(
+                    req, gif_path, sender_name=quoted_sender, msg_id=msg_id
+                ):
+                    handled = True
+        return handled or audio_handled
 
-    return False
+    return audio_handled

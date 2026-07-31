@@ -5,13 +5,23 @@ import random
 from typing import List, Any, Optional
 from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.star import Context, Star, StarTools
-from astrbot.api import logger, AstrBotConfig 
-import astrbot.api.message_components as Comp 
-from astrbot.api.provider import LLMResponse, ProviderRequest 
+from astrbot.api import logger, AstrBotConfig
+import astrbot.api.message_components as Comp
+from astrbot.api.provider import LLMResponse, ProviderRequest
 from astrbot.core.utils.session_waiter import session_waiter, SessionController
+from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import (
+    AiocqhttpMessageEvent,
+)
 from .modules.sentiment import Sentiment
 from .modules.similarity import Similarity
 from .modules.state_manager import StateManager, GroupState, MemberState
+from .modules import (
+    dialogue_context as _ctx_module,
+    forward_parser as _fp_module,
+    url_parser as _up_module,
+    runtime_helpers as _rh_module,
+)
+from .modules.media_parser import MediaFrameProcessor as _MediaFrameProcessor
 from .modules.forward_parser import process_forward_record_content
 from .modules.reference_parser import (
     check_self_reply_block,
@@ -20,8 +30,8 @@ from .modules.reference_parser import (
     inject_current_message_forward_origin_context,
     inject_record_asr_context,
 )
-from .modules.video_parser import (
-    download_video_to_temp,
+from .modules.media_parser import (
+    download_media_to_temp,
     process_media_content,
 )
 from .modules.qq_utils import (
@@ -60,19 +70,18 @@ from .modules.runtime_helpers import (
     resolve_provider,
     get_stt_provider,
     get_vision_provider,
-    get_discarded_response_ttl_sec,
     clear_discarded_response_cache,
     store_discarded_response_cache,
     is_llm_response_empty_without_tool,
     is_chain_effectively_empty,
     looks_like_error_result,
+    save_caches_to_kv,
+    load_caches_from_kv,
     apply_discarded_response_fallback,
     append_text_part_to_request,
-    
 )
 from .modules.qq_face import build_message_text_with_qq_faces
 from .modules.wake_logic import (
-    normalize_concurrency_limit,
     try_acquire_request_concurrency_slot,
     release_request_concurrency_slot,
     evict_stale_concurrency_slots,
@@ -91,7 +100,6 @@ from .modules.wake_logic import (
     evaluate_mention_wake,
     contains_forbidden_wake_word,
     compute_relevant_context_substring_downweight,
-    get_prob_wake_activity,
     get_prob_wake_observe_threshold,
     get_prob_wake_trigger_chance,
 )
@@ -123,7 +131,6 @@ from .modules.merge_flow import (
     mark_dynamic_soft_recompute,
     request_dynamic_recompute_stop,
     schedule_dynamic_recompute_requeue,
-    drop_dynamic_batch_from_unresolved,
     reset_dynamic_capture_session,
     reset_member_state,
     reset_group_state,
@@ -157,13 +164,12 @@ from .modules.dialogue_context import (
     inject_context_into_request,
     clear_context_records_for_group,
 )
-from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import AiocqhttpMessageEvent
 # ==================== 常量定义 ====================
 
 RECENT_RECALL_TTL_SEC = 120.0
-DYNAMIC_DISCARDED_RESPONSE_TTL_SEC = 300.0
 PRIVATE_TYPING_INDICATOR_INTERVAL_SEC = 0.5
 PRIVATE_TYPING_INDICATOR_TIMEOUT_SEC = 120.0
+
 
 def _raw_get(raw: Any, key: str, default: Any = None) -> Any:
     """兼容 dict / aiocqhttp Event 的字段读取。"""
@@ -177,6 +183,7 @@ def _raw_get(raw: Any, key: str, default: Any = None) -> Any:
         return getattr(raw, key, default)
     except Exception:
         return default
+
 
 async def _background_context_injection(
     *,
@@ -222,11 +229,18 @@ async def _background_context_injection(
                     message_chain=message_chain,
                     raw_image_datas=raw_image_datas,
                     get_cfg=self._get_cfg,
-                    provider_by_id_resolver=lambda provider_id: resolve_provider(self.context, provider_id),
-                    default_provider_resolver=lambda: get_vision_provider(self.context, self._get_cfg, event=event),
+                    provider_by_id_resolver=lambda provider_id: resolve_provider(
+                        self.context, provider_id
+                    ),
+                    default_provider_resolver=lambda: get_vision_provider(
+                        self.context, self._get_cfg, event=event
+                    ),
+                    emoji_mode=True,
                 )
                 if image_caption:
-                    image_label = get_image_component_label(message_chain, raw_image_datas=raw_image_datas)
+                    image_label = get_image_component_label(
+                        message_chain, raw_image_datas=raw_image_datas
+                    )
                     text_enrichment = (
                         f"{text_enrichment} | {image_label}转述: {image_caption}"
                         if text_enrichment
@@ -244,14 +258,21 @@ async def _background_context_injection(
                 msg_id=current_msg_id,
                 parse_options=parse_options,
                 raw_image_datas=raw_image_datas,
-                provider_by_id_resolver=lambda provider_id: resolve_provider(self.context, provider_id),
-                default_provider_resolver=lambda: get_vision_provider(self.context, self._get_cfg, event=event),
+                provider_by_id_resolver=lambda provider_id: resolve_provider(
+                    self.context, provider_id
+                ),
+                default_provider_resolver=lambda: get_vision_provider(
+                    self.context, self._get_cfg, event=event
+                ),
+                emoji_mode=True,
             )
         if not context_text:
             image_caption = ""
             image_label = "图片"
             if (not msg) and ("image" in parse_options):
-                image_label = get_image_component_label(message_chain, raw_image_datas=raw_image_datas)
+                image_label = get_image_component_label(
+                    message_chain, raw_image_datas=raw_image_datas
+                )
             context_text = build_context_text(
                 msg,
                 event.get_sender_name(),
@@ -305,9 +326,18 @@ async def _background_context_injection(
         logger.error(f"[LLMEnhancement] 后台上下文注入失败: {type(e).__name__}: {e}")
 
 
-class LLMEnhancement(Star): 
-    def __init__(self, context: Context, config: AstrBotConfig): 
-        super().__init__(context) 
+def _flatten_cfg(src: dict, target: dict) -> None:
+    """递归拍平嵌套配置字典到目标字典。"""
+    for k, v in src.items():
+        if isinstance(v, dict):
+            _flatten_cfg(v, target)
+        else:
+            target[k] = v
+
+
+class LLMEnhancement(Star):
+    def __init__(self, context: Context, config: AstrBotConfig):
+        super().__init__(context)
         self.config = config
         self.cfg = {}
         self._recent_recalled_msg: dict[str, float] = {}
@@ -327,47 +357,68 @@ class LLMEnhancement(Star):
         )
         logger.info("[LLMEnhancement] 插件初始化完成。")
 
-    async def initialize(self):
-        await self.blacklist.initialize()
+    _CACHE_PERSIST_KEY = "llme_caches"
 
+    _CACHE_SOURCES = (
+        ("image_caption", _ctx_module._context_image_caption_cache, "expire_at"),
+        ("emoji", _ctx_module._context_emoji_cache, "expire_at"),
+        ("forward", _fp_module._forward_result_cache, "expire"),
+        ("url", _up_module._url_inject_cache, "expire"),
+        ("asr", _rh_module._record_asr_cache, "expire_at"),
+        ("video_summary", _MediaFrameProcessor._summary_cache, "expire"),
+    )
+
+    async def _save_caches_to_kv(self):
+        await save_caches_to_kv(
+            self.put_kv_data, self._CACHE_SOURCES, self._CACHE_PERSIST_KEY
+        )
+
+    async def _load_caches_from_kv(self):
+        await load_caches_from_kv(
+            self.get_kv_data, self._CACHE_SOURCES, self._CACHE_PERSIST_KEY
+        )
+
+    async def initialize(self):
+        await self._load_caches_from_kv()
+        await self.blacklist.initialize()
 
     def _refresh_config(self):
         """将 object 格式的配置平铺到 self.cfg 中"""
         self.cfg = {}
-        # 1. 获取顶级配置项
-        for k in ["group_whitelist"]:
-            self.cfg[k] = self.config.get(k)
-        
-        # 2. 平铺对象配置
-        for section in [
-            "intelligent_wake",
-            "context_injection",
-            "parse_switches",
-            "video_injection",
-            "forward_parsing",
-            "file_parsing",
-            "url_parsing",
-            "qq_platform",
-            "blacklist",
-        ]:
-            section_cfg = self.config.get(section, {})
-            if isinstance(section_cfg, dict):
-                for k, v in section_cfg.items():
+        # 1. 递归平铺所有配置
+        for k, v in self.config.items():
+            if k == "media_parse":
+                continue
+            if isinstance(v, dict):
+                _flatten_cfg(v, self.cfg)
+            else:
+                self.cfg[k] = v
+
+        # 2. 递归平铺 media_parse
+        media_parse = self.config.get("media_parse", {})
+        if isinstance(media_parse, dict):
+            for k, v in media_parse.items():
+                if isinstance(v, dict):
+                    for sub_k, sub_v in v.items():
+                        self.cfg[f"{k}_{sub_k}"] = sub_v
+                else:
                     self.cfg[k] = v
 
         # 3. 群聊按用户并发兼容性检查
-        orch = self.config.get("request_orchestration", {})
-        if not isinstance(orch, dict):
-            orch = {}
-        dynamic_mode = str(orch.get("merge_dynamic_mode", "dynamic") or "dynamic").strip().lower() == "dynamic"
-        allow_multi_user = bool(orch.get("merge_multi_user", False))
-        group_concurrency = bool(orch.get("group_sender_concurrency", False))
+        dynamic_mode = (
+            str(self._get_cfg("merge_dynamic_mode", "dynamic") or "dynamic")
+            .strip()
+            .lower()
+            == "dynamic"
+        )
+        allow_multi_user = bool(self._get_cfg("merge_multi_user", False))
+        group_concurrency = bool(self._get_cfg("group_sender_concurrency", False))
         if dynamic_mode and allow_multi_user and group_concurrency:
             if not hasattr(self, "_warned_group_concurrency_conflict"):
                 self._warned_group_concurrency_conflict = True
                 logger.warning(
                     "[LLMEnhancement] 动态合并模式下多人合并与请求并发冲突，"
-                    "已自动禁用群组按用户并发功能。"
+                    "已自动禁用群组按用户并发功能。",
                 )
             group_concurrency = False
         old_val = self.cfg.get("_group_concurrency_enabled", False)
@@ -382,14 +433,6 @@ class LLMEnhancement(Star):
         if key in self.cfg:
             return self.cfg[key]
         return self.config.get(key, default)
-
-    def _confirm_timeout_sec(self) -> int:
-        raw = self._get_cfg("confirm_timeout_sec", 90)
-        try:
-            value = int(raw)
-        except Exception:
-            value = 90
-        return max(10, min(600, value))
 
     def _get_private_typing_task_key(self, event: AstrMessageEvent) -> str:
         key = str(getattr(event, "unified_msg_origin", "") or "").strip()
@@ -422,6 +465,7 @@ class LLMEnhancement(Star):
             return
         _, stop_event = task_pair
         try:
+
             async def loop() -> None:
                 while not stop_event.is_set():
                     await self._show_private_typing_indicator(event)
@@ -436,7 +480,7 @@ class LLMEnhancement(Star):
             await asyncio.wait_for(loop(), timeout=PRIVATE_TYPING_INDICATOR_TIMEOUT_SEC)
         except asyncio.TimeoutError:
             logger.debug(
-                f"[LLMEnhancement] Private typing indicator task timed out: task_key={task_key}"
+                f"[LLMEnhancement] Private typing indicator task timed out: task_key={task_key}",
             )
         finally:
             stop_event.set()
@@ -455,7 +499,7 @@ class LLMEnhancement(Star):
             return
         stop_event = asyncio.Event()
         task = asyncio.create_task(
-            self._run_private_typing_indicator_loop(task_key, event)
+            self._run_private_typing_indicator_loop(task_key, event),
         )
         self._private_typing_tasks[task_key] = (task, stop_event)
 
@@ -482,13 +526,15 @@ class LLMEnhancement(Star):
         *,
         reason: str,
     ) -> int:
-        """Release pre-acquired concurrency slot if still held."""
+        """释放预获取的并发槽位（若仍持有）。"""
         if not bool(event.get_extra("_llme_concurrency_acquired", default=False)):
             return -1
         if bool(event.get_extra("_llme_concurrency_released", default=False)):
             return -1
 
-        slot_key = str(event.get_extra("_llme_concurrency_key", default="") or "").strip()
+        slot_key = str(
+            event.get_extra("_llme_concurrency_key", default="") or ""
+        ).strip()
         left_ref = 0
         if slot_key:
             async with self._request_counter_lock:
@@ -503,12 +549,14 @@ class LLMEnhancement(Star):
         logger.debug(
             "[LLMEnhancement] 并发槽位释放："
             f"key={slot_key}, left_ref={left_ref}, reason={reason}, "
-            f"group={event.get_group_id() or 'private'}, uid={event.get_sender_id()}"
+            f"group={event.get_group_id() or 'private'}, uid={event.get_sender_id()}",
         )
         return left_ref
 
     def _is_command_trigger_event(self, event: AstrMessageEvent) -> bool:
-        handlers_parsed_params = event.get_extra("handlers_parsed_params", default={}) or {}
+        handlers_parsed_params = (
+            event.get_extra("handlers_parsed_params", default={}) or {}
+        )
         if not isinstance(handlers_parsed_params, dict) or not handlers_parsed_params:
             return False
 
@@ -529,12 +577,16 @@ class LLMEnhancement(Star):
     def _build_recall_key(self, umo: str, msg_id: str) -> str:
         return f"{umo}::{msg_id}"
 
-    def _mark_recent_recall(self, umo: str, msg_id: str, ttl_sec: float = RECENT_RECALL_TTL_SEC) -> None:
+    def _mark_recent_recall(
+        self, umo: str, msg_id: str, ttl_sec: float = RECENT_RECALL_TTL_SEC
+    ) -> None:
         sid = str(msg_id or "").strip()
         if not sid:
             return
         now_ts = time.time()
-        self._recent_recalled_msg[self._build_recall_key(umo, sid)] = now_ts + max(10.0, float(ttl_sec))
+        self._recent_recalled_msg[self._build_recall_key(umo, sid)] = now_ts + max(
+            10.0, float(ttl_sec)
+        )
         expired = [k for k, exp in self._recent_recalled_msg.items() if exp <= now_ts]
         for k in expired:
             self._recent_recalled_msg.pop(k, None)
@@ -615,20 +667,25 @@ class LLMEnhancement(Star):
                             "source_event": source_event,
                         }
                 hit = True
-                logger.info(
-                    "[LLMEnhancement] 撤回命中动态/合并状态："
-                    f"group={group_scope}, uid={m.uid}, msg_id={recalled_msg_id}, notice_type={notice_type}, "
-                    f"removed_pending={summary.get('removed_pending')}, "
-                    f"removed_dynamic={summary.get('removed_dynamic_unresolved')}, "
-                    f"marked_cancel={summary.get('marked_cancel')}, inflight_seq={summary.get('inflight_seq')}"
-                )
+                if int(m.dynamic_inflight_seq or 0) > 0:
+                    logger.debug(
+                        "[LLMEnhancement] 撤回命中动态/合并状态："
+                        f"group={group_scope}, uid={m.uid}, msg_id={recalled_msg_id}, notice_type={notice_type}, "
+                        f"removed_pending={summary.get('removed_pending')}, "
+                        f"removed_dynamic={summary.get('removed_dynamic_unresolved')}, "
+                        f"marked_cancel={summary.get('marked_cancel')}, inflight_seq={summary.get('inflight_seq')}",
+                    )
             if requeue_plan:
                 stop_requested = request_dynamic_recompute_stop(
                     notice_event,
                     inflight_seq=int(requeue_plan["inflight_seq"]),
                     owner_uid=str(requeue_plan["uid"]),
                 )
-                event_queue = self.context.get_event_queue() if hasattr(self.context, "get_event_queue") else None
+                event_queue = (
+                    self.context.get_event_queue()
+                    if hasattr(self.context, "get_event_queue")
+                    else None
+                )
                 requeued = schedule_dynamic_recompute_requeue(
                     source_event=requeue_plan["source_event"],
                     event_queue=event_queue,
@@ -648,13 +705,13 @@ class LLMEnhancement(Star):
                     logger.info(
                         "[LLMEnhancement] 撤回命中后已安排动态重算："
                         f"group={group_scope}, uid={requeue_plan['uid']}, msg_id={recalled_msg_id}, "
-                        f"inflight_seq={int(requeue_plan['inflight_seq'])}, stop_requested={stop_requested}"
+                        f"inflight_seq={int(requeue_plan['inflight_seq'])}, stop_requested={stop_requested}",
                     )
                 else:
                     logger.warning(
                         "[LLMEnhancement] 撤回命中但动态重算重排失败，将退回旧响应兜底逻辑："
                         f"group={group_scope}, uid={requeue_plan['uid']}, msg_id={recalled_msg_id}, "
-                        f"inflight_seq={int(requeue_plan['inflight_seq'])}, stop_requested={stop_requested}"
+                        f"inflight_seq={int(requeue_plan['inflight_seq'])}, stop_requested={stop_requested}",
                     )
         return hit
 
@@ -681,39 +738,61 @@ class LLMEnhancement(Star):
             gs = StateManager.get_group_if_exists(scope)
             if not gs:
                 continue
-            if await self._apply_recall_to_group_state(event, gs, recalled_msg_id, scope, notice_type):
+            if await self._apply_recall_to_group_state(
+                event, gs, recalled_msg_id, scope, notice_type
+            ):
                 processed = True
 
         if not processed:
             for scope, gs in list(StateManager.iter_groups_items()):
-                if await self._apply_recall_to_group_state(event, gs, recalled_msg_id, scope, notice_type):
+                if await self._apply_recall_to_group_state(
+                    event, gs, recalled_msg_id, scope, notice_type
+                ):
                     processed = True
                     break
 
-
     # ==================== 唤醒消息级别 ====================
-    
+
+    async def _get_wake_context_messages(
+        self,
+        group_state,
+        event,
+        count: int,
+    ) -> list[str]:
+        """获取唤醒上下文消息，如无上下文注入记录则回退到有效对话历史。"""
+        msgs = get_wake_history_messages(
+            group_state=group_state,
+            get_cfg=self._get_cfg,
+            count=count,
+        )
+        if msgs:
+            return msgs
+        return await self._effective_dialog_history.get_history_messages(event, count)
 
     @filter.event_message_type(filter.EventMessageType.ALL, priority=1)
     async def on_message_event(self, event: AstrMessageEvent):
         """处理消息的初步过滤、黑白名单检查及唤醒逻辑。支持群聊和私聊。"""
-        raw_message = event.message_obj.raw_message if (event.message_obj and hasattr(event.message_obj, "raw_message")) else {}
+        raw_message = (
+            event.message_obj.raw_message
+            if (event.message_obj and hasattr(event.message_obj, "raw_message"))
+            else {}
+        )
         if not raw_message and hasattr(event, "event"):
             raw_message = event.event
-        if (
-            isinstance(event, AiocqhttpMessageEvent)
-            and _raw_get(raw_message, "post_type") not in (None, "", "message")
-        ):
+        if isinstance(event, AiocqhttpMessageEvent) and _raw_get(
+            raw_message, "post_type"
+        ) not in (None, "", "message"):
             raw_post_type = _raw_get(raw_message, "post_type")
             raw_notice_type = _raw_get(raw_message, "notice_type")
             recalled_msg_id = str(_raw_get(raw_message, "message_id") or "").strip()
-            if raw_post_type == "notice" and raw_notice_type in {"group_recall", "friend_recall"} and recalled_msg_id:
+            if (
+                raw_post_type == "notice"
+                and raw_notice_type in {"group_recall", "friend_recall"}
+                and recalled_msg_id
+            ):
                 self._mark_recent_recall(event.unified_msg_origin, recalled_msg_id)
-                await self._handle_recall_notice(event, recalled_msg_id, str(raw_notice_type))
-                logger.debug(
-                    "[LLMEnhancement] 记录撤回消息："
-                    f"umo={event.unified_msg_origin}, recalled_msg_id={recalled_msg_id}, "
-                    f"notice_type={raw_notice_type}"
+                await self._handle_recall_notice(
+                    event, recalled_msg_id, str(raw_notice_type)
                 )
             raw_group_id = str(_raw_get(raw_message, "group_id") or "").strip()
             if raw_group_id and is_context_injection_enabled(self._get_cfg):
@@ -723,40 +802,29 @@ class LLMEnhancement(Star):
                     raw_message=raw_message,
                     get_cfg=self._get_cfg,
                 )
-                if appended_notice_context:
-                    logger.debug(
-                        "[LLMEnhancement][ContextInjection] notice context appended: "
-                        f"group={raw_group_id}, source={notice_source}, post_type={raw_post_type}, notice_type={raw_notice_type}"
-                    )
             return
         bid: str = event.get_self_id()
-        gid: str = event.get_group_id() # 私聊下为 None
+        gid: str = event.get_group_id()  # 私聊下为 None
         uid: str = event.get_sender_id()
         msg: str = event.message_str.strip() if event.message_str else ""
-        context_injection_enabled = bool(gid) and is_context_injection_enabled(self._get_cfg)
         context_injection_max_messages = (
             get_context_injection_max_messages(self._get_cfg)
-            if context_injection_enabled
+            if (bool(gid) and is_context_injection_enabled(self._get_cfg))
             else 0
         )
-        
+        context_injection_enabled = context_injection_max_messages > 0
+
         g = StateManager.get_group(gid or f"private_{uid}")
-        async def _get_wake_context_messages(_event, count: int) -> list[str]:
-            msgs = get_wake_history_messages(
-                group_state=g,
-                get_cfg=self._get_cfg,
-                count=count,
-            )
-            if msgs:
-                return msgs
-            # 兜底：当上下文注入关闭或暂无记录时，回退到旧的有效对话历史。
-            return await self._effective_dialog_history.get_history_messages(_event, count)
+
+        def _get_wake_context_messages(ev, cnt):
+            return self._get_wake_context_messages(g, ev, cnt)
+
         command_trigger_event = self._is_command_trigger_event(event)
 
         # 0. 全局屏蔽检查
         if uid == bid:
             return
-        
+
         # 1. 内置黑名单拦截（三档：仅LLM/指令+LLM/全消息）
         blacklist_level = self.blacklist.blacklist_intercept_level()
         if blacklist_level == "all_messages":
@@ -766,13 +834,13 @@ class LLMEnhancement(Star):
             if await self.blacklist.intercept_event(event):
                 return
 
-        # 仅在群聊环境下检查群黑白名单
+        # 仅在群聊环境下检查群黑白名单。
         if gid:
             whitelist = self._get_cfg("group_whitelist")
             if whitelist and gid not in whitelist:
                 return
-            
-        # 提取消息发送时间，用于所有后续判定
+
+        # 提取消息发送时间，用于所有后续判定。
         raw_msg_ts = _raw_get(raw_message, "time", None)
         if raw_msg_ts in (None, ""):
             raw_msg_ts = _raw_get(raw_message, "date", None)
@@ -787,11 +855,11 @@ class LLMEnhancement(Star):
             else uid
         )
         allow_existing_dynamic_session_reuse = bool(
-            dynamic_merge_mode and event.get_extra("_llme_dynamic_requeued", default=False)
+            dynamic_merge_mode
+            and event.get_extra("_llme_dynamic_requeued", default=False),
         )
-        orch = self._get_cfg("request_orchestration", {})
-        user_limit = normalize_concurrency_limit(orch.get("max_user_concurrent_requests", 0))
-        group_limit = normalize_concurrency_limit(orch.get("max_group_concurrent_requests", 0))
+        user_limit = max(0, int(self._get_cfg("max_user_concurrent_requests", 0)))
+        group_limit = max(0, int(self._get_cfg("max_group_concurrent_requests", 0)))
         # 动态合并模式：用户有进行中的动态合并会话时，绕过预检查。
         should_bypass_concurrency = (
             dynamic_merge_mode
@@ -799,7 +867,7 @@ class LLMEnhancement(Star):
             and uid in g.members
             and g.members[uid].dynamic_inflight_seq > 0
         )
-        if gid and (user_limit > 0 or group_limit > 0) and not should_bypass_concurrency:
+        if gid and (user_limit > 0 or group_limit > 0):
             async with self._request_counter_lock:
                 now_ts = time.time()
                 evict_stale_concurrency_slots(
@@ -821,9 +889,16 @@ class LLMEnhancement(Star):
                     allow_existing_dynamic_session_reuse=allow_existing_dynamic_session_reuse,
                 )
             if not accepted_slot:
-                logger.debug(f"[LLMEnhancement] 并发预检查拦截：{slot_detail}")
-                return
-        
+                if should_bypass_concurrency:
+                    event.set_extra("_llme_skip_wake_for_congestion", True)
+                    logger.debug(
+                        "[LLMEnhancement] 并发预检查跳过：并发已满，跳过后续唤醒判定。"
+                        f"group={gid}, uid={uid}, detail={slot_detail}",
+                    )
+                else:
+                    logger.debug(f"[LLMEnhancement] 并发预检查拦截：{slot_detail}")
+                    return
+
         # 3. 初始化状态
         if uid not in g.members:
             g.members[uid] = MemberState(uid=uid)
@@ -850,15 +925,21 @@ class LLMEnhancement(Star):
             event.is_at_or_wake_command = False
             logger.debug(
                 "[LLMEnhancement] 跳过机器人消息唤醒判定：当前消息发送者命中机器人 ID 列表，且处于唤醒延长窗口内。"
-                f"group={gid}, uid={uid}, msg={msg[:50]}"
+                f"group={gid}, uid={uid}, msg={msg[:50]}",
             )
             return
 
         if skip_explicit_wake_for_bot and event.is_at_or_wake_command:
             logger.debug(
                 "[LLMEnhancement] 跳过机器人消息的显式唤醒判定："
-                f"group={gid or 'private'}, uid={uid}, msg={msg[:50]}"
+                f"group={gid or 'private'}, uid={uid}, msg={msg[:50]}",
             )
+            event.is_at_or_wake_command = False
+
+        _skip_wake_for_congestion = bool(
+            event.get_extra("_llme_skip_wake_for_congestion", False)
+        )
+        if _skip_wake_for_congestion:
             event.is_at_or_wake_command = False
 
         # 4. 唤醒条件判断
@@ -877,7 +958,9 @@ class LLMEnhancement(Star):
         if enriched_msg and enriched_msg != msg:
             msg = enriched_msg
             event.message_str = msg
-            if hasattr(event, "message_obj") and hasattr(event.message_obj, "message_str"):
+            if hasattr(event, "message_obj") and hasattr(
+                event.message_obj, "message_str"
+            ):
                 event.message_obj.message_str = msg
         (
             has_image_component,
@@ -888,9 +971,11 @@ class LLMEnhancement(Star):
             has_record_component,
             file_name,
         ) = detect_wake_media_components(message_chain)
-        at_targets, at_bot, at_all, reply_to_id, reply_msg_id = extract_addressing_signals(
-            message_chain,
-            bot_id=bid,
+        at_targets, at_bot, at_all, reply_to_id, reply_msg_id = (
+            extract_addressing_signals(
+                message_chain,
+                bot_id=bid,
+            )
         )
         reply_to_bot = bool(bid and reply_to_id and str(reply_to_id) == str(bid))
         wake_prefixes = []
@@ -910,13 +995,15 @@ class LLMEnhancement(Star):
         event.set_extra("_llme_prefix_wake_triggered", prefix_wake_triggered)
         addressed_to_bot = bool(at_bot or reply_to_bot)
         event.set_extra("_llme_addressed_to_bot", addressed_to_bot)
-        require_at_for_wake_prefix = bool(self._get_cfg("require_at_for_wake_prefix", False))
+        require_at_for_wake_prefix = bool(
+            self._get_cfg("require_at_for_wake_prefix", False)
+        )
         prefix_wake_blocked = bool(
             require_at_for_wake_prefix
             and gid
             and direct_wake
             and prefix_wake_triggered
-            and (not addressed_to_bot)
+            and (not addressed_to_bot),
         )
         event.set_extra("_llme_prefix_wake_blocked", prefix_wake_blocked)
         if prefix_wake_blocked:
@@ -930,7 +1017,7 @@ class LLMEnhancement(Star):
                 logger.debug(
                     "[LLMEnhancement] 消息发送者为已配置的机器人账号，"
                     "不计入主动唤醒统计。"
-                    f" group={gid}, uid={uid}"
+                    f" group={gid}, uid={uid}",
                 )
             ordinary_group_msg = (
                 (not direct_wake)
@@ -939,16 +1026,30 @@ class LLMEnhancement(Star):
                 and (not at_all)
                 and (not is_bot_msg)
             )
-            wake_extend_window = float(self._get_cfg("wake_extend", 0) or 0)
+            wake_extend_window = float(self._get_cfg("wake_extend_window", 0) or 0)
             ref_ts = float(g.last_response_ts or 0.0)
             if ordinary_group_msg:
-                g.active_wake_new_msg_count = max(0, int(g.active_wake_new_msg_count or 0)) + 1
-                g.prob_wake_pending_count = max(0, int(g.prob_wake_pending_count or 0)) + 1
-                if ref_ts > 0 and wake_extend_window > 0 and (now - ref_ts) <= wake_extend_window:
-                    g.wake_extend_batch_count = max(0, int(g.wake_extend_batch_count or 0)) + 1
+                g.active_wake_new_msg_count = (
+                    max(0, int(g.active_wake_new_msg_count or 0)) + 1
+                )
+                g.prob_wake_pending_count = (
+                    max(0, int(g.prob_wake_pending_count or 0)) + 1
+                )
+                if (
+                    ref_ts > 0
+                    and wake_extend_window > 0
+                    and (now - ref_ts) <= wake_extend_window
+                ):
+                    g.wake_extend_batch_count = (
+                        max(0, int(g.wake_extend_batch_count or 0)) + 1
+                    )
                 else:
                     g.wake_extend_batch_count = 0
-            elif ref_ts <= 0 or wake_extend_window <= 0 or (now - ref_ts) > wake_extend_window:
+            elif (
+                ref_ts <= 0
+                or wake_extend_window <= 0
+                or (now - ref_ts) > wake_extend_window
+            ):
                 g.wake_extend_batch_count = 0
         raw_image_datas = extract_raw_image_datas_from_event(event)
         emoji_summary = get_emoji_summary_from_sources(
@@ -970,44 +1071,50 @@ class LLMEnhancement(Star):
                 include_state_bias=False,
                 get_cfg=self._get_cfg,
             )
-            relevant_wake_factor, relevant_wake_reasons = compute_active_wake_adjustment(
-                group_state=g,
-                current_uid=uid,
-                bot_id=bid,
-                at_targets=at_targets,
-                at_all=at_all,
-                reply_to_id=reply_to_id,
-                include_state_bias=True,
-                get_cfg=self._get_cfg,
+            relevant_wake_factor, relevant_wake_reasons = (
+                compute_active_wake_adjustment(
+                    group_state=g,
+                    current_uid=uid,
+                    bot_id=bid,
+                    at_targets=at_targets,
+                    at_all=at_all,
+                    reply_to_id=reply_to_id,
+                    include_state_bias=True,
+                    get_cfg=self._get_cfg,
+                )
             )
 
         if context_injection_enabled:
-            asyncio.create_task(_background_context_injection(
-                self=self,
-                event=event,
-                g=g,
-                uid=uid,
-                msg=msg,
-                message_chain=message_chain,
-                raw_image_datas=raw_image_datas,
-                has_image_component=has_image_component,
-                has_video_component=has_video_component,
-                has_file_component=has_file_component,
-                has_forward_component=has_forward_component,
-                has_json_component=has_json_component,
-                has_record_component=has_record_component,
-                file_name=file_name,
-                reply_to_id=reply_to_id,
-                reply_msg_id=reply_msg_id,
-                at_targets=at_targets,
-                at_bot=at_bot,
-                at_all=at_all,
-                now=now,
-                emoji_summary=emoji_summary,
-                context_injection_max_messages=context_injection_max_messages,
-            ))
+            asyncio.create_task(
+                _background_context_injection(
+                    self=self,
+                    event=event,
+                    g=g,
+                    uid=uid,
+                    msg=msg,
+                    message_chain=message_chain,
+                    raw_image_datas=raw_image_datas,
+                    has_image_component=has_image_component,
+                    has_video_component=has_video_component,
+                    has_file_component=has_file_component,
+                    has_forward_component=has_forward_component,
+                    has_json_component=has_json_component,
+                    has_record_component=has_record_component,
+                    file_name=file_name,
+                    reply_to_id=reply_to_id,
+                    reply_msg_id=reply_msg_id,
+                    at_targets=at_targets,
+                    at_bot=at_bot,
+                    at_all=at_all,
+                    now=now,
+                    emoji_summary=emoji_summary,
+                    context_injection_max_messages=context_injection_max_messages,
+                )
+            )
 
-        image_label = get_image_component_label(message_chain, raw_image_datas=raw_image_datas)
+        image_label = get_image_component_label(
+            message_chain, raw_image_datas=raw_image_datas
+        )
         normalized_msg, normalized_reason = normalize_wake_trigger_message(
             wake=wake,
             msg=msg,
@@ -1042,10 +1149,19 @@ class LLMEnhancement(Star):
         followup_require_wake = merge_cfg.followup_require_wake
         force_dynamic_followup = False
         dynamic_state_uid: Optional[str] = None
-        requeued_dynamic_followup = bool(event.get_extra("_llme_dynamic_requeued", default=False))
+        requeued_dynamic_followup = bool(
+            event.get_extra("_llme_dynamic_requeued", default=False)
+        )
 
-        if not msg and dynamic_merge_mode and (not followup_require_wake) and (not wake):
-            image_label = get_image_component_label(message_chain, raw_image_datas=raw_image_datas)
+        if (
+            not msg
+            and dynamic_merge_mode
+            and (not followup_require_wake)
+            and (not wake)
+        ):
+            image_label = get_image_component_label(
+                message_chain, raw_image_datas=raw_image_datas
+            )
             dynamic_msg, dynamic_reason = build_media_trigger_message(
                 sender_name=event.get_sender_name(),
                 has_image_component=has_image_component,
@@ -1063,7 +1179,7 @@ class LLMEnhancement(Star):
                 event.message_str = msg
                 logger.debug(
                     "[LLMEnhancement] 无文本媒体消息已转换为动态合并占位文本："
-                    f"group={gid or 'private'}, uid={uid}, reason={dynamic_reason}, msg={msg}"
+                    f"group={gid or 'private'}, uid={uid}, reason={dynamic_reason}, msg={msg}",
                 )
 
         if not msg:
@@ -1071,10 +1187,17 @@ class LLMEnhancement(Star):
                 return
 
         if dynamic_merge_mode and requeued_dynamic_followup:
-            forced_state_uid = str(event.get_extra("_llme_dynamic_state_uid", default=uid) or uid).strip() or uid
+            forced_state_uid = (
+                str(
+                    event.get_extra("_llme_dynamic_state_uid", default=uid) or uid
+                ).strip()
+                or uid
+            )
             if forced_state_uid not in g.members:
                 g.members[forced_state_uid] = MemberState(uid=forced_state_uid)
-            requeue_from_seq = int(event.get_extra("_llme_dynamic_requeue_from_seq", default=0) or 0)
+            requeue_from_seq = int(
+                event.get_extra("_llme_dynamic_requeue_from_seq", default=0) or 0
+            )
             forced_member = g.members[forced_state_uid]
             async with forced_member.lock:
                 current_req_seq = int(forced_member.dynamic_request_seq or 0)
@@ -1082,7 +1205,7 @@ class LLMEnhancement(Star):
                 logger.debug(
                     "[LLMEnhancement] 跳过过期动态重排事件："
                     f"group={gid or 'private'}, sender_uid={uid}, state_uid={forced_state_uid}, "
-                    f"requeue_from_seq={requeue_from_seq}, current_req_seq={current_req_seq}"
+                    f"requeue_from_seq={requeue_from_seq}, current_req_seq={current_req_seq}",
                 )
                 return
             wake = True
@@ -1093,11 +1216,16 @@ class LLMEnhancement(Star):
             event.set_extra("_llme_dynamic_state_uid", dynamic_state_uid)
             logger.debug(
                 "[LLMEnhancement] 动态软重算重排事件进入强制跟进："
-                f"group={gid or 'private'}, sender_uid={uid}, state_uid={dynamic_state_uid}"
+                f"group={gid or 'private'}, sender_uid={uid}, state_uid={dynamic_state_uid}",
             )
 
         # 动态模式 + 不要求再次唤醒：优先走软重算，并承接最近唤醒窗口中的紧随消息。
-        if dynamic_merge_mode and (not followup_require_wake) and (not wake) and (not prefix_wake_blocked):
+        if (
+            dynamic_merge_mode
+            and (not followup_require_wake)
+            and (not wake)
+            and (not prefix_wake_blocked)
+        ):
             prejoin_window = max(0.5, merge_cfg.delay_sec + 0.3)
             prejoin_candidate = False
             target_uid = select_dynamic_owner_uid(
@@ -1129,18 +1257,24 @@ class LLMEnhancement(Star):
                         merge_max_count=merge_cfg.max_count,
                     )
                     max_count_limit_reached = (
-                        (not recompute_decision.accepted)
-                        and recompute_decision.reason in {"deadline_reached", "max_count_reached"}
-                    )
+                        not recompute_decision.accepted
+                    ) and recompute_decision.reason in {
+                        "deadline_reached",
+                        "max_count_reached",
+                    }
                     if max_count_limit_reached:
                         logger.debug(
                             "[LLMEnhancement] 动态软重算已达上限，消息降级为普通新消息继续唤醒判定："
                             f"group={gid or 'private'}, owner_uid={target_uid}, incoming_uid={uid}, "
-                            f"reason={recompute_decision.reason}, max_count={merge_cfg.max_count}"
+                            f"reason={recompute_decision.reason}, max_count={merge_cfg.max_count}",
                         )
                         event.set_extra("_llme_dynamic_max_count_reached", True)
                     inflight_seq = int(recompute_decision.inflight_seq or 0)
-                    if (not max_count_limit_reached) and recompute_decision.accepted and inflight_seq > 0:
+                    if (
+                        (not max_count_limit_reached)
+                        and recompute_decision.accepted
+                        and inflight_seq > 0
+                    ):
                         stop_requested = request_dynamic_recompute_stop(
                             event,
                             inflight_seq=inflight_seq,
@@ -1157,7 +1291,7 @@ class LLMEnhancement(Star):
                                 logger.debug(
                                     "[LLMEnhancement] 动态软重算已中断旧流程并停止当前事件，等待重排消息触发新请求："
                                     f"group={gid or 'private'}, owner_uid={target_uid}, incoming_uid={uid}, "
-                                    f"inflight_seq={inflight_seq}"
+                                    f"inflight_seq={inflight_seq}",
                                 )
                                 event.stop_event()
                                 return
@@ -1171,7 +1305,7 @@ class LLMEnhancement(Star):
                             "[LLMEnhancement] 动态合并检测到新消息，已标记丢弃旧响应并等待下一次软重算："
                             f"group={gid or 'private'}, owner_uid={target_uid}, incoming_uid={uid}, "
                             f"inflight_seq={inflight_seq}, msg_id={str(dynamic_snap.get('msg_id') or 'unknown')}, "
-                            f"require_wake={followup_require_wake}, stop_requested={stop_requested}"
+                            f"require_wake={followup_require_wake}, stop_requested={stop_requested}",
                         )
                     elif (
                         prejoin_candidate
@@ -1179,22 +1313,31 @@ class LLMEnhancement(Star):
                         and str(recompute_decision.reason or "") == "no_inflight"
                     ):
                         async with target_member.lock:
-                            upsert_dynamic_unresolved_snapshot(target_member, dynamic_snap)
+                            upsert_dynamic_unresolved_snapshot(
+                                target_member, dynamic_snap
+                            )
                         logger.debug(
                             "[LLMEnhancement] 动态合并预请求窗口缓存消息（未启动合并）："
                             f"group={gid or 'private'}, owner_uid={target_uid}, incoming_uid={uid}, "
-                            f"msg_id={str(dynamic_snap.get('msg_id') or 'unknown')}, window={prejoin_window:.2f}s"
+                            f"msg_id={str(dynamic_snap.get('msg_id') or 'unknown')}, window={prejoin_window:.2f}s",
                         )
 
         # 提及唤醒 (仅群聊)
-        if gid and (not wake) and (not skip_active_wake_for_bot):
-            matched_mention = evaluate_mention_wake(msg, self._get_cfg("mention_wake"), gid=gid, uid=uid)
+        if (
+            gid
+            and (not wake)
+            and (not skip_active_wake_for_bot)
+            and (not _skip_wake_for_congestion)
+        ):
+            matched_mention = evaluate_mention_wake(
+                msg, self._get_cfg("mention_wake"), gid=gid, uid=uid
+            )
             if matched_mention:
                 wake = True
                 reason = f"提及唤醒({matched_mention})"
 
         # 唤醒延长 (仅群聊)
-        if gid and not wake:
+        if gid and not wake and (not _skip_wake_for_congestion):
             wake, wake_reason = await evaluate_wake_extend(
                 event=event,
                 msg=msg,
@@ -1206,14 +1349,21 @@ class LLMEnhancement(Star):
                 get_cfg=self._get_cfg,
                 get_history_msg=_get_wake_context_messages,
                 similarity_fn=self.similarity.similarity,
-                find_provider=lambda provider_id: resolve_provider(self.context, provider_id),
+                find_provider=lambda provider_id: resolve_provider(
+                    self.context, provider_id
+                ),
             )
             if wake and wake_reason:
                 reason = wake_reason
 
         # 话题相关性唤醒 (仅群聊)
-        if gid and (not wake) and (not skip_active_wake_for_bot):
-            relevant_wake = self._get_cfg("relevant_wake")
+        if (
+            gid
+            and (not wake)
+            and (not skip_active_wake_for_bot)
+            and (not _skip_wake_for_congestion)
+        ):
+            relevant_wake = float(self._get_cfg("relevant_wake") or 0.0)
             if relevant_wake:
                 relevant_ctx_count = self.similarity.context_count_for_query(msg)
                 if bmsgs := await self._effective_dialog_history.get_history_messages(
@@ -1221,9 +1371,11 @@ class LLMEnhancement(Star):
                     relevant_ctx_count,
                 ):
                     simi = await self.similarity.similarity(gid, msg, bmsgs)
-                    repeat_factor, _hit_count = compute_relevant_context_substring_downweight(
-                        msg,
-                        bmsgs,
+                    repeat_factor, _hit_count = (
+                        compute_relevant_context_substring_downweight(
+                            msg,
+                            bmsgs,
+                        )
                     )
                     adjusted_simi = simi * relevant_wake_factor * repeat_factor
                     if adjusted_simi >= relevant_wake:
@@ -1231,9 +1383,14 @@ class LLMEnhancement(Star):
                         reason = f"话题相关性{adjusted_simi:.2f}>={relevant_wake:.2f}"
 
         # 答疑唤醒 (仅群聊)
-        if gid and (not wake) and (not skip_active_wake_for_bot):
-            ask_wake = self._get_cfg("ask_wake")
-            if ask_wake:  
+        if (
+            gid
+            and (not wake)
+            and (not skip_active_wake_for_bot)
+            and (not _skip_wake_for_congestion)
+        ):
+            ask_wake = float(self._get_cfg("ask_wake") or 0.0)
+            if ask_wake:
                 ask_score = await self.sent.ask(msg)
                 adjusted_ask_score = ask_score * active_wake_factor
                 if adjusted_ask_score >= ask_wake:
@@ -1241,8 +1398,13 @@ class LLMEnhancement(Star):
                     reason = f"答疑唤醒{adjusted_ask_score:.2f}>={ask_wake:.2f}"
 
         # 无聊唤醒 (仅群聊)
-        if gid and (not wake) and (not skip_active_wake_for_bot):
-            bored_wake = self._get_cfg("bored_wake")
+        if (
+            gid
+            and (not wake)
+            and (not skip_active_wake_for_bot)
+            and (not _skip_wake_for_congestion)
+        ):
+            bored_wake = float(self._get_cfg("bored_wake") or 0.0)
             if bored_wake:
                 bored_score = await self.sent.bored(msg)
                 adjusted_bored_score = bored_score * active_wake_factor
@@ -1251,9 +1413,31 @@ class LLMEnhancement(Star):
                     reason = f"无聊唤醒{adjusted_bored_score:.2f}>={bored_wake:.2f}"
 
         # 概率唤醒 (仅群聊)
-        if gid and (not wake) and (not skip_active_wake_for_bot):
-            prob_wake_activity = get_prob_wake_activity(self._get_cfg)
-            if prob_wake_activity > 0 and ordinary_group_msg and (not has_video_component) and (not has_file_component):
+        if (
+            gid
+            and (not wake)
+            and (not skip_active_wake_for_bot)
+            and (not _skip_wake_for_congestion)
+        ):
+            # 动态合并进行中时跳过概率唤醒。
+            _prob_wake_blocked_by_merge = (
+                dynamic_merge_mode
+                and uid in g.members
+                and g.members[uid].dynamic_inflight_seq > 0
+            )
+            if _prob_wake_blocked_by_merge:
+                logger.debug(
+                    "[LLMEnhancement] 概率唤醒跳过：动态合并进行中。"
+                    f"group={gid}, uid={uid}, inflight_seq={g.members[uid].dynamic_inflight_seq}",
+                )
+            prob_wake_activity = float(self._get_cfg("prob_wake", 0.3))
+            if (
+                prob_wake_activity > 0
+                and ordinary_group_msg
+                and (not has_video_component)
+                and (not has_file_component)
+                and (not _prob_wake_blocked_by_merge)
+            ):
                 observe_threshold = get_prob_wake_observe_threshold(g, self._get_cfg)
                 trigger_chance = get_prob_wake_trigger_chance(self._get_cfg)
                 pending_count = max(0, int(g.prob_wake_pending_count or 0))
@@ -1265,19 +1449,25 @@ class LLMEnhancement(Star):
                     if prob_roll < trigger_chance:
                         g.prob_wake_no_reply_count = 0
                         wake = True
-                        backoff_note = f", 退避{current_no_reply}次" if current_no_reply > 0 else ""
+                        backoff_note = (
+                            f", 退避{current_no_reply}次"
+                            if current_no_reply > 0
+                            else ""
+                        )
                         reason = (
                             f"概率唤醒(活跃度{prob_wake_activity:.2f}, 批次{pending_count}>={observe_threshold}{backoff_note}, "
                             f"{prob_roll:.4f}<{trigger_chance:.4f})"
                         )
                     else:
-                        g.prob_wake_no_reply_count = max(0, int(g.prob_wake_no_reply_count or 0)) + 1
+                        g.prob_wake_no_reply_count = (
+                            max(0, int(g.prob_wake_no_reply_count or 0)) + 1
+                        )
                         logger.debug(
                             "[LLMEnhancement] 概率唤醒批次观察未命中："
                             f"group={gid}, uid={uid}, pending={pending_count}, "
                             f"threshold={observe_threshold}, activity={prob_wake_activity:.2f}, "
                             f"roll={prob_roll:.4f}, chance={trigger_chance:.4f}, "
-                            f"no_reply={g.prob_wake_no_reply_count}"
+                            f"no_reply={g.prob_wake_no_reply_count}",
                         )
 
         event.set_extra("_llme_direct_wake", direct_wake)
@@ -1286,10 +1476,20 @@ class LLMEnhancement(Star):
         event.set_extra("_llme_force_dynamic_followup", force_dynamic_followup)
         event.set_extra(
             "_llme_skip_due_to_prefix_block",
-            bool(prefix_wake_blocked and (not wake) and (not command_trigger_event) and (not force_dynamic_followup)),
+            bool(
+                prefix_wake_blocked
+                and (not wake)
+                and (not command_trigger_event)
+                and (not force_dynamic_followup)
+            ),
         )
 
-        if dynamic_merge_mode and (not force_dynamic_followup) and (not command_trigger_event) and (not prefix_wake_blocked):
+        if (
+            dynamic_merge_mode
+            and (not force_dynamic_followup)
+            and (not command_trigger_event)
+            and (not prefix_wake_blocked)
+        ):
             target_uid = select_dynamic_owner_uid(
                 own_inflight_seq=member.dynamic_inflight_seq,
                 dynamic_owner_uid=g.dynamic_owner_uid,
@@ -1310,18 +1510,24 @@ class LLMEnhancement(Star):
                         merge_max_count=merge_cfg.max_count,
                     )
                     max_count_limit_reached = (
-                        (not recompute_decision.accepted)
-                        and recompute_decision.reason in {"deadline_reached", "max_count_reached"}
-                    )
+                        not recompute_decision.accepted
+                    ) and recompute_decision.reason in {
+                        "deadline_reached",
+                        "max_count_reached",
+                    }
                     if max_count_limit_reached:
                         logger.debug(
                             "[LLMEnhancement] 动态软重算已达上限，已唤醒消息不参与动态合并，继续走后续流程："
                             f"group={gid or 'private'}, owner_uid={target_uid}, incoming_uid={uid}, "
-                            f"reason={recompute_decision.reason}, max_count={merge_cfg.max_count}"
+                            f"reason={recompute_decision.reason}, max_count={merge_cfg.max_count}",
                         )
                         event.set_extra("_llme_dynamic_max_count_reached", True)
                     inflight_seq = int(recompute_decision.inflight_seq or 0)
-                    if (not max_count_limit_reached) and recompute_decision.accepted and inflight_seq > 0:
+                    if (
+                        (not max_count_limit_reached)
+                        and recompute_decision.accepted
+                        and inflight_seq > 0
+                    ):
                         stop_requested = request_dynamic_recompute_stop(
                             event,
                             inflight_seq=inflight_seq,
@@ -1338,7 +1544,7 @@ class LLMEnhancement(Star):
                                 logger.debug(
                                     "[LLMEnhancement] 动态软重算已中断旧流程并停止当前事件，等待重排消息触发新请求："
                                     f"group={gid or 'private'}, owner_uid={target_uid}, incoming_uid={uid}, "
-                                    f"inflight_seq={inflight_seq}"
+                                    f"inflight_seq={inflight_seq}",
                                 )
                                 event.stop_event()
                                 return
@@ -1349,12 +1555,16 @@ class LLMEnhancement(Star):
                             "[LLMEnhancement] 动态合并检测到新消息，已标记丢弃旧响应并等待下一次软重算："
                             f"group={gid or 'private'}, owner_uid={target_uid}, incoming_uid={uid}, "
                             f"inflight_seq={inflight_seq}, msg_id={str(dynamic_snap.get('msg_id') or 'unknown')}, "
-                            f"require_wake={followup_require_wake}, stop_requested={stop_requested}"
+                            f"require_wake={followup_require_wake}, stop_requested={stop_requested}",
                         )
-        elif dynamic_merge_mode and command_trigger_event and member.dynamic_inflight_seq > 0:
+        elif (
+            dynamic_merge_mode
+            and command_trigger_event
+            and member.dynamic_inflight_seq > 0
+        ):
             logger.debug(
                 "[LLMEnhancement] 跳过命令消息的动态软重算，保留正在进行中的 LLM 响应："
-                f"group={gid or 'private'}, uid={uid}, msg={msg[:50]}, inflight_seq={member.dynamic_inflight_seq}"
+                f"group={gid or 'private'}, uid={uid}, msg={msg[:50]}, inflight_seq={member.dynamic_inflight_seq}",
             )
 
         # 违禁词检查
@@ -1381,9 +1591,13 @@ class LLMEnhancement(Star):
                 snap = build_event_snapshot(event, gid, uid, ts=event_ts)
                 ensure_snapshot_merge_key(snap)
                 upsert_recent_wake_snapshot(member, snap)
-                if dynamic_merge_mode and dynamic_state_uid is None and (not command_trigger_event) and (
-                    not event.get_extra("_llme_dynamic_max_count_reached", False)
-                ) and merge_cfg.premerge_window_sec > 0:
+                if (
+                    dynamic_merge_mode
+                    and dynamic_state_uid is None
+                    and (not command_trigger_event)
+                    and (not event.get_extra("_llme_dynamic_max_count_reached", False))
+                    and merge_cfg.premerge_window_sec > 0
+                ):
                     premerge_candidates = consume_premerge_snapshots_for_trigger(
                         member,
                         trigger_ts=event_ts,
@@ -1396,10 +1610,15 @@ class LLMEnhancement(Star):
                         logger.debug(
                             "[LLMEnhancement] 动态合并命中预合并消息："
                             f"group={gid or 'private'}, uid={uid}, trigger_msg_id={str(snap.get('msg_id') or 'unknown')}, "
-                            f"premerge_msg_ids={[str(item.get('msg_id') or '').strip() for item in premerge_candidates if str(item.get('msg_id') or '').strip()]}"
+                            f"premerge_msg_ids={[str(item.get('msg_id') or '').strip() for item in premerge_candidates if str(item.get('msg_id') or '').strip()]}",
                         )
                     upsert_dynamic_unresolved_snapshot(member, snap)
-        elif dynamic_merge_mode and merge_cfg.premerge_window_sec > 0 and merge_cfg.max_count > 1 and (not prefix_wake_blocked):
+        elif (
+            dynamic_merge_mode
+            and merge_cfg.premerge_window_sec > 0
+            and merge_cfg.max_count > 1
+            and (not prefix_wake_blocked)
+        ):
             max_premerge_count = max(0, int(merge_cfg.max_count) - 1)
             if max_premerge_count > 0:
                 premerge_window = max(0.5, merge_cfg.premerge_window_sec)
@@ -1414,9 +1633,8 @@ class LLMEnhancement(Star):
                     )
                     premerge_snap = build_event_snapshot(event, gid, uid, ts=event_ts)
                     ensure_snapshot_merge_key(premerge_snap)
-                    inserted_new = False
                     if not in_recent_wake_window:
-                        inserted_new = upsert_premerge_snapshot(
+                        upsert_premerge_snapshot(
                             member,
                             premerge_snap,
                             max_keep=max_premerge_count,
@@ -1424,7 +1642,15 @@ class LLMEnhancement(Star):
 
     # ==================== 消息合并处理 ====================
 
-    async def _handle_message_merge(self, event: AstrMessageEvent, req: ProviderRequest, gid: str, uid: str, member: MemberState, event_ts: float = 0.0) -> List[Any]:
+    async def _handle_message_merge(
+        self,
+        event: AstrMessageEvent,
+        req: ProviderRequest,
+        gid: str,
+        uid: str,
+        member: MemberState,
+        event_ts: float = 0.0,
+    ) -> List[Any]:
         """执行消息合并逻辑，根据配置决定是否收集多用户消息并格式化。event_ts 为消息发送时间。"""
         group_state = StateManager.get_group(gid or f"private_{uid}")
         merge_cfg = load_merge_runtime_config(self._get_cfg)
@@ -1446,18 +1672,22 @@ class LLMEnhancement(Star):
             clear_pending_msg_ids(group_state, member)
             member.cancel_merge = False
             member.trigger_msg_id = None
-            member.in_merging = True  # 标记正在合并中，避免并发请求重复进入
-            preselected_snapshots, member.trigger_msg_id = prepare_initial_merge_snapshots(
-                event=event,
-                gid=gid,
-                uid=uid,
-                member=member,
-                merge_delay=wait_timeout_sec,
-                merged_window_tolerance=merged_window_tolerance,
-                merged_skip_ttl=merged_skip_ttl,
-                merge_max_count=merge_max_count,
-                add_pending_msg_id=lambda msg_id: add_pending_msg_id(group_state, member, msg_id),
-                event_ts=event_ts,
+            member.in_merging = True
+            preselected_snapshots, member.trigger_msg_id = (
+                prepare_initial_merge_snapshots(
+                    event=event,
+                    gid=gid,
+                    uid=uid,
+                    member=member,
+                    merge_delay=wait_timeout_sec,
+                    merged_window_tolerance=merged_window_tolerance,
+                    merged_skip_ttl=merged_skip_ttl,
+                    merge_max_count=merge_max_count,
+                    add_pending_msg_id=lambda msg_id: add_pending_msg_id(
+                        group_state, member, msg_id
+                    ),
+                    event_ts=event_ts,
+                )
             )
 
         # buffer 结构: List[Tuple[msg_id, sender_name, message_str]]
@@ -1465,7 +1695,9 @@ class LLMEnhancement(Star):
             preselected_snapshots,
             default_sender_name=event.get_sender_name(),
         )
-        additional_components: List[Any] = collect_additional_components_from_snapshots(preselected_snapshots)
+        additional_components: List[Any] = collect_additional_components_from_snapshots(
+            preselected_snapshots
+        )
 
         @session_waiter(timeout=wait_timeout_sec, record_history_chains=False)
         async def collect_messages(
@@ -1502,7 +1734,7 @@ class LLMEnhancement(Star):
                 if not recalled_msg_id:
                     logger.debug(
                         "[LLMEnhancement] 实时撤回监控：message_id 为空。"
-                        f"uid={uid}, notice_type={raw_notice_type}"
+                        f"uid={uid}, notice_type={raw_notice_type}",
                     )
                     return
 
@@ -1521,9 +1753,13 @@ class LLMEnhancement(Star):
                     in_buffer = bool(recall_result.get("in_buffer", False))
                     before_count = int(recall_result.get("before_count", 0))
                     after_count = int(recall_result.get("after_count", 0))
-                    is_trigger_recalled = bool(recall_result.get("is_trigger_recalled", False))
+                    is_trigger_recalled = bool(
+                        recall_result.get("is_trigger_recalled", False)
+                    )
                     should_stop = bool(recall_result.get("should_stop", False))
-                    new_trigger_msg_id = str(recall_result.get("new_trigger_msg_id") or "unknown")
+                    new_trigger_msg_id = str(
+                        recall_result.get("new_trigger_msg_id") or "unknown"
+                    )
 
                     logger.debug(
                         "[LLMEnhancement] 实时撤回监控命中："
@@ -1531,13 +1767,13 @@ class LLMEnhancement(Star):
                         f"in_pending={in_pending}, in_buffer={in_buffer}, "
                         f"is_trigger_recalled={is_trigger_recalled}, "
                         f"before={before_count}, after={after_count}, "
-                        f"should_stop={should_stop}, new_trigger_msg_id={new_trigger_msg_id}"
+                        f"should_stop={should_stop}, new_trigger_msg_id={new_trigger_msg_id}",
                     )
 
                     if should_stop:
                         logger.info(
                             "[LLMEnhancement] 实时撤回触发终止，已立即取消本次合并会话。"
-                            f"uid={uid}, recalled_msg_id={recalled_msg_id}, after={after_count}"
+                            f"uid={uid}, recalled_msg_id={recalled_msg_id}, after={after_count}",
                         )
                         controller.stop()
                     else:
@@ -1545,7 +1781,10 @@ class LLMEnhancement(Star):
                         if remaining_sec <= 0:
                             controller.stop()
                         else:
-                            controller.keep(timeout=min(wait_timeout_sec, remaining_sec), reset_timeout=True)
+                            controller.keep(
+                                timeout=min(wait_timeout_sec, remaining_sec),
+                                reset_timeout=True,
+                            )
                 return
             elif raw_post_type == "notice":
                 pass
@@ -1561,7 +1800,7 @@ class LLMEnhancement(Star):
                 if reject_reason == "wake_required":
                     logger.debug(
                         "[LLMEnhancement] 硬等待合并跳过未唤醒后续消息："
-                        f"uid={uid}, group={gid or 'private'}, sender={followup_event.get_sender_id()}"
+                        f"uid={uid}, group={gid or 'private'}, sender={followup_event.get_sender_id()}",
                     )
                 return
 
@@ -1575,7 +1814,11 @@ class LLMEnhancement(Star):
                 controller.stop()
                 return
 
-            message_buffer, additional_components, _new_msg_id = await append_followup_to_merge_buffer(
+            (
+                message_buffer,
+                additional_components,
+                _new_msg_id,
+            ) = await append_followup_to_merge_buffer(
                 group_state=group_state,
                 member=member,
                 message_buffer=message_buffer,
@@ -1590,8 +1833,10 @@ class LLMEnhancement(Star):
             if remaining_sec <= 0:
                 controller.stop()
                 return
-            controller.keep(timeout=min(wait_timeout_sec, remaining_sec), reset_timeout=True)
-        
+            controller.keep(
+                timeout=min(wait_timeout_sec, remaining_sec), reset_timeout=True
+            )
+
         try:
             if len(message_buffer) < merge_max_count:
                 await collect_messages(event)
@@ -1599,15 +1844,15 @@ class LLMEnhancement(Star):
             logger.debug(
                 "[LLMEnhancement] collect_messages 等待超时："
                 f"uid={uid}, group={gid or 'private'}, trigger_msg_id={member.trigger_msg_id or 'unknown'}, "
-                f"buffer_count={len(message_buffer)}"
+                f"buffer_count={len(message_buffer)}",
             )
             pass
         finally:
             async with member.lock:
-                member.in_merging = False # 合并结束
+                member.in_merging = False  # 合并结束
                 member.merge_start_ts = 0.0
-            
-        # 无论是否超时，如果已取消，直接返回
+
+        # 无论是否超时，如果已取消，直接返回。
         if member.cancel_merge:
             logger.info(f" [LLMEnhancement] 合并流程已因消息撤回而取消 (用户: {uid})")
             event.stop_event()
@@ -1616,7 +1861,9 @@ class LLMEnhancement(Star):
         # 合并结束后做一次协议端校验，兜底撤回事件延迟/丢失。
         if message_buffer and isinstance(event, AiocqhttpMessageEvent):
             validation_before_count = len(message_buffer)
-            filtered_buffer, removed_msg_ids = await filter_unavailable_message_buffer(event, message_buffer)
+            filtered_buffer, removed_msg_ids = await filter_unavailable_message_buffer(
+                event, message_buffer
+            )
 
             if removed_msg_ids:
                 async with member.lock:
@@ -1627,13 +1874,13 @@ class LLMEnhancement(Star):
                     f"[LLMEnhancement] 最终校验已从本次合并队列移除消息："
                     f"before={validation_before_count}, removed={len(removed_msg_ids)}, "
                     f"remaining={len(filtered_buffer)}, removed_ids={removed_ids_text}, "
-                    f"trigger_msg_id={member.trigger_msg_id or 'unknown'}"
+                    f"trigger_msg_id={member.trigger_msg_id or 'unknown'}",
                 )
             else:
                 logger.debug(
                     f"[LLMEnhancement] 最终校验完成（未移除消息）："
                     f"before={validation_before_count}, removed=0, remaining={len(filtered_buffer)}, "
-                    f"trigger_msg_id={member.trigger_msg_id or 'unknown'}"
+                    f"trigger_msg_id={member.trigger_msg_id or 'unknown'}",
                 )
             message_buffer = filtered_buffer
 
@@ -1641,16 +1888,22 @@ class LLMEnhancement(Star):
             sender_count = apply_merged_message_to_request(event, req, message_buffer)
             event.set_extra(
                 "_llme_merged_batch_msg_ids",
-                [str(mid).strip() for mid, _name, _content in message_buffer if str(mid or "").strip()],
+                [
+                    str(mid).strip()
+                    for mid, _name, _content in message_buffer
+                    if str(mid or "").strip()
+                ],
             )
-                
+
             log_prefix = f"群({gid})" if gid else "私聊"
-            logger.debug(f"{log_prefix}合并：用户({uid})触发，共合并了{len(message_buffer)}条消息 (涉及{sender_count}人)")
+            logger.debug(
+                f"{log_prefix}合并：用户({uid})触发，共合并了{len(message_buffer)}条消息 (涉及{sender_count}人)"
+            )
         else:
             member.cancel_merge = True
             logger.info(
                 f"[LLMEnhancement] 本次合并上下文消息均已被撤回或不可获取，取消本次请求。"
-                f"trigger_msg_id={member.trigger_msg_id or 'unknown'}"
+                f"trigger_msg_id={member.trigger_msg_id or 'unknown'}",
             )
             event.stop_event()
             return []
@@ -1681,13 +1934,15 @@ class LLMEnhancement(Star):
             allow_multi_user=allow_multi_user,
             merge_delay=merge_delay,
             merge_max_count=merge_max_count,
-            is_recent_recalled=lambda msg_id: self._consume_recent_recall(event.unified_msg_origin, msg_id),
+            is_recent_recalled=lambda msg_id: self._consume_recent_recall(
+                event.unified_msg_origin, msg_id
+            ),
             event_ts=event_ts,
         )
         if result.get("cancelled"):
             logger.info(
                 "[LLMEnhancement] 动态合并无可用消息，已取消本次请求："
-                f"uid={uid}, group={gid or 'private'}, request_seq={int(result.get('request_seq') or 0)}"
+                f"uid={uid}, group={gid or 'private'}, request_seq={int(result.get('request_seq') or 0)}",
             )
             return []
         removed_recalled_ids = result.get("removed_recalled_ids", []) or []
@@ -1695,30 +1950,28 @@ class LLMEnhancement(Star):
             logger.debug(
                 "[LLMEnhancement] 动态合并已过滤撤回消息："
                 f"uid={uid}, group={gid or 'private'}, request_seq={int(result.get('request_seq') or 0)}, "
-                f"removed_ids={','.join([str(x) for x in removed_recalled_ids])}"
+                f"removed_ids={','.join([str(x) for x in removed_recalled_ids])}",
             )
         removed_unavailable_ids = result.get("removed_unavailable_ids", []) or []
         if removed_unavailable_ids:
             logger.debug(
                 "[LLMEnhancement] 动态合并兜底校验已过滤不可用消息："
                 f"uid={uid}, group={gid or 'private'}, request_seq={int(result.get('request_seq') or 0)}, "
-                f"removed_ids={','.join([str(x) for x in removed_unavailable_ids])}"
+                f"removed_ids={','.join([str(x) for x in removed_unavailable_ids])}",
             )
         log_prefix = f"群({gid})" if gid else "私聊"
         logger.debug(
             f"{log_prefix}动态合并：请求seq={int(result.get('request_seq') or 0)}，"
             f"合并{int(result.get('message_count') or 0)}条消息 "
-            f"(涉及{int(result.get('sender_count') or 0)}人，待确认池{int(result.get('unresolved_count') or 0)}条)"
+            f"(涉及{int(result.get('sender_count') or 0)}人，待确认池{int(result.get('unresolved_count') or 0)}条)",
         )
         logger.debug(
             "[LLMEnhancement] 动态合并批次详情："
             f"uid={uid}, group={gid or 'private'}, request_seq={int(result.get('request_seq') or 0)}, "
             f"batch_keys={result.get('selected_keys', [])}, "
-            f"selected_msg_ids={result.get('selected_msg_ids', [])}"
+            f"selected_msg_ids={result.get('selected_msg_ids', [])}",
         )
         return result.get("additional_components", [])
-
-    # ==================== LLM 工具注册 ====================
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("清除上下文", alias={"clear"})
@@ -1761,6 +2014,10 @@ class LLMEnhancement(Star):
                 )
                 self._active_request_ts.pop(key, None)
 
+        # 5. 清除所有全局缓存（URL 摘要、图片转述、语音转写等）
+        for _, cache_dict, _ in self._CACHE_SOURCES:
+            cache_dict.clear()
+
         yield event.plain_result("清除上下文成功！")
 
     @filter.command_group("黑名单", alias={"bl"})
@@ -1770,7 +2027,9 @@ class LLMEnhancement(Star):
         pass
 
     @blacklist.command("列表", alias={"ls"})
-    async def blacklist_ls(self, event: AstrMessageEvent, page: int = 1, page_size: int = 10):
+    async def blacklist_ls(
+        self, event: AstrMessageEvent, page: int = 1, page_size: int = 10
+    ):
         """查看黑名单列表。用法: /黑名单 列表 [页码] [每页数量]"""
         result = await self.blacklist.command_ls(page=page, page_size=page_size)
         if result.image_base64:
@@ -1816,6 +2075,8 @@ class LLMEnhancement(Star):
         result = await self.blacklist.command_clear()
         yield event.plain_result(result)
 
+    # ==================== LLM 工具注册 ====================
+
     @filter.llm_tool(name="get_user_avatar")
     async def get_user_avatar(self, event: AstrMessageEvent, user_ids: str = "") -> Any:
         """
@@ -1827,7 +2088,9 @@ class LLMEnhancement(Star):
         return await process_user_avatar(event=event, user_ids=user_ids)
 
     @filter.llm_tool(name="get_group_members_list")
-    async def get_group_members(self, event: AstrMessageEvent, group_id: str = None) -> str:
+    async def get_group_members(
+        self, event: AstrMessageEvent, group_id: str = None
+    ) -> str:
         """
         获取指定 QQ 群的成员列表。
 
@@ -1860,7 +2123,9 @@ class LLMEnhancement(Star):
         )
 
     @filter.llm_tool(name="get_group_info")
-    async def get_group_info(self, event: AstrMessageEvent, group_id: str = None, no_cache: bool = False) -> str:
+    async def get_group_info(
+        self, event: AstrMessageEvent, group_id: str = None, no_cache: bool = False
+    ) -> str:
         """
         获取指定 QQ 群的群信息。
 
@@ -1868,10 +2133,14 @@ class LLMEnhancement(Star):
             group_id (str, optional): 目标群号。在私聊使用时必填，在群聊使用时可选（默认当前群）。
             no_cache (bool, optional): 是否跳过缓存直接查询 OneBot。
         """
-        return await process_group_info(event=event, group_id=group_id, no_cache=no_cache)
+        return await process_group_info(
+            event=event, group_id=group_id, no_cache=no_cache
+        )
 
     @filter.llm_tool(name="get_group_notices")
-    async def get_group_notices(self, event: AstrMessageEvent, group_id: str = None, limit: int = 10) -> str:
+    async def get_group_notices(
+        self, event: AstrMessageEvent, group_id: str = None, limit: int = 10
+    ) -> str:
         """
         获取指定 QQ 群的群公告列表。
 
@@ -1882,7 +2151,9 @@ class LLMEnhancement(Star):
         return await process_group_notices(event=event, group_id=group_id, limit=limit)
 
     @filter.llm_tool(name="get_group_essence")
-    async def get_group_essence(self, event: AstrMessageEvent, group_id: str = None, limit: int = 10) -> str:
+    async def get_group_essence(
+        self, event: AstrMessageEvent, group_id: str = None, limit: int = 10
+    ) -> str:
         """
         获取指定 QQ 群的精华消息列表。
 
@@ -1893,7 +2164,9 @@ class LLMEnhancement(Star):
         return await process_group_essence(event=event, group_id=group_id, limit=limit)
 
     @filter.llm_tool(name="get_contact_list")
-    async def get_contact_list(self, event: AstrMessageEvent, limit_each: int = 200) -> str:
+    async def get_contact_list(
+        self, event: AstrMessageEvent, limit_each: int = 200
+    ) -> str:
         """
         查看自身 QQ 的通讯录。
 
@@ -1933,7 +2206,7 @@ class LLMEnhancement(Star):
             auto_escape=auto_escape,
         )
 
-        # 上下文补录：工具发送成功后记录到目标群的 StateManager
+        # 上下文补录：工具发送成功后记录到目标群的 StateManager。
         try:
             data = json.loads(result_text)
             targets: list[tuple[str, str]] = []
@@ -1944,7 +2217,7 @@ class LLMEnhancement(Star):
                 if gid:
                     targets.append((gid, mid))
             elif "results" in data and data.get("chat_type") == "group":
-                for r in (data.get("results") or []):
+                for r in data.get("results") or []:
                     if r.get("success"):
                         rgid = str(r.get("group_id") or "").strip()
                         rmid = str(r.get("message_id") or "").strip()
@@ -2024,7 +2297,7 @@ class LLMEnhancement(Star):
             )
         return json.dumps(
             {"error": "chat_type 参数无效。仅支持 group 或 private。"},
-            ensure_ascii=False
+            ensure_ascii=False,
         )
 
     @filter.llm_tool(name="set_group_ban")
@@ -2078,7 +2351,7 @@ class LLMEnhancement(Star):
             self_only_tools=self._get_cfg("self_only_tools", []),
             enabled_risk_tools=self._get_cfg("enabled_risk_tools", []),
             confirm_required_tools=self._get_cfg("confirm_required_tools", []),
-            confirm_timeout_sec=self._confirm_timeout_sec(),
+            confirm_timeout_sec=max(0, int(self._get_cfg("confirm_timeout_sec", 90))),
             confirm_token=confirm_token,
         )
 
@@ -2104,7 +2377,7 @@ class LLMEnhancement(Star):
             group_id=group_id,
             enabled_risk_tools=self._get_cfg("enabled_risk_tools", []),
             confirm_required_tools=self._get_cfg("confirm_required_tools", []),
-            confirm_timeout_sec=self._confirm_timeout_sec(),
+            confirm_timeout_sec=max(0, int(self._get_cfg("confirm_timeout_sec", 90))),
             confirm_token=confirm_token,
         )
 
@@ -2133,12 +2406,18 @@ class LLMEnhancement(Star):
             group_id=group_id,
             enabled_risk_tools=self._get_cfg("enabled_risk_tools", []),
             confirm_required_tools=self._get_cfg("confirm_required_tools", []),
-            confirm_timeout_sec=self._confirm_timeout_sec(),
+            confirm_timeout_sec=max(0, int(self._get_cfg("confirm_timeout_sec", 90))),
             confirm_token=confirm_token,
         )
 
     @filter.llm_tool(name="set_group_card")
-    async def set_group_card(self, event: AstrMessageEvent, user_id: str = "", card: str = "", group_id: str = None) -> str:
+    async def set_group_card(
+        self,
+        event: AstrMessageEvent,
+        user_id: str = "",
+        card: str = "",
+        group_id: str = None,
+    ) -> str:
         """
         设置群成员名片即群昵称。
 
@@ -2182,7 +2461,9 @@ class LLMEnhancement(Star):
         )
 
     @filter.llm_tool(name="set_essence_msg")
-    async def set_essence_msg(self, event: AstrMessageEvent, message_ids: str = "") -> str:
+    async def set_essence_msg(
+        self, event: AstrMessageEvent, message_ids: str = ""
+    ) -> str:
         """
         将指定消息设置为群精华消息。仅支持群聊中使用。
 
@@ -2214,12 +2495,14 @@ class LLMEnhancement(Star):
             message_ids=message_ids,
             enabled_risk_tools=self._get_cfg("enabled_risk_tools", []),
             confirm_required_tools=self._get_cfg("confirm_required_tools", []),
-            confirm_timeout_sec=self._confirm_timeout_sec(),
+            confirm_timeout_sec=max(0, int(self._get_cfg("confirm_timeout_sec", 90))),
             confirm_token=confirm_token,
         )
 
     @filter.llm_tool(name="delete_msg")
-    async def delete_msg(self, event: AstrMessageEvent, message_ids: str = "", confirm_token: str = "") -> str:
+    async def delete_msg(
+        self, event: AstrMessageEvent, message_ids: str = "", confirm_token: str = ""
+    ) -> str:
         """
         撤回消息。
 
@@ -2232,12 +2515,14 @@ class LLMEnhancement(Star):
             message_ids=message_ids,
             enabled_risk_tools=self._get_cfg("enabled_risk_tools", []),
             confirm_required_tools=self._get_cfg("confirm_required_tools", []),
-            confirm_timeout_sec=self._confirm_timeout_sec(),
+            confirm_timeout_sec=max(0, int(self._get_cfg("confirm_timeout_sec", 90))),
             confirm_token=confirm_token,
         )
 
     @filter.llm_tool(name="set_group_name")
-    async def set_group_name(self, event: AstrMessageEvent, group_name: str, group_id: str = None) -> str:
+    async def set_group_name(
+        self, event: AstrMessageEvent, group_name: str, group_id: str = None
+    ) -> str:
         """
         修改群名称。
 
@@ -2298,12 +2583,14 @@ class LLMEnhancement(Star):
             group_id=group_id,
             enabled_risk_tools=self._get_cfg("enabled_risk_tools", []),
             confirm_required_tools=self._get_cfg("confirm_required_tools", []),
-            confirm_timeout_sec=self._confirm_timeout_sec(),
+            confirm_timeout_sec=max(0, int(self._get_cfg("confirm_timeout_sec", 90))),
             confirm_token=confirm_token,
         )
 
     @filter.llm_tool(name="dismiss_group")
-    async def dismiss_group(self, event: AstrMessageEvent, group_id: str = None, confirm_token: str = "") -> str:
+    async def dismiss_group(
+        self, event: AstrMessageEvent, group_id: str = None, confirm_token: str = ""
+    ) -> str:
         """
         解散群聊。
 
@@ -2316,7 +2603,7 @@ class LLMEnhancement(Star):
             group_id=group_id,
             enabled_risk_tools=self._get_cfg("enabled_risk_tools", []),
             confirm_required_tools=self._get_cfg("confirm_required_tools", []),
-            confirm_timeout_sec=self._confirm_timeout_sec(),
+            confirm_timeout_sec=max(0, int(self._get_cfg("confirm_timeout_sec", 90))),
             confirm_token=confirm_token,
         )
 
@@ -2358,7 +2645,9 @@ class LLMEnhancement(Star):
         return await self.blacklist.tool_unblock_user(event=event, user_ids=user_ids)
 
     @filter.llm_tool(name="list_blacklist")
-    async def list_blacklist(self, event: AstrMessageEvent, page: int = 1, page_size: int = 20) -> str:
+    async def list_blacklist(
+        self, event: AstrMessageEvent, page: int = 1, page_size: int = 20
+    ) -> str:
         """
         获取黑名单列表（分页）。
         返回中的 expire_time 表示该用户黑名单失效时间，失效后会自动移出黑名单，可重新与其进行对话。
@@ -2367,7 +2656,9 @@ class LLMEnhancement(Star):
             page (int, optional): 页码，从 1 开始。
             page_size (int, optional): 每页数量，默认 20，最大 50。
         """
-        return await self.blacklist.tool_list_blacklist(event=event, page=page, page_size=page_size)
+        return await self.blacklist.tool_list_blacklist(
+            event=event, page=page, page_size=page_size
+        )
 
     @filter.llm_tool(name="get_blacklist_status")
     async def get_blacklist_status(self, event: AstrMessageEvent, user_ids: str) -> str:
@@ -2378,7 +2669,9 @@ class LLMEnhancement(Star):
         Args:
             user_ids (str): 目标用户 ID，支持逗号分隔多个（如 123,456）。
         """
-        return await self.blacklist.tool_get_blacklist_status(event=event, user_ids=user_ids)
+        return await self.blacklist.tool_get_blacklist_status(
+            event=event, user_ids=user_ids
+        )
 
     # ==================== LLM 请求级别逻辑 ====================
 
@@ -2397,7 +2690,7 @@ class LLMEnhancement(Star):
         if not gid:
             return
 
-        # 违禁词检查 — 已触发唤醒场景下拦截 LLM 请求
+        # 违禁词检查 — 已触发唤醒场景下拦截 LLM 请求。
         msg = (event.message_str or "").strip()
         forbidden_word = contains_forbidden_wake_word(
             msg,
@@ -2422,13 +2715,13 @@ class LLMEnhancement(Star):
             else uid
         )
         allow_existing_dynamic_session_reuse = bool(
-            dynamic_merge_mode and event.get_extra("_llme_dynamic_requeued", default=False)
+            dynamic_merge_mode
+            and event.get_extra("_llme_dynamic_requeued", default=False),
         )
         current_msg_id = get_event_msg_id(event) or ""
 
-        orch = self._get_cfg("request_orchestration", {})
-        user_limit = normalize_concurrency_limit(orch.get("max_user_concurrent_requests", 0))
-        group_limit = normalize_concurrency_limit(orch.get("max_group_concurrent_requests", 0))
+        user_limit = max(0, int(self._get_cfg("max_user_concurrent_requests", 0)))
+        group_limit = max(0, int(self._get_cfg("max_group_concurrent_requests", 0)))
         async with self._request_counter_lock:
             now_ts = time.time()
             evict_stale_concurrency_slots(
@@ -2455,7 +2748,9 @@ class LLMEnhancement(Star):
             if accepted_slot:
                 self._active_request_ts[slot_key] = now_ts
         if not accepted_slot:
-            logger.debug(f"[LLMEnhancement] on_waiting_llm_request 并发拦截：{slot_detail}")
+            logger.debug(
+                f"[LLMEnhancement] on_waiting_llm_request 并发拦截：{slot_detail}"
+            )
             event.stop_event()
             return
 
@@ -2470,48 +2765,50 @@ class LLMEnhancement(Star):
         setattr(event, "_provider_req", req)
         if event.is_stopped():
             await self._release_concurrency_slot_if_needed(
-                event, reason="on_llm_request_skip_stopped"
+                event,
+                reason="on_llm_request_skip_stopped",
             )
             return
         if bool(event.get_extra("_llme_skip_due_to_prefix_block", default=False)):
             logger.debug("[LLMEnhancement] on_llm_request 拦截：命中唤醒前缀拦截。")
             event.stop_event()
             await self._release_concurrency_slot_if_needed(
-                event, reason="on_llm_request_prefix_wake_blocked"
+                event,
+                reason="on_llm_request_prefix_wake_blocked",
             )
             return
         gid: str = event.get_group_id()
         uid: str = event.get_sender_id()
         if not uid:
             await self._release_concurrency_slot_if_needed(
-                event, reason="on_llm_request_missing_uid"
+                event,
+                reason="on_llm_request_missing_uid",
             )
             return
 
         # 任意拦截等级都会拦截 LLM 请求。
         if await self.blacklist.intercept_llm_request(event):
             await self._release_concurrency_slot_if_needed(
-                event, reason="on_llm_request_blacklist_intercept"
+                event,
+                reason="on_llm_request_blacklist_intercept",
             )
             return
-        
+
         merge_cfg = load_merge_runtime_config(self._get_cfg)
         dynamic_merge_mode = bool(merge_cfg.dynamic_mode and merge_cfg.delay_sec > 0)
         g = StateManager.get_group(gid or f"private_{uid}")
-        async def _get_wake_context_messages(_event, count: int) -> list[str]:
-            msgs = get_wake_history_messages(
-                group_state=g,
-                get_cfg=self._get_cfg,
-                count=count,
-            )
-            if msgs:
-                return msgs
-            # 兜底：当上下文注入关闭或暂无记录时，回退到旧的有效对话历史。
-            return await self._effective_dialog_history.get_history_messages(_event, count)
+
+        def _get_wake_context_messages(ev, cnt):
+            return self._get_wake_context_messages(g, ev, cnt)
+
         if uid not in g.members:
             g.members[uid] = MemberState(uid=uid)
         sender_member = g.members[uid]
-        state_uid = str(event.get_extra("_llme_dynamic_state_uid", default=uid) or uid).strip() if dynamic_merge_mode else uid
+        state_uid = (
+            str(event.get_extra("_llme_dynamic_state_uid", default=uid) or uid).strip()
+            if dynamic_merge_mode
+            else uid
+        )
         if state_uid not in g.members:
             g.members[state_uid] = MemberState(uid=state_uid)
         merge_member = g.members[state_uid]
@@ -2536,8 +2833,12 @@ class LLMEnhancement(Star):
                 wake_prefixes = config.get("wake_prefix", []) or []
             except Exception:
                 wake_prefixes = []
-        require_at_for_wake_prefix = bool(self._get_cfg("require_at_for_wake_prefix", False))
-        raw_message_text = getattr(event.message_obj, "message_str", "") or event.message_str or ""
+        require_at_for_wake_prefix = bool(
+            self._get_cfg("require_at_for_wake_prefix", False)
+        )
+        raw_message_text = (
+            getattr(event.message_obj, "message_str", "") or event.message_str or ""
+        )
         if (
             require_at_for_wake_prefix
             and gid
@@ -2551,11 +2852,16 @@ class LLMEnhancement(Star):
             logger.debug("[LLMEnhancement] on_llm_request 拦截：命中唤醒前缀拦截。")
             event.stop_event()
             await self._release_concurrency_slot_if_needed(
-                event, reason="on_llm_request_prefix_only_wake_blocked"
+                event,
+                reason="on_llm_request_prefix_only_wake_blocked",
             )
             return
-        requeue_from_seq = int(event.get_extra("_llme_dynamic_requeue_from_seq", default=0) or 0)
-        is_requeued_dynamic_followup = bool(event.get_extra("_llme_dynamic_requeued", default=False))
+        requeue_from_seq = int(
+            event.get_extra("_llme_dynamic_requeue_from_seq", default=0) or 0
+        )
+        is_requeued_dynamic_followup = bool(
+            event.get_extra("_llme_dynamic_requeued", default=False)
+        )
         if dynamic_merge_mode and is_requeued_dynamic_followup and requeue_from_seq > 0:
             async with merge_member.lock:
                 current_req_seq = int(merge_member.dynamic_request_seq or 0)
@@ -2563,23 +2869,31 @@ class LLMEnhancement(Star):
                 logger.debug(
                     "[LLMEnhancement] 跳过过期动态重排请求："
                     f"group={gid or 'private'}, sender_uid={uid}, state_uid={state_uid}, "
-                    f"requeue_from_seq={requeue_from_seq}, current_req_seq={current_req_seq}"
+                    f"requeue_from_seq={requeue_from_seq}, current_req_seq={current_req_seq}",
                 )
                 event.stop_event()
                 await self._release_concurrency_slot_if_needed(
-                    event, reason="on_llm_request_stale_dynamic_requeue"
+                    event,
+                    reason="on_llm_request_stale_dynamic_requeue",
                 )
                 return
         if dynamic_merge_mode and state_uid != uid:
             logger.debug(
                 "[LLMEnhancement] 动态合并状态重定向："
-                f"group={gid or 'private'}, sender_uid={uid}, state_uid={state_uid}"
+                f"group={gid or 'private'}, sender_uid={uid}, state_uid={state_uid}",
             )
         now = event_ts_llm
         msg = event.message_str
         current_msg_id = get_event_msg_id(event)
-        is_dynamic_followup = bool(event.get_extra("_llme_dynamic_followup", default=False))
-        if is_dynamic_followup and requeue_from_seq > 0 and req.conversation and req.conversation.history:
+        is_dynamic_followup = bool(
+            event.get_extra("_llme_dynamic_followup", default=False)
+        )
+        if (
+            is_dynamic_followup
+            and requeue_from_seq > 0
+            and req.conversation
+            and req.conversation.history
+        ):
             try:
                 original_history = json.loads(req.conversation.history)
                 n = len(original_history)
@@ -2587,38 +2901,47 @@ class LLMEnhancement(Star):
                     first, second = original_history[0], original_history[1]
                     start = None
                     for i, msg_ctx in enumerate(req.contexts):
-                        if (msg_ctx.get("role") == first.get("role")
-                                and i + 1 < len(req.contexts)
-                                and req.contexts[i + 1].get("role") == second.get("role")
-                                and msg_ctx.get("content") == first.get("content")):
+                        if (
+                            msg_ctx.get("role") == first.get("role")
+                            and i + 1 < len(req.contexts)
+                            and req.contexts[i + 1].get("role") == second.get("role")
+                            and msg_ctx.get("content") == first.get("content")
+                        ):
                             start = i
                             break
                     if start is not None and start + n <= len(req.contexts):
                         idx = start + n - 2
-                        if (req.contexts[idx].get("role") == "user"
-                                and req.contexts[idx + 1].get("role") == "assistant"):
-                            del req.contexts[idx:idx + 2]
+                        if (
+                            req.contexts[idx].get("role") == "user"
+                            and req.contexts[idx + 1].get("role") == "assistant"
+                        ):
+                            del req.contexts[idx : idx + 2]
                             logger.debug(
                                 "[LLMEnhancement] 清理 requeued followup 残留对话历史："
                                 f"group={gid or 'private'}, uid={uid}, "
-                                f"requeue_from_seq={requeue_from_seq}"
+                                f"requeue_from_seq={requeue_from_seq}",
                             )
             except Exception as e:
                 logger.warning("[LLMEnhancement] 清理 requeued 历史失败：%s", e)
-        if current_msg_id and self._consume_recent_recall(event.unified_msg_origin, current_msg_id):
+        if current_msg_id and self._consume_recent_recall(
+            event.unified_msg_origin, current_msg_id
+        ):
             logger.info(
                 "[LLMEnhancement] on_llm_request 拦截：触发消息已在本次请求前撤回。"
-                f"umo={event.unified_msg_origin}, msg_id={current_msg_id}, uid={uid}"
+                f"umo={event.unified_msg_origin}, msg_id={current_msg_id}, uid={uid}",
             )
             event.stop_event()
             await self._release_concurrency_slot_if_needed(
-                event, reason="on_llm_request_message_recalled"
+                event,
+                reason="on_llm_request_message_recalled",
             )
             return
         merge_delay = merge_cfg.delay_sec
         cache_keep_sec = max(max(merge_cfg.delay_sec, 10.0) * 6, 60.0)
         async with merge_member.lock:
-            prune_member_msg_cache(merge_member, keep_sec=cache_keep_sec, ref_ts=event_ts_llm)
+            prune_member_msg_cache(
+                merge_member, keep_sec=cache_keep_sec, ref_ts=event_ts_llm
+            )
             if merge_delay > 0:
                 raw_message = (
                     event.message_obj.raw_message
@@ -2650,17 +2973,23 @@ class LLMEnhancement(Star):
             ):
                 logger.debug(
                     "[LLMEnhancement] 动态合并跳过已并入消息，避免队列中的重复请求："
-                    f"group={gid or 'private'}, sender_uid={uid}, state_uid={state_uid}, msg_id={current_msg_id}"
+                    f"group={gid or 'private'}, sender_uid={uid}, state_uid={state_uid}, msg_id={current_msg_id}",
                 )
                 event.stop_event()
                 await self._release_concurrency_slot_if_needed(
-                    event, reason="on_llm_request_skip_merged_dynamic"
+                    event,
+                    reason="on_llm_request_skip_merged_dynamic",
                 )
                 return
-            if not dynamic_merge_mode and current_msg_id and current_msg_id in merge_member.merged_msg_ids:
+            if (
+                not dynamic_merge_mode
+                and current_msg_id
+                and current_msg_id in merge_member.merged_msg_ids
+            ):
                 event.stop_event()
                 await self._release_concurrency_slot_if_needed(
-                    event, reason="on_llm_request_skip_merged_static"
+                    event,
+                    reason="on_llm_request_skip_merged_static",
                 )
                 return
 
@@ -2668,59 +2997,84 @@ class LLMEnhancement(Star):
         if hasattr(event, "message_obj") and hasattr(event.message_obj, "message"):
             message_chain = event.message_obj.message or []
         if not msg and not message_chain:
-            logger.debug(f"[LLMEnhancement] 忽略空消息事件: gid={gid or 'private'}, uid={uid}")
+            logger.debug(
+                f"[LLMEnhancement] 忽略空消息事件: gid={gid or 'private'}, uid={uid}"
+            )
             event.stop_event()
             await self._release_concurrency_slot_if_needed(
-                event, reason="on_llm_request_empty_message"
+                event,
+                reason="on_llm_request_empty_message",
             )
             return
-        
+
         if (not dynamic_merge_mode) and merge_member.in_merging:
-            logger.debug(f"[LLMEnhancement] 当前存在进行中的合并会话，跳过重复请求: gid={gid or 'private'}, uid={uid}")
+            logger.debug(
+                f"[LLMEnhancement] 当前存在进行中的合并会话，跳过重复请求: gid={gid or 'private'}, uid={uid}"
+            )
             event.stop_event()
             await self._release_concurrency_slot_if_needed(
-                event, reason="on_llm_request_merge_in_progress"
+                event,
+                reason="on_llm_request_merge_in_progress",
             )
             return
 
         has_preacquired_slot = True
         if gid:
-            has_preacquired_slot = bool(event.get_extra("_llme_concurrency_preacquired", default=False)) and bool(
-                event.get_extra("_llme_concurrency_acquired", default=False)
-            ) and (not bool(event.get_extra("_llme_concurrency_released", default=False)))
+            has_preacquired_slot = (
+                bool(event.get_extra("_llme_concurrency_preacquired", default=False))
+                and bool(
+                    event.get_extra("_llme_concurrency_acquired", default=False),
+                )
+                and (
+                    not bool(
+                        event.get_extra("_llme_concurrency_released", default=False)
+                    )
+                )
+            )
         if gid and (not has_preacquired_slot):
             logger.debug(
-                "[LLMEnhancement] on_llm_request 并发判定跳过：未检测到 on_waiting_llm_request 预占位。"
+                "[LLMEnhancement] on_llm_request 并发判定跳过：未检测到 on_waiting_llm_request 预占位。",
             )
 
         request_forwarded = False
         try:
-            # ==================== 1. 消息合并（前置，避免异步防护导致并发请求拆分） ====================
+            # ---- 1. 消息合并（前置，避免异步防护导致并发请求拆分） ----
             if merge_delay <= 0:
                 all_components = extract_merge_components(event)
                 logger.debug(
                     "[LLMEnhancement] 消息合并已关闭："
-                    f"gid={gid or 'private'}, uid={uid}, merge_delay={merge_delay}, dynamic_mode={merge_cfg.dynamic_mode}"
+                    f"gid={gid or 'private'}, uid={uid}, merge_delay={merge_delay}, dynamic_mode={merge_cfg.dynamic_mode}",
                 )
             elif dynamic_merge_mode:
-                all_components = await self._handle_message_merge_dynamic(event, req, gid, uid, merge_member, event_ts=event_ts_llm)
+                all_components = await self._handle_message_merge_dynamic(
+                    event, req, gid, uid, merge_member, event_ts=event_ts_llm
+                )
             else:
-                all_components = await self._handle_message_merge(event, req, gid, uid, merge_member, event_ts=event_ts_llm)
+                all_components = await self._handle_message_merge(
+                    event, req, gid, uid, merge_member, event_ts=event_ts_llm
+                )
             if merge_member.cancel_merge:
                 event.stop_event()
                 return
 
             direct_wake = bool(event.get_extra("_llme_direct_wake", default=False))
             wake_reason = str(event.get_extra("_llme_wake_reason", default="") or "")
-            command_trigger_event = bool(event.get_extra("_llme_command_trigger_event", default=False))
-            force_dynamic_followup = bool(event.get_extra("_llme_force_dynamic_followup", default=False))
+            command_trigger_event = bool(
+                event.get_extra("_llme_command_trigger_event", default=False)
+            )
+            force_dynamic_followup = bool(
+                event.get_extra("_llme_force_dynamic_followup", default=False)
+            )
             reply_seg_for_self_block = None
             for seg in all_components:
                 if isinstance(seg, Comp.Reply):
                     reply_seg_for_self_block = seg
                     break
             if reply_seg_for_self_block:
-                blocked_by_self_reply, self_reply_block_reason = await check_self_reply_block(
+                (
+                    blocked_by_self_reply,
+                    self_reply_block_reason,
+                ) = await check_self_reply_block(
                     event=event,
                     reply_seg=reply_seg_for_self_block,
                     get_cfg=self._get_cfg,
@@ -2728,7 +3082,7 @@ class LLMEnhancement(Star):
                 if blocked_by_self_reply:
                     logger.debug(
                         "[LLMEnhancement] on_llm_request 提前拦截：命中引用 Bot 自身内容屏蔽。"
-                        f"group={gid or 'private'}, uid={uid}, reason={self_reply_block_reason}"
+                        f"group={gid or 'private'}, uid={uid}, reason={self_reply_block_reason}",
                     )
                     event.stop_event()
                     return
@@ -2747,13 +3101,15 @@ class LLMEnhancement(Star):
                 force_dynamic_followup=force_dynamic_followup,
                 get_cfg=self._get_cfg,
                 get_history_msg=_get_wake_context_messages,
-                find_provider=lambda provider_id: resolve_provider(self.context, provider_id),
+                find_provider=lambda provider_id: resolve_provider(
+                    self.context, provider_id
+                ),
                 context=self.context,
             )
             if direct_wake and not wake:
                 logger.debug(
                     "[LLMEnhancement] on_llm_request 拦截：显式唤醒判定未通过，已取消本次 LLM 请求。"
-                    f"group={gid or 'private'}, uid={uid}, reason={wake_reason}, detail={wake_judge_detail}"
+                    f"group={gid or 'private'}, uid={uid}, reason={wake_reason}, detail={wake_judge_detail}",
                 )
                 event.stop_event()
                 return
@@ -2765,10 +3121,10 @@ class LLMEnhancement(Star):
             ):
                 logger.debug(
                     "[LLMEnhancement] on_llm_request 唤醒判定："
-                    f"group={gid or 'private'}, uid={uid}, reason={wake_reason}, detail={wake_judge_detail}, wake={wake}"
+                    f"group={gid or 'private'}, uid={uid}, reason={wake_reason}, detail={wake_judge_detail}, wake={wake}",
                 )
 
-            # ==================== 2. 防护机制（使用合并后的文本） ====================
+            # ---- 2. 防护机制（使用合并后的文本） ----
             msg = event.message_str
             event.set_extra(
                 "_llme_effective_user_text",
@@ -2776,10 +3132,16 @@ class LLMEnhancement(Star):
             )
             now = event_ts_llm
 
-            empty_mention_ctx = str(event.get_extra("_llme_empty_mention_context", default="") or "").strip()
+            empty_mention_ctx = str(
+                event.get_extra("_llme_empty_mention_context", default="") or ""
+            ).strip()
             if empty_mention_ctx:
-                if not append_text_part_to_request(req, empty_mention_ctx, mark_temp=True):
-                    req.prompt = f"{(req.prompt or '').strip()}\n\n{empty_mention_ctx}".strip()
+                if not append_text_part_to_request(
+                    req, empty_mention_ctx, mark_temp=True
+                ):
+                    req.prompt = (
+                        f"{(req.prompt or '').strip()}\n\n{empty_mention_ctx}".strip()
+                    )
 
             perception_fields = self._get_cfg("perception_injection_fields", [])
             perception_injected = bool(
@@ -2789,19 +3151,23 @@ class LLMEnhancement(Star):
                     raw_fields=perception_fields,
                     timezone_name="Asia/Shanghai",
                     holiday_country="CN",
-                    no_cache=bool(self._get_cfg("extra_info_injection_no_cache", False)),
-                )
+                    no_cache=bool(
+                        self._get_cfg("extra_info_injection_no_cache", False)
+                    ),
+                ),
             )
 
             selected_fields = self._get_cfg("extra_info_injection_fields", [])
-            inject_no_cache = bool(self._get_cfg("extra_info_injection_no_cache", False))
+            inject_no_cache = bool(
+                self._get_cfg("extra_info_injection_no_cache", False)
+            )
             sender_member_injected = bool(
                 await inject_sender_group_member_info(
                     event,
                     req,
                     raw_fields=selected_fields,
                     no_cache=inject_no_cache,
-                )
+                ),
             )
             bot_member_injected = False
             if bool(self._get_cfg("extra_info_injection_include_bot_self", False)):
@@ -2811,17 +3177,23 @@ class LLMEnhancement(Star):
                         req,
                         raw_fields=selected_fields,
                         no_cache=inject_no_cache,
-                    )
+                    ),
                 )
 
-            injected_context, inject_detail, _injected_block = inject_context_into_request(
-                req=req,
-                group_state=g,
-                get_cfg=self._get_cfg,
-                direct_wake=direct_wake,
-                wake_reason=wake_reason,
+            injected_context, inject_detail, _injected_block = (
+                inject_context_into_request(
+                    req=req,
+                    group_state=g,
+                    get_cfg=self._get_cfg,
+                    direct_wake=direct_wake,
+                    wake_reason=wake_reason,
+                )
             )
-            active_wake_note_injected, active_wake_note_detail, _active_wake_note_block = inject_active_wake_note_into_request(
+            (
+                active_wake_note_injected,
+                active_wake_note_detail,
+                _active_wake_note_block,
+            ) = inject_active_wake_note_into_request(
                 req=req,
                 direct_wake=direct_wake,
                 wake_reason=wake_reason,
@@ -2829,7 +3201,7 @@ class LLMEnhancement(Star):
             if injected_context:
                 logger.debug(
                     "[LLMEnhancement][ContextInjection] 已注入上下文："
-                    f"group={gid or 'private'}, uid={uid}, reason={wake_reason}, detail={inject_detail}"
+                    f"group={gid or 'private'}, uid={uid}, reason={wake_reason}, detail={inject_detail}",
                 )
 
             injection_summary = {
@@ -2847,10 +3219,18 @@ class LLMEnhancement(Star):
             # 注册清理路径容器
             req._cleanup_paths = []
 
-            dynamic_batch_msg_ids = event.get_extra("_llme_dynamic_batch_msg_ids", default=[]) or []
-            merged_batch_msg_ids = event.get_extra("_llme_merged_batch_msg_ids", default=[]) or []
+            dynamic_batch_msg_ids = (
+                event.get_extra("_llme_dynamic_batch_msg_ids", default=[]) or []
+            )
+            merged_batch_msg_ids = (
+                event.get_extra("_llme_merged_batch_msg_ids", default=[]) or []
+            )
             if (not merged_batch_msg_ids) and dynamic_batch_msg_ids:
-                merged_batch_msg_ids = [str(mid).strip() for mid in dynamic_batch_msg_ids if str(mid or "").strip()]
+                merged_batch_msg_ids = [
+                    str(mid).strip()
+                    for mid in dynamic_batch_msg_ids
+                    if str(mid or "").strip()
+                ]
                 event.set_extra("_llme_merged_batch_msg_ids", merged_batch_msg_ids)
             current_provider = resolve_provider(
                 self.context,
@@ -2859,7 +3239,7 @@ class LLMEnhancement(Star):
             if current_provider is None:
                 try:
                     current_provider = self.context.get_using_provider(
-                        umo=event.unified_msg_origin
+                        umo=event.unified_msg_origin,
                     )
                 except Exception:
                     current_provider = None
@@ -2871,15 +3251,17 @@ class LLMEnhancement(Star):
                 get_cfg=self._get_cfg,
                 framework_provider_settings=(
                     self.context.get_config(umo=event.unified_msg_origin).get(
-                        "provider_settings", {}
+                        "provider_settings",
+                        {},
                     )
                     or {}
                 ),
                 provider_by_id_resolver=lambda provider_id: resolve_provider(
-                    self.context, provider_id
+                    self.context,
+                    provider_id,
                 ),
                 default_provider_resolver=lambda: self.context.get_using_provider(
-                    umo=event.unified_msg_origin
+                    umo=event.unified_msg_origin,
                 ),
             )
             if not dynamic_batch_msg_ids:
@@ -2891,25 +3273,29 @@ class LLMEnhancement(Star):
                 event=event,
                 req=req,
             )
-             
-            # ==================== 3. 引用/JSON/文件上下文注入（不含转发聊天记录解析） ====================
+
+            # ---- 3. 引用/JSON/文件上下文注入（不含转发聊天记录解析） ----
             ref_result = await process_reference_context(
                 event=event,
                 context=self.context,
                 req=req,
                 all_components=all_components,
                 get_cfg=self._get_cfg,
-                download_media=download_video_to_temp,
+                download_media=download_media_to_temp,
             )
-            injection_summary["json"] = bool(getattr(ref_result, "injected_json", False))
-            injection_summary["file"] = bool(getattr(ref_result, "injected_file", False))
+            injection_summary["json"] = bool(
+                getattr(ref_result, "injected_json", False)
+            )
+            injection_summary["file"] = bool(
+                getattr(ref_result, "injected_file", False)
+            )
             injection_summary["url"] = bool(getattr(ref_result, "injected_url", False))
             if ref_result.blocked:
                 event.stop_event()
                 return
             reply_seg = ref_result.reply_seg
 
-            # ==================== 4. 转发聊天记录解析 ====================
+            # ---- 4. 转发聊天记录解析 ----
             handled_forward = await process_forward_record_content(
                 context=self.context,
                 event=event,
@@ -2931,8 +3317,8 @@ class LLMEnhancement(Star):
             injection_summary["forward"] = bool(handled_forward)
             if handled_forward:
                 return
-             
-            # ==================== 5. 语音转写注入 ====================
+
+            # ---- 5. 语音转写注入 ----
             injection_summary["record"] = bool(
                 await inject_record_asr_context(
                     context=self.context,
@@ -2941,10 +3327,10 @@ class LLMEnhancement(Star):
                     all_components=all_components,
                     get_cfg=self._get_cfg,
                     cleanup_paths=cleanup_paths_later,
-                )
+                ),
             )
 
-            # ==================== 6. 媒体场景检测与处理 ====================
+            # ---- 6. 媒体场景检测与处理 ----
             injection_summary["video"] = bool(
                 await process_media_content(
                     context=self.context,
@@ -2953,27 +3339,31 @@ class LLMEnhancement(Star):
                     all_components=all_components,
                     reply_seg=reply_seg,
                     get_cfg=self._get_cfg,
-                )
+                ),
             )
             await self._start_private_typing_indicator(event)
             request_forwarded = True
-        
+
         finally:
             if event.is_stopped():
                 await self._stop_private_typing_indicator(event)
             if not request_forwarded:
                 await self._release_concurrency_slot_if_needed(
-                    event, reason="request_blocked_before_provider"
+                    event,
+                    reason="request_blocked_before_provider",
                 )
             if dynamic_merge_mode and event.is_stopped():
                 dynamic_req_seq = int(event.get_extra("_llme_dynamic_request_seq") or 0)
                 if dynamic_req_seq > 0:
                     async with merge_member.lock:
-                        # 重置 inflight_seq，但不清理解 dynamic_unresolved_msgs
+                        # 重置 inflight_seq，但不清理解 dynamic_unresolved_msgs。
                         if merge_member.dynamic_inflight_seq == dynamic_req_seq:
                             merge_member.dynamic_inflight_seq = 0
                             reset_dynamic_capture_session(merge_member)
-                        if int(merge_member.dynamic_source_event_seq or 0) == dynamic_req_seq:
+                        if (
+                            int(merge_member.dynamic_source_event_seq or 0)
+                            == dynamic_req_seq
+                        ):
                             merge_member.dynamic_source_event = None
                             merge_member.dynamic_source_event_seq = 0
                         if g.dynamic_owner_uid == state_uid:
@@ -2985,7 +3375,6 @@ class LLMEnhancement(Star):
             if hasattr(req, "_cleanup_paths"):
                 await cleanup_paths_later(req._cleanup_paths)
 
-
     @filter.on_llm_response(priority=20)
     async def on_llm_response(self, event: AstrMessageEvent, resp: LLMResponse):
         """在 LLM 返回结果后执行，用于更新会话状态并处理动态丢弃回退。"""
@@ -2993,30 +3382,36 @@ class LLMEnhancement(Star):
         uid: str = event.get_sender_id()
         if not uid:
             await self._release_concurrency_slot_if_needed(
-                event, reason="llm_response_missing_uid"
+                event,
+                reason="llm_response_missing_uid",
             )
             return
 
         try:
             target_id = gid or f"private_{uid}"
             g = StateManager.get_group(target_id)
-            context_injection_enabled = bool(gid) and is_context_injection_enabled(self._get_cfg)
+            context_injection_enabled = bool(gid) and is_context_injection_enabled(
+                self._get_cfg
+            )
             context_injection_max_messages = (
                 get_context_injection_max_messages(self._get_cfg)
                 if context_injection_enabled
                 else 0
             )
-            state_uid = str(event.get_extra("_llme_dynamic_state_uid", default=uid) or uid).strip()
+            state_uid = str(
+                event.get_extra("_llme_dynamic_state_uid", default=uid) or uid
+            ).strip()
             member = g.members.get(state_uid)
             should_drop = False
 
             if member:
                 merge_cfg = load_merge_runtime_config(self._get_cfg)
-                dynamic_merge_mode = bool(merge_cfg.dynamic_mode and merge_cfg.delay_sec > 0)
-                cache_ttl_sec = get_discarded_response_ttl_sec(self._get_cfg, DYNAMIC_DISCARDED_RESPONSE_TTL_SEC)
+                dynamic_merge_mode = bool(
+                    merge_cfg.dynamic_mode and merge_cfg.delay_sec > 0
+                )
+                cache_ttl_sec = 300.0
                 dynamic_req_seq = int(event.get_extra("_llme_dynamic_request_seq") or 0)
                 is_dynamic_request = dynamic_merge_mode and dynamic_req_seq > 0
-                dynamic_batch_keys = event.get_extra("_llme_dynamic_batch_keys", default=[]) or []
                 if dynamic_merge_mode and dynamic_req_seq > 0:
                     should_drop = False
                     cache_stored = False
@@ -3025,7 +3420,9 @@ class LLMEnhancement(Star):
                     async with member.lock:
                         if dynamic_req_seq <= member.dynamic_discard_before_seq:
                             should_drop = True
-                            cache_stored = store_discarded_response_cache(member, dynamic_req_seq, resp)
+                            cache_stored = store_discarded_response_cache(
+                                member, dynamic_req_seq, resp
+                            )
                         if member.dynamic_inflight_seq == dynamic_req_seq:
                             member.dynamic_inflight_seq = 0
                             reset_dynamic_capture_session(member)
@@ -3035,7 +3432,9 @@ class LLMEnhancement(Star):
                         if g.dynamic_owner_uid == state_uid:
                             g.dynamic_owner_uid = None
                         next_inflight_seq = int(member.dynamic_inflight_seq or 0)
-                        pending_requeue_seq = int(member.dynamic_requeue_pending_seq or 0)
+                        pending_requeue_seq = int(
+                            member.dynamic_requeue_pending_seq or 0
+                        )
 
                     if should_drop:
                         has_newer_inflight = next_inflight_seq > dynamic_req_seq
@@ -3045,27 +3444,28 @@ class LLMEnhancement(Star):
                                 "[LLMEnhancement] 动态合并放弃上次请求响应："
                                 f"uid={state_uid}, sender_uid={uid}, group={gid or 'private'}, response_seq={dynamic_req_seq}, "
                                 f"discard_before_seq={member.dynamic_discard_before_seq}, cache_stored={cache_stored}, "
-                                f"next_inflight_seq={next_inflight_seq}, pending_requeue_seq={pending_requeue_seq}"
+                                f"next_inflight_seq={next_inflight_seq}, pending_requeue_seq={pending_requeue_seq}",
                             )
                             clear_pending_msg_ids(g, member)
                             member.cancel_merge = False
                             event.set_extra("_llme_pending_last_response_update", False)
                             event.stop_event()
                             await self._release_concurrency_slot_if_needed(
-                                event, reason="llm_response_discarded"
+                                event,
+                                reason="llm_response_discarded",
                             )
                             return
                         logger.warning(
                             "[LLMEnhancement] 动态丢弃保护触发：未检测到更新中的后续请求，保留当前响应以避免整轮无回复。"
                             f"uid={state_uid}, sender_uid={uid}, group={gid or 'private'}, response_seq={dynamic_req_seq}, "
-                            f"discard_before_seq={member.dynamic_discard_before_seq}, cache_stored={cache_stored}"
+                            f"discard_before_seq={member.dynamic_discard_before_seq}, cache_stored={cache_stored}",
                         )
 
-                # 检查是否在此期间发生了撤回
+                # 检查是否在此期间发生了撤回。
                 if member.cancel_merge:
                     logger.info(
                         " [LLMEnhancement] LLM 响应生成完成，但检测到消息已撤回，拦截回复 "
-                        f"(state_uid: {state_uid}, sender_uid: {uid})。"
+                        f"(state_uid: {state_uid}, sender_uid: {uid})。",
                     )
                     member.cancel_merge = False
                     clear_pending_msg_ids(g, member)
@@ -3076,7 +3476,8 @@ class LLMEnhancement(Star):
                     event.set_extra("_llme_effective_assistant_text_candidate", "")
                     event.stop_event()
                     await self._release_concurrency_slot_if_needed(
-                        event, reason="llm_response_cancelled_by_recall"
+                        event,
+                        reason="llm_response_cancelled_by_recall",
                     )
                     return
 
@@ -3084,7 +3485,9 @@ class LLMEnhancement(Star):
                 event.set_extra("_llme_discard_cache_clear_after_sent", False)
                 event.set_extra(
                     "_llme_effective_assistant_text_candidate",
-                    self._effective_dialog_history.extract_assistant_text_from_response(resp),
+                    self._effective_dialog_history.extract_assistant_text_from_response(
+                        resp
+                    ),
                 )
                 # 清理待处理消息 ID
                 clear_pending_msg_ids(g, member)
@@ -3093,16 +3496,20 @@ class LLMEnhancement(Star):
                 is_err_resp = str(resp.role or "").lower() == "err"
                 is_empty_resp = is_llm_response_empty_without_tool(resp)
                 has_tool_calls = bool(resp.tools_call_name or resp.tools_call_args)
-                # 如果有 tool_calls，即使 chain 为空也不触发 fallback
+                # 如果有 tool_calls，即使 chain 为空也不触发 fallback。
                 if has_tool_calls:
                     event.set_extra("_llme_has_tool_calls", True)
-                if is_dynamic_request and (is_err_resp or (is_empty_resp and not has_tool_calls)):
+                if is_dynamic_request and (
+                    is_err_resp or (is_empty_resp and not has_tool_calls)
+                ):
                     await apply_discarded_response_fallback(
                         event=event,
                         member=member,
                         gid=gid,
                         uid=uid,
-                        reason="llm_response_err" if is_err_resp else "llm_response_empty",
+                        reason="llm_response_err"
+                        if is_err_resp
+                        else "llm_response_empty",
                         ttl_sec=cache_ttl_sec,
                     )
                 else:
@@ -3110,7 +3517,9 @@ class LLMEnhancement(Star):
                     event.set_extra("_llme_discard_cache_clear_after_sent", True)
 
                 if context_injection_enabled and not should_drop:
-                    assistant_text = self._effective_dialog_history.extract_assistant_text_from_response(resp)
+                    assistant_text = self._effective_dialog_history.extract_assistant_text_from_response(
+                        resp
+                    )
                     if not assistant_text:
                         assistant_text = str(resp.completion_text or "").strip()
                     if assistant_text and str(resp.role or "").lower() != "err":
@@ -3132,7 +3541,6 @@ class LLMEnhancement(Star):
                             now_ts=time.time(),
                             get_cfg=self._get_cfg,
                         )
-                        sender_name = event.get_sender_name()
                         g.context_bot_last_replied_to_uid = state_uid
 
         finally:
@@ -3142,7 +3550,9 @@ class LLMEnhancement(Star):
     async def on_decorating_result(self, event: AstrMessageEvent):
         """发送前兜底：若结果为空/报错，尝试回退到动态丢弃缓存。"""
         await self._show_private_typing_indicator(event)
-        if not bool(event.get_extra("_llme_pending_last_response_update", default=False)):
+        if not bool(
+            event.get_extra("_llme_pending_last_response_update", default=False)
+        ):
             return
 
         uid: str = event.get_sender_id()
@@ -3151,7 +3561,9 @@ class LLMEnhancement(Star):
         gid: str = event.get_group_id()
         target_id = gid or f"private_{uid}"
         g = StateManager.get_group(target_id)
-        state_uid = str(event.get_extra("_llme_dynamic_state_uid", default=uid) or uid).strip()
+        state_uid = str(
+            event.get_extra("_llme_dynamic_state_uid", default=uid) or uid
+        ).strip()
         member = g.members.get(state_uid)
         if not member:
             return
@@ -3165,12 +3577,14 @@ class LLMEnhancement(Star):
 
         chain = list(result.chain or [])
         has_tool_calls = bool(event.get_extra("_llme_has_tool_calls", default=False))
-        need_fallback = (is_chain_effectively_empty(chain) or looks_like_error_result(chain)) and not has_tool_calls
+        need_fallback = (
+            is_chain_effectively_empty(chain) or looks_like_error_result(chain)
+        ) and not has_tool_calls
         if not need_fallback:
             event.set_extra("_llme_discard_cache_clear_after_sent", True)
             return
 
-        cache_ttl_sec = get_discarded_response_ttl_sec(self._get_cfg, DYNAMIC_DISCARDED_RESPONSE_TTL_SEC)
+        cache_ttl_sec = 300.0
         used = await apply_discarded_response_fallback(
             event=event,
             member=member,
@@ -3186,11 +3600,14 @@ class LLMEnhancement(Star):
     async def after_message_sent(self, event: AstrMessageEvent):
         """消息实际发送后再更新唤醒延长时间锚点。"""
         await self._stop_private_typing_indicator(event)
-        if not bool(event.get_extra("_llme_pending_last_response_update", default=False)):
+        if not bool(
+            event.get_extra("_llme_pending_last_response_update", default=False)
+        ):
             await self._release_concurrency_slot_if_needed(
-                event, reason="after_message_sent_no_pending"
+                event,
+                reason="after_message_sent_no_pending",
             )
-            # ===== 非 LLM 回复补录 =====
+            # ---- 非 LLM 回复补录 ----
             gid = event.get_group_id()
             if (
                 gid
@@ -3219,7 +3636,9 @@ class LLMEnhancement(Star):
                             uid=str(event.get_self_id() or "bot"),
                             sender_name="Bot",
                             message_text=text,
-                            max_messages=get_context_injection_max_messages(self._get_cfg),
+                            max_messages=get_context_injection_max_messages(
+                                self._get_cfg
+                            ),
                             msg_id="",
                             is_bot=True,
                             source="plugin_response",
@@ -3237,19 +3656,25 @@ class LLMEnhancement(Star):
         uid: str = event.get_sender_id()
         if not uid:
             await self._release_concurrency_slot_if_needed(
-                event, reason="after_message_sent_missing_uid"
+                event,
+                reason="after_message_sent_missing_uid",
             )
             return
-        state_uid = str(event.get_extra("_llme_dynamic_state_uid", default=uid) or uid).strip()
-        should_clear_discard_cache = bool(event.get_extra("_llme_discard_cache_clear_after_sent", default=False))
+        state_uid = str(
+            event.get_extra("_llme_dynamic_state_uid", default=uid) or uid
+        ).strip()
+        should_clear_discard_cache = bool(
+            event.get_extra("_llme_discard_cache_clear_after_sent", default=False)
+        )
 
         if not getattr(event, "_has_send_oper", False):
             logger.debug(
                 "[LLMEnhancement] 跳过唤醒延长锚点更新：本次事件未实际发送消息。"
-                f"uid={uid}, state_uid={state_uid}, group={event.get_group_id() or 'private'}"
+                f"uid={uid}, state_uid={state_uid}, group={event.get_group_id() or 'private'}",
             )
             await self._release_concurrency_slot_if_needed(
-                event, reason="after_message_sent_no_send"
+                event,
+                reason="after_message_sent_no_send",
             )
             event.set_extra("_llme_pending_last_response_update", False)
             event.set_extra("_llme_discard_cache_clear_after_sent", False)
@@ -3282,22 +3707,27 @@ class LLMEnhancement(Star):
             if should_clear_discard_cache:
                 clear_discarded_response_cache(member)
 
-            batch_msg_ids = event.get_extra("_llme_dynamic_batch_msg_ids", default=[]) or []
+            batch_msg_ids = (
+                event.get_extra("_llme_dynamic_batch_msg_ids", default=[]) or []
+            )
             if batch_msg_ids:
-                batch_id_set = {str(mid).strip() for mid in batch_msg_ids if str(mid or "").strip()}
+                batch_id_set = {
+                    str(mid).strip() for mid in batch_msg_ids if str(mid or "").strip()
+                }
                 if batch_id_set:
                     before_count = len(member.dynamic_unresolved_msgs)
                     member.dynamic_unresolved_msgs = [
-                        m for m in member.dynamic_unresolved_msgs
+                        m
+                        for m in member.dynamic_unresolved_msgs
                         if str(m.get("msg_id") or "").strip() not in batch_id_set
                     ]
                     after_count = len(member.dynamic_unresolved_msgs)
                     if before_count != after_count:
                         logger.debug(
                             "[LLMEnhancement] after_message_sent 清理 dynamic_unresolved_msgs："
-                            f"uid={uid}, removed={before_count - after_count}, remaining={after_count}"
+                            f"uid={uid}, removed={before_count - after_count}, remaining={after_count}",
                         )
-                    # 如果池子空了，重置状态
+                    # 如果池子空了，重置状态。
                     if not member.dynamic_unresolved_msgs:
                         member.dynamic_attached_premerge_msgs = []
                         member.dynamic_inflight_seq = 0
@@ -3306,9 +3736,14 @@ class LLMEnhancement(Star):
         user_text = str(event.get_extra("_llme_effective_user_text", default="") or "")
         assistant_text = ""
         if not bool(event.get_extra("_llme_discard_cache_used", default=False)):
-            assistant_text = str(event.get_extra("_llme_effective_assistant_text_candidate", default="") or "")
+            assistant_text = str(
+                event.get_extra("_llme_effective_assistant_text_candidate", default="")
+                or ""
+            )
         if not assistant_text:
-            assistant_text = self._effective_dialog_history.extract_assistant_text(event)
+            assistant_text = self._effective_dialog_history.extract_assistant_text(
+                event
+            )
         if user_text and assistant_text:
             assistant_name = "bot"
             self._effective_dialog_history.append_turn(
@@ -3326,11 +3761,12 @@ class LLMEnhancement(Star):
         logger.debug(
             "[LLMEnhancement] 已更新唤醒延长锚点："
             f"uid={uid}, state_uid={state_uid}, group={gid or 'private'}, ts={resp_ts:.3f}, "
-            f"clear_discard_cache={should_clear_discard_cache}, cleared_recent_wake_count={cleared_recent_wake_count}"
+            f"clear_discard_cache={should_clear_discard_cache}, cleared_recent_wake_count={cleared_recent_wake_count}",
         )
 
         await self._release_concurrency_slot_if_needed(
-            event, reason="after_message_sent_finished"
+            event,
+            reason="after_message_sent_finished",
         )
 
     async def terminate(self):
@@ -3350,6 +3786,7 @@ class LLMEnhancement(Star):
                     f"[LLMEnhancement] 私聊输入状态任务异常结束: task_key={task_key}",
                     exc_info=True,
                 )
+        await self._save_caches_to_kv()
         self._group_concurrency.terminate()
         await self.blacklist.terminate()
         logger.info("[LLMEnhancement] 插件已终止")

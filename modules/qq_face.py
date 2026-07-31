@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from typing import Any, Optional
 
+from .runtime_helpers import _safe_int
+
 import astrbot.api.message_components as Comp
 
 
@@ -129,6 +131,7 @@ QQ_FACE_ID_TO_NAME: dict[int, str] = {
     325: "惊吓",
     326: "生气",
     333: "烟花",
+    334: "虎虎生威",
     337: "花朵脸",
     338: "我想开了",
     339: "舔屏",
@@ -138,6 +141,7 @@ QQ_FACE_ID_TO_NAME: dict[int, str] = {
     344: "大冤种",
     345: "红包多多",
     346: "你真棒棒",
+    347: "大展宏兔",
     349: "坚强",
     350: "贴贴",
     351: "敲敲",
@@ -150,23 +154,28 @@ QQ_FACE_ID_TO_NAME: dict[int, str] = {
     425: "求放过",
     426: "玩火",
     427: "偷感",
-    429: "蛇年快乐"
+    428: "收到",
+    429: "蛇年快乐",
+    458: "我吗",
+    459: "优雅",
+    460: "硬撑",
+    461: "宕机",
+    462: "无语",
+    464: "马上到",
+    466: "羞羞哒",
+    470: "马到成功",
+    472: "心动",
+    474: "给你一拳",
+    475: "干饭",
+    476: "不是哥们",
+    477: "你懂的",
+    478: "对的对的",
+    479: "不对不对",
 }
 
 
-def _safe_int(value: Any) -> Optional[int]:
-    try:
-        if value is None:
-            return None
-        text = str(value).strip()
-        if not text:
-            return None
-        return int(float(text))
-    except Exception:
-        return None
-
-
 def normalize_qq_face_name(name: Any) -> str:
+    """标准化 QQ 表情名称，去除前导斜杠和方括号。"""
     text = str(name or "").strip()
     if text.startswith("/"):
         text = text[1:].strip()
@@ -214,6 +223,7 @@ def _extract_raw_face_names(raw_message: Any) -> list[str]:
 
 
 def resolve_qq_face_name(segment: Any) -> str:
+    """解析 QQ 表情组件的名称，优先使用 raw 数据中的 faceText。"""
     face_id, raw = _extract_face_data(segment)
     if face_id is None:
         return ""
@@ -231,6 +241,7 @@ def resolve_qq_face_name(segment: Any) -> str:
 
 
 def build_qq_face_text(segment: Any) -> str:
+    """构建 QQ 表情的文本表示 [QQ官方表情:名称]。"""
     face_name = resolve_qq_face_name(segment)
     if not face_name:
         return ""
@@ -268,7 +279,10 @@ def _resolve_message_chain_face_texts(
 
 
 def has_qq_face_segment(message_chain: Any, raw_message: Any = None) -> bool:
-    return bool(_resolve_message_chain_face_texts(message_chain, raw_message=raw_message))
+    """判断消息链中是否包含 QQ 表情组件。"""
+    return bool(
+        _resolve_message_chain_face_texts(message_chain, raw_message=raw_message)
+    )
 
 
 def build_message_text_with_qq_faces(
@@ -276,6 +290,7 @@ def build_message_text_with_qq_faces(
     fallback_text: str = "",
     raw_message: Any = None,
 ) -> str:
+    """构建包含 QQ 表情文本表示的消息文本，无表情时回退到 fallback_text。"""
     resolved_face_texts = _resolve_message_chain_face_texts(
         message_chain,
         raw_message=raw_message,

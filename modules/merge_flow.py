@@ -7,11 +7,13 @@ from typing import Any, Callable, Dict, Optional
 import astrbot.api.message_components as Comp
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent
+from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import (
+    AiocqhttpMessageEvent,
+)
 
 from .qq_face import build_qq_face_text
 from .state_manager import GroupState, MemberState
 
-from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import AiocqhttpMessageEvent
 try:
     from astrbot.core.utils.active_event_registry import active_event_registry
 except Exception:
@@ -41,19 +43,20 @@ class DynamicSoftRecomputeDecision:
 
 
 def load_merge_runtime_config(get_cfg: Callable[[str, Any], Any]) -> MergeRuntimeConfig:
-    """Load merge settings from `request_orchestration` object only."""
-    raw_merge_obj = get_cfg("request_orchestration", {})
-    merge_obj = raw_merge_obj if isinstance(raw_merge_obj, dict) else {}
-
-    delay_sec = max(0.0, float(merge_obj.get("merge_delay", 0.0)))
-    raw_dynamic_mode = str(
-        merge_obj.get("merge_dynamic_mode", "dynamic") or "dynamic"
-    ).strip().lower()
+    """从已展平的配置中加载合并设置。"""
+    delay_sec = max(0.0, float(get_cfg("merge_delay", 0.0)))
+    raw_dynamic_mode = (
+        str(
+            get_cfg("merge_dynamic_mode", "dynamic") or "dynamic",
+        )
+        .strip()
+        .lower()
+    )
     dynamic_mode = raw_dynamic_mode == "dynamic"
-    followup_require_wake = bool(merge_obj.get("merge_followup_require_wake", False))
-    max_count = max(1, int(merge_obj.get("merge_max_count", 3)))
-    allow_multi_user = bool(merge_obj.get("merge_multi_user", False))
-    premerge_window_sec = max(0.0, float(merge_obj.get("merge_premerge_window", 0.0)))
+    followup_require_wake = bool(get_cfg("merge_followup_require_wake", False))
+    max_count = max(1, int(get_cfg("merge_max_count", 3)))
+    allow_multi_user = bool(get_cfg("merge_multi_user", False))
+    premerge_window_sec = max(0.0, float(get_cfg("merge_premerge_window", 0.0)))
 
     return MergeRuntimeConfig(
         delay_sec=delay_sec,
@@ -81,6 +84,7 @@ def normalize_event_ts(raw_ts: Any, fallback_ts: float) -> float:
 
 
 def get_event_msg_id(event: AstrMessageEvent) -> Optional[str]:
+    """从事件中提取消息 ID，若不存在则返回 None。"""
     if hasattr(event, "message_obj") and hasattr(event.message_obj, "message_id"):
         raw_msg_id = getattr(event.message_obj, "message_id", None)
         if raw_msg_id is not None:
@@ -89,15 +93,38 @@ def get_event_msg_id(event: AstrMessageEvent) -> Optional[str]:
 
 
 def is_merge_component(seg: Any) -> bool:
-    if isinstance(seg, (Comp.Image, Comp.Forward, Comp.Reply, Comp.Video, Comp.File, Comp.Json, Comp.Record, Comp.Face)):
+    """判断组件是否为需要合并处理的非纯文本类型。"""
+    if isinstance(
+        seg,
+        (
+            Comp.Image,
+            Comp.Forward,
+            Comp.Reply,
+            Comp.Video,
+            Comp.File,
+            Comp.Json,
+            Comp.Record,
+            Comp.Face,
+        ),
+    ):
         return True
     if isinstance(seg, dict):
         seg_type = str(seg.get("type") or "").lower()
-        return seg_type in {"image", "forward", "reply", "video", "file", "json", "record", "face"}
+        return seg_type in {
+            "image",
+            "forward",
+            "reply",
+            "video",
+            "file",
+            "json",
+            "record",
+            "face",
+        }
     return False
 
 
 def extract_merge_components(event: AstrMessageEvent) -> list[Any]:
+    """从事件的消息对象中提取所有需要合并的非纯文本组件。"""
     chain = []
     if hasattr(event, "message_obj") and hasattr(event.message_obj, "message"):
         chain = event.message_obj.message or []
@@ -106,7 +133,18 @@ def extract_merge_components(event: AstrMessageEvent) -> list[Any]:
 
 def is_message_payload_component(seg: Any) -> bool:
     """是否属于可视为消息载荷的非文本组件。"""
-    if isinstance(seg, (Comp.Image, Comp.Video, Comp.File, Comp.Forward, Comp.Json, Comp.Record, Comp.Face)):
+    if isinstance(
+        seg,
+        (
+            Comp.Image,
+            Comp.Video,
+            Comp.File,
+            Comp.Forward,
+            Comp.Json,
+            Comp.Record,
+            Comp.Face,
+        ),
+    ):
         return True
     if isinstance(seg, dict):
         seg_type = str(seg.get("type") or "").lower()
@@ -121,6 +159,7 @@ def build_message_buffer_from_snapshots(
     snapshots: list[Dict[str, Any]],
     default_sender_name: str,
 ) -> list[tuple[Optional[str], str, str]]:
+    """从快照列表构建消息缓冲区，每个条目为（msg_id, sender_name, text）。"""
     return [
         (
             str(item.get("msg_id") or "") or None,
@@ -134,6 +173,7 @@ def build_message_buffer_from_snapshots(
 def collect_additional_components_from_snapshots(
     snapshots: list[Dict[str, Any]],
 ) -> list[Any]:
+    """收集快照中所有需要合并的附加组件（如图片、文件等）。"""
     additional_components: list[Any] = []
     for item in snapshots:
         for seg in item.get("components", []) or []:
@@ -146,6 +186,7 @@ async def filter_unavailable_message_buffer(
     event: AstrMessageEvent,
     message_buffer: list[tuple[Optional[str], str, str]],
 ) -> tuple[list[tuple[Optional[str], str, str]], list[str]]:
+    """过滤掉已被撤回的消息缓冲区条目，返回有效缓冲和已删除消息 ID 列表。"""
     filtered_buffer: list[tuple[Optional[str], str, str]] = []
     removed_msg_ids: list[str] = []
     for mid, name, content in message_buffer:
@@ -177,6 +218,7 @@ def apply_merged_message_to_request(
     req: Any,
     message_buffer: list[tuple[Optional[str], str, str]],
 ) -> int:
+    """将消息缓冲区中的内容合并为一个文本块，注入到请求的 message 字段。返回消息数量。"""
     senders = {name for _, name, _ in message_buffer}
     if len(senders) > 1:
         merged_msg = "\n".join([f"[{name}]: {msg}" for _, name, msg in message_buffer])
@@ -185,12 +227,18 @@ def apply_merged_message_to_request(
         merged_msg = _compress_identical_messages(message_buffer, merged_msg)
 
     merged_anchor_msg_id = next(
-        (str(mid).strip() for mid, _name, _content in reversed(message_buffer) if str(mid or "").strip()),
+        (
+            str(mid).strip()
+            for mid, _name, _content in reversed(message_buffer)
+            if str(mid or "").strip()
+        ),
         "",
     )
     if merged_anchor_msg_id:
         anchor_value: Any = (
-            int(merged_anchor_msg_id) if merged_anchor_msg_id.isdigit() else merged_anchor_msg_id
+            int(merged_anchor_msg_id)
+            if merged_anchor_msg_id.isdigit()
+            else merged_anchor_msg_id
         )
         event.set_extra("_llme_merged_anchor_msg_id", merged_anchor_msg_id)
         message_obj = getattr(event, "message_obj", None)
@@ -263,6 +311,7 @@ def evaluate_followup_collectability(
     ev: AstrMessageEvent,
     gid: str,
     uid: str,
+    *,
     allow_multi_user: bool,
     followup_require_wake: bool,
 ) -> tuple[bool, str]:
@@ -276,8 +325,14 @@ def evaluate_followup_collectability(
         if ev.get_sender_id() != uid:
             return False, "private_sender_mismatch"
 
-    chain = ev.message_obj.message if (hasattr(ev, "message_obj") and hasattr(ev.message_obj, "message")) else []
-    if not ev.message_str and not any(is_message_payload_component(seg) for seg in chain):
+    chain = (
+        ev.message_obj.message
+        if (hasattr(ev, "message_obj") and hasattr(ev.message_obj, "message"))
+        else []
+    )
+    if not ev.message_str and not any(
+        is_message_payload_component(seg) for seg in chain
+    ):
         return False, "empty_payload"
 
     if followup_require_wake and (not ev.is_at_or_wake_command):
@@ -321,7 +376,11 @@ async def append_followup_to_merge_buffer(
     new_message_buffer.append((new_msg_id, ev.get_sender_name(), ev.message_str))
 
     new_additional_components = list(additional_components)
-    chain = ev.message_obj.message if (hasattr(ev, "message_obj") and hasattr(ev.message_obj, "message")) else []
+    chain = (
+        ev.message_obj.message
+        if (hasattr(ev, "message_obj") and hasattr(ev.message_obj, "message"))
+        else []
+    )
     for seg in chain:
         if is_merge_component(seg):
             new_additional_components.append(seg)
@@ -351,6 +410,7 @@ def has_recent_wake_in_window(
 
 
 def ensure_snapshot_merge_key(snapshot: Dict[str, Any]) -> str:
+    """确保快照有合并键，缺失时基于 msg_id 或 uid+ts+text_len 生成。"""
     existing_key = str(snapshot.get("_merge_key") or "").strip()
     if existing_key:
         return existing_key
@@ -371,6 +431,7 @@ def upsert_dynamic_unresolved_snapshot(
     snapshot: Dict[str, Any],
     max_keep: int = 50,
 ) -> bool:
+    """插入或更新成员的未处理动态合并快照，保持按时间排序并限制数量。"""
     key = ensure_snapshot_merge_key(snapshot)
     for idx, item in enumerate(member.dynamic_unresolved_msgs):
         if ensure_snapshot_merge_key(item) == key:
@@ -390,6 +451,7 @@ def upsert_dynamic_unresolved_snapshot(
 
 
 def reset_dynamic_capture_session(member: MemberState) -> None:
+    """重置成员的动态合并捕获会话计数器。"""
     member.merge_start_ts = 0.0
     member.dynamic_capture_count = 0
 
@@ -434,15 +496,19 @@ def reset_group_state(group_state: GroupState) -> None:
     group_state.context_bot_last_replied_to_uid = ""
 
 
-def prune_member_msg_cache(member: MemberState, keep_sec: float, ref_ts: float = 0.0) -> None:
+def prune_member_msg_cache(
+    member: MemberState, keep_sec: float, ref_ts: float = 0.0
+) -> None:
     """清理过期的消息缓存。ref_ts 用于判断消息列表的相对过期，merged_msg_ids 使用真实时间判断。"""
-    # 消息列表用 ref_ts（消息发送时间）判断，避免处理延迟导致历史消息被误删
+    # 消息列表用 ref_ts（消息发送时间）判断，避免处理延迟导致历史消息被误删。
     member.recent_wake_msgs = [
-        item for item in member.recent_wake_msgs
+        item
+        for item in member.recent_wake_msgs
         if ref_ts - float(item.get("ts") or 0.0) <= keep_sec
     ]
     member.premerge_msgs = [
-        item for item in member.premerge_msgs
+        item
+        for item in member.premerge_msgs
         if ref_ts - float(item.get("ts") or 0.0) <= keep_sec
     ]
     member.dynamic_attached_premerge_msgs = [
@@ -455,17 +521,25 @@ def prune_member_msg_cache(member: MemberState, keep_sec: float, ref_ts: float =
         for item in member.dynamic_unresolved_msgs
         if ref_ts - float(item.get("ts") or 0.0) <= keep_sec
     ]
-    # merged_msg_ids 存储的是绝对过期时间，必须用真实时间判断
+    # merged_msg_ids 存储的是绝对过期时间，必须用真实时间判断。
     now_ts = time.time()
-    expired_ids = [mid for mid, exp_ts in member.merged_msg_ids.items() if exp_ts <= now_ts]
+    expired_ids = [
+        mid for mid, exp_ts in member.merged_msg_ids.items() if exp_ts <= now_ts
+    ]
     for mid in expired_ids:
         member.merged_msg_ids.pop(mid, None)
 
 
-def build_event_snapshot(event: AstrMessageEvent, gid: str, uid: str, ts: Optional[float] = None) -> Dict[str, Any]:
+def build_event_snapshot(
+    event: AstrMessageEvent, gid: str, uid: str, ts: Optional[float] = None
+) -> Dict[str, Any]:
     """构建事件快照。ts 参数用于传入消息的实际发送时间，避免用处理时间替代。"""
     chain = []
-    if hasattr(event, "message_obj") and hasattr(event.message_obj, "message") and event.message_obj.message:
+    if (
+        hasattr(event, "message_obj")
+        and hasattr(event.message_obj, "message")
+        and event.message_obj.message
+    ):
         chain = event.message_obj.message
     components = [seg for seg in chain if is_merge_component(seg)]
     return {
@@ -480,12 +554,13 @@ def build_event_snapshot(event: AstrMessageEvent, gid: str, uid: str, ts: Option
 
 
 def upsert_recent_wake_snapshot(member: MemberState, snapshot: Dict[str, Any]) -> None:
+    """插入或更新成员最近的唤醒消息快照。"""
     msg_id = str(snapshot.get("msg_id") or "")
     if not msg_id:
         return
     for idx, item in enumerate(member.recent_wake_msgs):
         if str(item.get("msg_id") or "") == msg_id:
-            # 保留更早的时间戳，避免并发事件重排导致窗口错位
+            # 保留更早的时间戳，避免并发事件重排导致窗口错位。
             old_ts = float(item.get("ts") or 0.0)
             snapshot["ts"] = min(old_ts, float(snapshot.get("ts") or 0.0))
             member.recent_wake_msgs[idx] = snapshot
@@ -638,7 +713,10 @@ def prepare_initial_merge_snapshots(
     if not preselected_snapshots:
         preselected_snapshots = [current_snapshot]
 
-    if current_msg_id and all(str(item.get("msg_id") or "") != current_msg_id for item in preselected_snapshots):
+    if current_msg_id and all(
+        str(item.get("msg_id") or "") != current_msg_id
+        for item in preselected_snapshots
+    ):
         preselected_snapshots.insert(0, current_snapshot)
 
     deduped_snapshots: list[Dict[str, Any]] = []
@@ -660,11 +738,17 @@ def prepare_initial_merge_snapshots(
             add_pending_msg_id(msg_id)
             member.merged_msg_ids[msg_id] = time.time() + merged_skip_ttl
 
-    trigger_msg_id = current_msg_id or (str(preselected_snapshots[0].get("msg_id") or "") if preselected_snapshots else None)
+    trigger_msg_id = current_msg_id or (
+        str(preselected_snapshots[0].get("msg_id") or "")
+        if preselected_snapshots
+        else None
+    )
     return preselected_snapshots, trigger_msg_id
 
 
-def add_pending_msg_id(group_state: GroupState, member: MemberState, msg_id: Optional[str]) -> None:
+def add_pending_msg_id(
+    group_state: GroupState, member: MemberState, msg_id: Optional[str]
+) -> None:
     """在成员和组反向索引中同时登记待处理消息 ID。"""
     if not msg_id:
         return
@@ -672,7 +756,9 @@ def add_pending_msg_id(group_state: GroupState, member: MemberState, msg_id: Opt
     group_state.pending_msg_index[msg_id] = member.uid
 
 
-def remove_pending_msg_id(group_state: GroupState, member: MemberState, msg_id: Optional[str]) -> None:
+def remove_pending_msg_id(
+    group_state: GroupState, member: MemberState, msg_id: Optional[str]
+) -> None:
     """在成员和组反向索引中同时移除消息 ID。"""
     if not msg_id:
         return
@@ -690,6 +776,7 @@ def clear_pending_msg_ids(group_state: GroupState, member: MemberState) -> None:
 
 
 def member_contains_msg_id(member: MemberState, msg_id: str) -> bool:
+    """检查成员状态中是否包含指定消息 ID（在 pending、merged、wake 等列表中）。"""
     if not msg_id:
         return False
     if msg_id in member.pending_msg_ids:
@@ -700,9 +787,15 @@ def member_contains_msg_id(member: MemberState, msg_id: str) -> bool:
         return True
     if any(str(item.get("msg_id") or "") == msg_id for item in member.premerge_msgs):
         return True
-    if any(str(item.get("msg_id") or "") == msg_id for item in member.dynamic_attached_premerge_msgs):
+    if any(
+        str(item.get("msg_id") or "") == msg_id
+        for item in member.dynamic_attached_premerge_msgs
+    ):
         return True
-    if any(str(item.get("msg_id") or "") == msg_id for item in member.dynamic_unresolved_msgs):
+    if any(
+        str(item.get("msg_id") or "") == msg_id
+        for item in member.dynamic_unresolved_msgs
+    ):
         return True
     return False
 
@@ -740,7 +833,9 @@ def remove_recalled_msg_from_member(
 
     before_recent = len(member.recent_wake_msgs)
     member.recent_wake_msgs = [
-        item for item in member.recent_wake_msgs if str(item.get("msg_id") or "") != msg_id
+        item
+        for item in member.recent_wake_msgs
+        if str(item.get("msg_id") or "") != msg_id
     ]
     summary["removed_recent"] = max(0, before_recent - len(member.recent_wake_msgs))
 
@@ -752,7 +847,9 @@ def remove_recalled_msg_from_member(
 
     before_attached_premerge = len(member.dynamic_attached_premerge_msgs)
     member.dynamic_attached_premerge_msgs = [
-        item for item in member.dynamic_attached_premerge_msgs if str(item.get("msg_id") or "") != msg_id
+        item
+        for item in member.dynamic_attached_premerge_msgs
+        if str(item.get("msg_id") or "") != msg_id
     ]
     summary["removed_dynamic_attached_premerge"] = max(
         0,
@@ -783,12 +880,9 @@ def remove_recalled_msg_from_member(
         member.trigger_msg_id = new_trigger
         summary["trigger_replaced"] = new_trigger
 
-    if (
-        member.dynamic_inflight_seq > 0
-        and (
-            summary["remaining_pending"] <= 0
-            and summary["remaining_dynamic_unresolved"] <= 0
-        )
+    if member.dynamic_inflight_seq > 0 and (
+        summary["remaining_pending"] <= 0
+        and summary["remaining_dynamic_unresolved"] <= 0
     ):
         member.cancel_merge = True
         summary["marked_cancel"] = True
@@ -802,11 +896,13 @@ def prepare_dynamic_merge_batch(
     current_snapshot: Dict[str, Any],
     premerge_snapshots: Optional[list[Dict[str, Any]]],
     uid: str,
+    *,
     allow_multi_user: bool,
     merge_max_count: int,
     merge_delay: float,
     merged_skip_ttl: float,
 ) -> tuple[list[Dict[str, Any]], list[str], int, int, Optional[str]]:
+    """准备动态合并批次：组装快照、确定触发 msg_id、计算超时偏移。返回（选中快照, 合并键列表, seq, 未处理数, 触发id）。"""
     had_inflight = member.dynamic_inflight_seq > 0
     attach_dynamic_premerge_snapshots(member, premerge_snapshots)
     upsert_dynamic_unresolved_snapshot(member, current_snapshot)
@@ -825,12 +921,12 @@ def prepare_dynamic_merge_batch(
             if float(item.get("ts") or 0.0) >= merge_start_ts
         ]
 
-    # 判定当前触发消息是否已经跨越了时间断层
+    # 判定当前触发消息是否已经跨越了时间断层。
     current_ts = float(current_snapshot.get("ts") or 0.0)
     if merge_start_ts > 0.0 and (current_ts - merge_start_ts) > merge_delay:
-        # 既然已经超过 merge_delay，说明旧池子里的全是"僵尸消息"
+        # 既然已经超过 merge_delay，说明旧池子里的全是"僵尸消息"。
         logger.debug(
-            f"[LLMEnhancement] 检测到时间断层 ({(current_ts - merge_start_ts):.1f}s > {merge_delay}s)，重置动态池"
+            f"[LLMEnhancement] 检测到时间断层 ({(current_ts - merge_start_ts):.1f}s > {merge_delay}s)，重置动态池",
         )
         member.dynamic_unresolved_msgs = [current_snapshot]  # 只保留当前消息
         member.merge_start_ts = current_ts  # 重置起点
@@ -840,7 +936,9 @@ def prepare_dynamic_merge_batch(
         # 同步清理全局索引
         clear_pending_msg_ids(group_state, member)
 
-    attached_snapshots: list[Dict[str, Any]] = list(member.dynamic_attached_premerge_msgs)
+    attached_snapshots: list[Dict[str, Any]] = list(
+        member.dynamic_attached_premerge_msgs
+    )
     selected_unresolved_snapshots: list[Dict[str, Any]] = []
     current_key = ensure_snapshot_merge_key(current_snapshot)
     for item in member.dynamic_unresolved_msgs:
@@ -859,7 +957,11 @@ def prepare_dynamic_merge_batch(
         text = str(item.get("text") or "")
         components = item.get("components", []) or []
         # 允许当前触发快照兜底进入，避免动态合并在部分平台上因空文本快照被全量过滤后误取消请求。
-        if not text and not components and ensure_snapshot_merge_key(item) != current_key:
+        if (
+            not text
+            and not components
+            and ensure_snapshot_merge_key(item) != current_key
+        ):
             continue
         selected_unresolved_snapshots.append(item)
 
@@ -871,7 +973,9 @@ def prepare_dynamic_merge_batch(
     if len(selected_unresolved_snapshots) > merge_max_count:
         selected_unresolved_snapshots = selected_unresolved_snapshots[-merge_max_count:]
 
-    selected_snapshots: list[Dict[str, Any]] = list(attached_snapshots) + selected_unresolved_snapshots
+    selected_snapshots: list[Dict[str, Any]] = (
+        list(attached_snapshots) + selected_unresolved_snapshots
+    )
     selected_snapshots.sort(key=lambda x: float(x.get("ts") or 0.0))
 
     deduped_snapshots: list[Dict[str, Any]] = []
@@ -894,24 +998,34 @@ def prepare_dynamic_merge_batch(
         selected_keys.append(ensure_snapshot_merge_key(item))
 
     trigger_msg_id = str(current_snapshot.get("msg_id") or "").strip() or (
-        str(selected_snapshots[-1].get("msg_id") or "").strip() if selected_snapshots else None
+        str(selected_snapshots[-1].get("msg_id") or "").strip()
+        if selected_snapshots
+        else None
     )
 
     if not had_inflight:
-        # 首轮触发：用触发消息的 ts 作为合并起点
+        # 首轮触发：用触发消息的 ts 作为合并起点。
         member.merge_start_ts = float(current_snapshot.get("ts") or 0.0) or 0.0
         member.dynamic_capture_count = 1
 
     unresolved_count = len(member.dynamic_unresolved_msgs)
-    return selected_snapshots, selected_keys, request_seq, unresolved_count, trigger_msg_id
+    return (
+        selected_snapshots,
+        selected_keys,
+        request_seq,
+        unresolved_count,
+        trigger_msg_id,
+    )
 
 
 def select_dynamic_owner_uid(
     own_inflight_seq: int,
     dynamic_owner_uid: Optional[str],
     incoming_uid: str,
+    *,
     allow_multi_user: bool,
 ) -> Optional[str]:
+    """确定动态合并的所有者 UID：有进行中请求时使用新 uid，多用户模式下保留原所有者。"""
     if own_inflight_seq > 0:
         return incoming_uid
     if allow_multi_user and dynamic_owner_uid and dynamic_owner_uid != incoming_uid:
@@ -926,6 +1040,7 @@ async def mark_dynamic_soft_recompute(
     merge_delay: float,
     merge_max_count: int,
 ) -> DynamicSoftRecomputeDecision:
+    """标记需要进行软重新计算：有新消息到达时判断是否需要在现有 inflight 基础上重新合并。"""
     async with target_member.lock:
         inflight_seq = target_member.dynamic_inflight_seq
         if inflight_seq <= 0:
@@ -942,14 +1057,14 @@ async def mark_dynamic_soft_recompute(
                     for item in target_member.dynamic_unresolved_msgs
                 )
             else:
-                # 【修改】：直接用快照时间初始化 merge_start_ts，避免依赖系统时间
+                # 直接用快照时间初始化 merge_start_ts，避免依赖系统时间。
                 target_member.merge_start_ts = snapshot_ts
         if target_member.dynamic_capture_count <= 0:
             target_member.dynamic_capture_count = len(
                 {
                     ensure_snapshot_merge_key(item)
                     for item in target_member.dynamic_unresolved_msgs
-                }
+                },
             )
 
         if merge_delay > 0.0 and (
@@ -992,7 +1107,7 @@ def request_dynamic_recompute_stop(
     inflight_seq: int,
     owner_uid: str,
 ) -> int:
-    """Stop active events for this UMO (hard stop), excluding current event."""
+    """停止此 UMO 的活动事件（硬停止），排除当前事件。"""
     if active_event_registry is None:
         return 0
     try:
@@ -1003,7 +1118,7 @@ def request_dynamic_recompute_stop(
                     event.unified_msg_origin,
                     exclude=event,
                 )
-                or 0
+                or 0,
             )
             stop_mode = "hard_stop_all"
         else:
@@ -1012,25 +1127,25 @@ def request_dynamic_recompute_stop(
                     event.unified_msg_origin,
                     exclude=event,
                 )
-                or 0
+                or 0,
             )
             stop_mode = "request_agent_stop_all"
         if stopped_count > 0:
             logger.debug(
                 "[LLMEnhancement] 动态软重算已停止进行中的任务："
                 f"umo={event.unified_msg_origin}, owner_uid={owner_uid}, inflight_seq={inflight_seq}, "
-                f"stopped_count={stopped_count}, mode={stop_mode}"
+                f"stopped_count={stopped_count}, mode={stop_mode}",
             )
         else:
             logger.debug(
                 "[LLMEnhancement] 动态软重算未找到可停止的进行中任务："
-                f"umo={event.unified_msg_origin}, owner_uid={owner_uid}, inflight_seq={inflight_seq}, mode={stop_mode}"
+                f"umo={event.unified_msg_origin}, owner_uid={owner_uid}, inflight_seq={inflight_seq}, mode={stop_mode}",
             )
         return stopped_count
     except Exception as e:
         logger.warning(
             "[LLMEnhancement] 动态软重算请求停止任务失败："
-            f"umo={event.unified_msg_origin}, owner_uid={owner_uid}, inflight_seq={inflight_seq}, error={e}"
+            f"umo={event.unified_msg_origin}, owner_uid={owner_uid}, inflight_seq={inflight_seq}, error={e}",
         )
         return 0
 
@@ -1056,7 +1171,7 @@ def schedule_dynamic_recompute_requeue(
     delay_sec: float = 0.35,
     max_attempts: int = 2,
 ) -> bool:
-    """Requeue a saved message event as a fresh event after stop request."""
+    """停止后将已保存的消息事件重新入队为新事件。"""
     try:
         attempt = int(source_event.get_extra("_llme_dynamic_requeue_attempt") or 0)
     except Exception:
@@ -1065,14 +1180,14 @@ def schedule_dynamic_recompute_requeue(
         logger.warning(
             "[LLMEnhancement] 动态软重算重排已达上限，放弃再次入队："
             f"umo={source_event.unified_msg_origin}, owner_uid={owner_uid}, inflight_seq={inflight_seq}, "
-            f"attempt={attempt}, max_attempts={max_attempts}"
+            f"attempt={attempt}, max_attempts={max_attempts}",
         )
         return False
 
     if event_queue is None or not hasattr(event_queue, "put_nowait"):
         logger.warning(
             "[LLMEnhancement] 动态软重算重排入队失败：事件队列不可用，"
-            f"umo={source_event.unified_msg_origin}, owner_uid={owner_uid}, inflight_seq={inflight_seq}"
+            f"umo={source_event.unified_msg_origin}, owner_uid={owner_uid}, inflight_seq={inflight_seq}",
         )
         return False
 
@@ -1103,7 +1218,7 @@ def schedule_dynamic_recompute_requeue(
                     logger.warning(
                         "[LLMEnhancement] 动态软重算重排等待 active runner 退出超时，继续强制入队："
                         f"umo={source_event.unified_msg_origin}, owner_uid={owner_uid}, inflight_seq={inflight_seq}, "
-                        f"attempt={attempt + 1}, waited_sec={waited_sec:.2f}"
+                        f"attempt={attempt + 1}, waited_sec={waited_sec:.2f}",
                     )
                     break
                 await asyncio.sleep(0.05)
@@ -1111,7 +1226,7 @@ def schedule_dynamic_recompute_requeue(
             logger.debug(
                 "[LLMEnhancement] 动态软重算消息已重排入队："
                 f"umo={source_event.unified_msg_origin}, owner_uid={owner_uid}, inflight_seq={inflight_seq}, "
-                f"attempt={attempt + 1}, delay_sec={delay_sec:.2f}, waited_active_runner={waited_sec:.2f}"
+                f"attempt={attempt + 1}, delay_sec={delay_sec:.2f}, waited_active_runner={waited_sec:.2f}",
             )
 
         asyncio.create_task(_enqueue_later())
@@ -1119,12 +1234,15 @@ def schedule_dynamic_recompute_requeue(
     except Exception as e:
         logger.warning(
             "[LLMEnhancement] 动态软重算重排入队失败："
-            f"umo={event.unified_msg_origin}, owner_uid={owner_uid}, inflight_seq={inflight_seq}, error={e}"
+            f"umo={source_event.unified_msg_origin}, owner_uid={owner_uid}, inflight_seq={inflight_seq}, error={e}",
         )
         return False
 
 
-def drop_dynamic_batch_from_unresolved(member: MemberState, batch_keys: list[str]) -> int:
+def drop_dynamic_batch_from_unresolved(
+    member: MemberState, batch_keys: list[str]
+) -> int:
+    """从成员的未处理列表中移除已合并批次对应的快照，返回移除数量。"""
     key_set = {str(k) for k in batch_keys if str(k or "").strip()}
     if not key_set:
         return 0
@@ -1144,21 +1262,24 @@ async def execute_dynamic_merge(
     uid: str,
     member: MemberState,
     group_state: GroupState,
+    *,
     allow_multi_user: bool,
     merge_delay: float,
     merge_max_count: int,
     is_recent_recalled: Optional[Callable[[str], bool]] = None,
     event_ts: Optional[float] = None,
 ) -> dict[str, Any]:
+    """执行动态合并的主流程：准备批次、等待延时、合并消息并注入请求。返回合并结果字典。"""
     ttl_base = max(merge_delay, 10.0)
     cache_keep_sec = max(ttl_base * 6, 60.0)
     merged_skip_ttl = max(ttl_base * 6, 120.0)
     current_snapshot = build_event_snapshot(event, gid, uid, ts=event_ts)
     ensure_snapshot_merge_key(current_snapshot)
-    raw_premerge_snapshots = event.get_extra("_llme_premerge_snapshots", default=[]) or []
+    raw_premerge_snapshots = (
+        event.get_extra("_llme_premerge_snapshots", default=[]) or []
+    )
     premerge_snapshots = [
-        item for item in raw_premerge_snapshots
-        if isinstance(item, dict)
+        item for item in raw_premerge_snapshots if isinstance(item, dict)
     ]
     event.set_extra("_llme_premerge_snapshots", [])
 
@@ -1170,7 +1291,9 @@ async def execute_dynamic_merge(
     unresolved_count = 0
     try:
         async with member.lock:
-            prune_member_msg_cache(member, keep_sec=cache_keep_sec, ref_ts=event_ts or 0.0)
+            prune_member_msg_cache(
+                member, keep_sec=cache_keep_sec, ref_ts=event_ts or 0.0
+            )
             member.cancel_merge = False
             member.in_merging = True
             (
@@ -1206,7 +1329,9 @@ async def execute_dynamic_merge(
                         continue
                     filtered_snapshots.append(item)
                 selected_snapshots = filtered_snapshots
-                selected_keys = [ensure_snapshot_merge_key(item) for item in selected_snapshots]
+                selected_keys = [
+                    ensure_snapshot_merge_key(item) for item in selected_snapshots
+                ]
                 if removed_set:
                     member.dynamic_unresolved_msgs = [
                         item
@@ -1224,9 +1349,13 @@ async def execute_dynamic_merge(
                         if str(item.get("msg_id") or "").strip() not in removed_set
                     ]
 
-                if removed_recalled_ids and str(member.trigger_msg_id or "") in set(removed_recalled_ids):
+                if removed_recalled_ids and str(member.trigger_msg_id or "") in set(
+                    removed_recalled_ids
+                ):
                     member.trigger_msg_id = (
-                        str(selected_snapshots[0].get("msg_id") or "").strip() if selected_snapshots else None
+                        str(selected_snapshots[0].get("msg_id") or "").strip()
+                        if selected_snapshots
+                        else None
                     )
     finally:
         async with member.lock:
@@ -1251,31 +1380,42 @@ async def execute_dynamic_merge(
                 member.dynamic_unresolved_msgs = [
                     item
                     for item in member.dynamic_unresolved_msgs
-                    if str(item.get("msg_id") or "").strip() not in removed_unavailable_set
+                    if str(item.get("msg_id") or "").strip()
+                    not in removed_unavailable_set
                 ]
                 member.dynamic_attached_premerge_msgs = [
                     item
                     for item in member.dynamic_attached_premerge_msgs
-                    if str(item.get("msg_id") or "").strip() not in removed_unavailable_set
+                    if str(item.get("msg_id") or "").strip()
+                    not in removed_unavailable_set
                 ]
                 member.recent_wake_msgs = [
                     item
                     for item in member.recent_wake_msgs
-                    if str(item.get("msg_id") or "").strip() not in removed_unavailable_set
+                    if str(item.get("msg_id") or "").strip()
+                    not in removed_unavailable_set
                 ]
                 if str(member.trigger_msg_id or "") in removed_unavailable_set:
                     member.trigger_msg_id = (
-                        str(filtered_snapshots[0].get("msg_id") or "").strip() if filtered_snapshots else None
+                        str(filtered_snapshots[0].get("msg_id") or "").strip()
+                        if filtered_snapshots
+                        else None
                     )
 
             selected_snapshots = filtered_snapshots
-            selected_keys = [ensure_snapshot_merge_key(item) for item in selected_snapshots]
+            selected_keys = [
+                ensure_snapshot_merge_key(item) for item in selected_snapshots
+            ]
 
     event.set_extra("_llme_dynamic_request_seq", request_seq)
     event.set_extra("_llme_dynamic_batch_keys", selected_keys)
     event.set_extra(
         "_llme_dynamic_batch_msg_ids",
-        [str(item.get("msg_id") or "").strip() for item in selected_snapshots if str(item.get("msg_id") or "").strip()],
+        [
+            str(item.get("msg_id") or "").strip()
+            for item in selected_snapshots
+            if str(item.get("msg_id") or "").strip()
+        ],
     )
 
     if not selected_snapshots:
@@ -1303,14 +1443,20 @@ async def execute_dynamic_merge(
         selected_snapshots,
         default_sender_name=event.get_sender_name(),
     )
-    additional_components = collect_additional_components_from_snapshots(selected_snapshots)
+    additional_components = collect_additional_components_from_snapshots(
+        selected_snapshots
+    )
     sender_count = apply_merged_message_to_request(event, req, message_buffer)
 
     return {
         "cancelled": False,
         "request_seq": request_seq,
         "selected_keys": selected_keys,
-        "selected_msg_ids": [str(item.get("msg_id") or "").strip() for item in selected_snapshots if str(item.get("msg_id") or "").strip()],
+        "selected_msg_ids": [
+            str(item.get("msg_id") or "").strip()
+            for item in selected_snapshots
+            if str(item.get("msg_id") or "").strip()
+        ],
         "unresolved_count": unresolved_count,
         "message_count": len(message_buffer),
         "sender_count": sender_count,
@@ -1336,38 +1482,55 @@ async def is_msg_still_available(event: AstrMessageEvent, msg_id: str) -> bool:
     try:
         message_id = int(msg_id)
     except (TypeError, ValueError):
-        logger.debug(f"[LLMEnhancement] get_msg 校验跳过：非数字 message_id，msg_id={msg_id}")
+        logger.debug(
+            f"[LLMEnhancement] get_msg 校验跳过：非数字 message_id，msg_id={msg_id}"
+        )
         return True
 
     try:
         detail = await api.call_action("get_msg", message_id=message_id)
     except Exception as e:
         err_text = str(e).lower()
-        if any(k in err_text for k in ("not found", "not exist", "不存在", "撤回", "invalid")):
-            logger.debug(f"[LLMEnhancement] get_msg 指示消息不可用/已撤回: msg_id={msg_id}")
+        if any(
+            k in err_text
+            for k in ("not found", "not exist", "不存在", "撤回", "invalid")
+        ):
+            logger.debug(
+                f"[LLMEnhancement] get_msg 指示消息不可用/已撤回: msg_id={msg_id}"
+            )
             return False
-        logger.debug(f"[LLMEnhancement] get_msg 调用异常但按可用处理: msg_id={msg_id}, err={e}")
+        logger.debug(
+            f"[LLMEnhancement] get_msg 调用异常但按可用处理: msg_id={msg_id}, err={e}"
+        )
         return True
 
     if isinstance(detail, dict):
         msg_status = detail.get("status")
         if msg_status == "deleted":
-            logger.debug(f"[LLMEnhancement] get_msg status=deleted，判定消息已撤回: msg_id={msg_id}")
+            logger.debug(
+                f"[LLMEnhancement] get_msg status=deleted，判定消息已撤回: msg_id={msg_id}"
+            )
             return False
 
     if isinstance(detail, dict) and isinstance(detail.get("data"), dict):
         detail = detail["data"]
 
     if not isinstance(detail, dict):
-        logger.debug(f"[LLMEnhancement] get_msg 返回结构异常，判定不可用: msg_id={msg_id}")
+        logger.debug(
+            f"[LLMEnhancement] get_msg 返回结构异常，判定不可用: msg_id={msg_id}"
+        )
         return False
 
     msg_content = detail.get("message")
     if msg_content is None:
-        logger.debug(f"[LLMEnhancement] get_msg 未返回 message 字段，判定不可用: msg_id={msg_id}")
+        logger.debug(
+            f"[LLMEnhancement] get_msg 未返回 message 字段，判定不可用: msg_id={msg_id}"
+        )
         return False
     if isinstance(msg_content, (list, str)) and len(msg_content) == 0:
-        logger.debug(f"[LLMEnhancement] get_msg 返回空内容，判定不可用: msg_id={msg_id}")
+        logger.debug(
+            f"[LLMEnhancement] get_msg 返回空内容，判定不可用: msg_id={msg_id}"
+        )
         return False
 
     return True

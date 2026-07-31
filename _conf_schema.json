@@ -10,288 +10,347 @@
         "description": "智能唤醒",
         "hint": "配置智能唤醒相关参数。",
         "items": {
-            "prob_wake": {
-                "description": "概率唤醒活跃度",
-                "hint": "数值越高，Bot 在普通群消息中的主动插话意愿越强。设为 0 时关闭该模式。",
-                "type": "float",
-                "default": 0.3,
-                "slider": {
-                    "min": 0,
-                    "max": 1,
-                    "step": 0.1
-                },
-                "minimum": 0,
-                "maximum": 1
-            },
-            "mention_wake": {
-                "description": "提及唤醒规则",
-                "hint": "支持普通文本包含与 re:pattern（正则）。不填时关闭提及检测。",
-                "type": "list",
-                "default": []
-            },
-            "relevant_wake": {
-                "description": "相关性唤醒阈值",
-                "hint": "当前消息与上文 Bot 的消息相关性超过阈值时，唤醒 Bot。设为 0 时关闭检测。",
-                "type": "float",
-                "default": 0.68,
-                "slider": {
-                    "min": 0,
-                    "max": 1,
-                    "step": 0.01
-                },
-                "minimum": 0,
-                "maximum": 1
-            },
-            "ask_wake": {
-                "description": "答疑唤醒阈值",
-                "hint": "当群里有人问专业性问题时，唤醒 Bot。设为 0 时关闭检测。",
-                "type": "float",
-                "default": 0.78,
-                "slider": {
-                    "min": 0,
-                    "max": 1,
-                    "step": 0.01
-                },
-                "minimum": 0,
-                "maximum": 1
-            },
-            "bored_wake": {
-                "description": "无聊唤醒阈值",
-                "hint": "当群里出现无聊/冷场/求聊天等表达时，唤醒 Bot。设为 0 时关闭检测。",
-                "type": "float",
-                "default": 0.74,
-                "slider": {
-                    "min": 0,
-                    "max": 1,
-                    "step": 0.01
-                },
-                "minimum": 0,
-                "maximum": 1
-            },
-            "active_wake_silence_bonus_enabled": {
-                "description": "主动唤醒沉默补偿",
-                "hint": "开启后，Bot 距离上次回复后累积的消息越多，会更容易触发语义型主动唤醒。",
-                "type": "bool",
-                "default": true
-            },
-            "wake_judge_types": {
-                "description": "唤醒判定类型",
-                "hint": "选择后，这些唤醒类型会在触发后再经过一次唤醒判定。留空表示不额外判定。",
-                "type": "list",
-                "options": [
-                    "explicit",
-                    "prob",
-                    "mention",
-                    "relevant",
-                    "ask",
-                    "bored"
-                ],
-                "labels": [
-                    "显式唤醒",
-                    "概率唤醒",
-                    "提及唤醒",
-                    "相关性唤醒",
-                    "答疑唤醒",
-                    "无聊唤醒"
-                ],
-                "default": [
-                    "prob"
-                ]
-            },
-            "wake_judge_provider_id": {
-                "description": "唤醒判定 Provider ID",
-                "type": "string",
-                "_special": "select_provider",
-                "default": "",
-                "hint": "用于选中的各类唤醒类型的后置判定。留空表示不启用该判定。"
-            },
-            "wake_judge_prompt": {
-                "description": "唤醒判定提示词",
-                "type": "text",
-                "obvious_hint": true,
-                "editor_mode": true,
-                "editor_language": "markdown",
-                "editor_theme": "vs-dark",
-                "default": "你是群聊“唤醒判定器”。请判断机器人是否应该响应这条显式唤醒请求。\n\n[当前时间]\n{time}\n\n[用户ID]\n{user_id}\n\n[用户名]\n{user_name}\n\n[群组ID]\n{group_id}\n\n[最近上下文]\n{history}\n\n[当前消息]\n{message}\n\n[判定规则]\n1) 用户明确表示“别回复/不用回/闭嘴/停下”等，输出 F。\n2) 当前消息仅为收尾确认（如“嗯/好/知道了/收到/晚安/拜拜/谢谢”）且没有新问题或新任务，输出 F。\n3) 含有新的问题、任务、追问，或明确要求继续，输出 T。\n4) 不确定时优先输出 T，避免漏回关键请求。\n\n[输出格式]\n只能输出一个大写字母：T 或 F。",
-                "hint": "支持占位符：{time}、{user_id}、{user_name}、{group_id}、{history}、{message}、{persona}、{rN}、{schedule}（需安装 life_scheduler 插件）。"
-            },
-            "wake_extend": {
-                "description": "唤醒延长（秒）",
-                "hint": "LLM 响应后，在此时间窗口内可继续维持唤醒状态。设为 0 时关闭。",
-                "type": "float",
-                "default": 30.0
-            },
-            "wake_extend_same_user_only": {
-                "description": "唤醒延长仅对原用户生效",
-                "hint": "开启后，唤醒延长窗口内仅处理上次触发请求的用户消息，忽略其他用户。",
-                "type": "bool",
-                "default": true
-            },
-            "wake_extend_similarity": {
-                "description": "唤醒延长相关性阈值",
-                "hint": "唤醒延长期间，当前消息与上文的相关性阈值。",
-                "type": "float",
-                "default": 0.12,
-                "slider": {
-                    "min": 0,
-                    "max": 1,
-                    "step": 0.01
-                },
-                "minimum": 0,
-                "maximum": 1
-            },
-            "wake_extend_provider_id": {
-                "description": "唤醒延长判定 Provider ID",
-                "type": "string",
-                "_special": "select_provider",
-                "default": "",
-                "hint": "留空时不启用模型判定。配置后会让该模型仅输出 T/F，用于判断是否继续响应。"
-            },
-            "wake_extend_judge_prompt": {
-                "description": "唤醒延长判定提示词",
-                "type": "text",
-                "obvious_hint": true,
-                "editor_mode": true,
-                "editor_language": "markdown",
-                "editor_theme": "vs-dark",
-                "default": "请判断当前消息是否与上文足够相关，是否需要继续响应。\n\n[当前时间]\n{time}\n\n[用户ID]\n{user_id}\n\n[用户名]\n{user_name}\n\n[群组ID]\n{group_id}\n\n[相关性阈值参考]\n{threshold}\n\n[上文]\n{history}\n\n[当前消息]\n{message}\n\n[判定规则]\n1) 如果当前消息是对上文的自然追问、补充、纠正、承接或继续讨论，输出 T。\n2) 如果当前消息与上文明显无关、话题跳转过大，或不需要机器人继续响应，输出 F。\n3) 不确定时优先结合上文连续性判断；只有在明显无关时才输出 F。\n\n[输出格式]\n只能输出一个大写字母：T 或 F。",
-                "hint": "支持占位符：{time}、{user_id}、{user_name}、{group_id}、{threshold}、{history}、{message}、{persona}、{rN}、{schedule}。仅在配置了 唤醒延长判定 Provider ID 时生效。"
-            },
-            "wake_judge_context_count": {
-                "description": "唤醒判定上下文条数",
-                "hint": "唤醒判定与唤醒延长共用的上下文条数。默认 10，且不会超过“上下文记录上限”。",
-                "type": "int",
-                "default": 10,
-                "minimum": 1
-            },
-            "wake_llm_timeout_sec": {
-                "description": "唤醒判定模型超时（秒）",
-                "hint": "用于“唤醒判定”和“唤醒延长”的模型判定等待时间。超时后唤醒判定直接放行，唤醒延长回退到本地相似度判定。设为 0 表示不启用超时。",
-                "type": "int",
-                "default": 5,
-                "minimum": 0,
-                "maximum": 30,
-                "slider": {
-                    "min": 0,
-                    "max": 30,
-                    "step": 1
+            "wake_triggers": {
+                "type": "object",
+                "description": "唤醒条件",
+                "hint": "配置各类主动唤醒的触发条件。",
+                "items": {
+                    "prob_wake": {
+                        "description": "概率唤醒活跃度",
+                        "hint": "数值越高，Bot 在普通群消息中的主动插话意愿越强。设为 0 时关闭。",
+                        "type": "float",
+                        "default": 0.3,
+                        "slider": {
+                            "min": 0,
+                            "max": 1,
+                            "step": 0.1
+                        }
+                    },
+                    "mention_wake": {
+                        "description": "提及唤醒规则",
+                        "hint": "支持普通文本包含与 re:pattern（正则）。不填时关闭提及检测。",
+                        "type": "list",
+                        "default": []
+                    },
+                    "relevant_wake": {
+                        "description": "相关性唤醒阈值",
+                        "hint": "当前消息与上文 Bot 的消息相关性超过阈值时，唤醒 Bot。设为 0 时关闭检测。",
+                        "type": "float",
+                        "default": 0.68,
+                        "slider": {
+                            "min": 0,
+                            "max": 1,
+                            "step": 0.1
+                        }
+                    },
+                    "ask_wake": {
+                        "description": "答疑唤醒阈值",
+                        "hint": "当群里有人问专业性问题时，唤醒 Bot。设为 0 时关闭检测。",
+                        "type": "float",
+                        "default": 0.78,
+                        "slider": {
+                            "min": 0,
+                            "max": 1,
+                            "step": 0.1
+                        }
+                    },
+                    "bored_wake": {
+                        "description": "无聊唤醒阈值",
+                        "hint": "当群里出现无聊/冷场/求聊天等表达时，唤醒 Bot。设为 0 时关闭检测。",
+                        "type": "float",
+                        "default": 0.74,
+                        "slider": {
+                            "min": 0,
+                            "max": 1,
+                            "step": 0.1
+                        }
+                    },
+                    "active_wake_silence_bonus_enabled": {
+                        "description": "主动唤醒沉默补偿",
+                        "hint": "开启后，Bot 距离上次回复后累积的消息越多，会更容易触发语义型主动唤醒。",
+                        "type": "bool",
+                        "default": true
+                    }
                 }
             },
-            "wake_forbidden_words": {
-                "description": "屏蔽唤醒规则",
-                "hint": "支持格式同唤醒规则。命中规则时不会唤醒 Bot。",
-                "type": "list",
-                "default": [
-                    "政治",
-                    "键证",
-                    "党"
-                ]
+            "wake_judge": {
+                "type": "object",
+                "description": "唤醒判定",
+                "hint": "唤醒触发后经过模型再判定。",
+                "items": {
+                    "wake_judge_types": {
+                        "description": "唤醒判定类型",
+                        "hint": "选择后，这些唤醒类型会在触发后再经过一次唤醒判定。留空表示不额外判定。",
+                        "type": "list",
+                        "options": [
+                            "explicit",
+                            "prob",
+                            "mention",
+                            "relevant",
+                            "ask",
+                            "bored"
+                        ],
+                        "labels": [
+                            "显式唤醒",
+                            "概率唤醒",
+                            "提及唤醒",
+                            "相关性唤醒",
+                            "答疑唤醒",
+                            "无聊唤醒"
+                        ],
+                        "default": [
+                            "prob"
+                        ]
+                    },
+                    "wake_judge_provider_id": {
+                        "description": "唤醒判定 Provider ID",
+                        "type": "string",
+                        "_special": "select_provider",
+                        "default": "",
+                        "hint": "用于选中的各类唤醒类型的后置判定。留空表示不启用该判定。"
+                    },
+                    "wake_judge_prompt": {
+                        "description": "唤醒判定提示词",
+                        "type": "text",
+                        "obvious_hint": true,
+                        "editor_mode": true,
+                        "editor_language": "markdown",
+                        "editor_theme": "vs-dark",
+                        "default": "你是群聊“唤醒判定器”。请判断机器人是否应该响应这条显式唤醒请求。\n\n[当前时间]\n{time}\n\n[用户ID]\n{user_id}\n\n[用户名]\n{user_name}\n\n[群组ID]\n{group_id}\n\n[最近上下文]\n{history}\n\n[当前消息]\n{message}\n\n[判定规则]\n1) 用户明确表示“别回复/不用回/闭嘴/停下”等，输出 F。\n2) 当前消息仅为收尾确认（如“嗯/好/知道了/收到/晚安/拜拜/谢谢”）且没有新问题或新任务，输出 F。\n3) 含有新的问题、任务、追问，或明确要求继续，输出 T。\n4) 不确定时优先输出 T，避免漏回关键请求。\n\n[输出格式]\n只能输出一个大写字母：T 或 F。",
+                        "hint": "支持占位符：{time}、{user_id}、{user_name}、{group_id}、{history}、{message}、{persona}、{rN}、{schedule}（需安装 life_scheduler 插件）。"
+                    },
+                    "wake_judge_context_count": {
+                        "description": "唤醒判定上下文条数",
+                        "hint": "唤醒判定与唤醒延长共用的上下文条数。默认 10，且不会超过“上下文记录上限”。",
+                        "type": "int",
+                        "default": 10,
+                        "slider": {
+                            "min": 0,
+                            "max": 50,
+                            "step": 5
+                        }
+                    },
+                    "wake_judge_timeout_sec": {
+                        "description": "唤醒判定超时（秒）",
+                        "hint": "唤醒判定的模型等待时间。超时后直接放行。设为 0 不启用。",
+                        "type": "float",
+                        "default": 5,
+                        "slider": {
+                            "min": 0,
+                            "max": 30,
+                            "step": 1
+                        }
+                    }
+                }
             },
-            "require_at_for_wake_prefix": {
-                "description": "唤醒需 @Bot",
-                "hint": "开启后，仅通过唤醒前缀触发的 LLM 请求会被拦截，必须 @Bot 或引用 Bot 消息才放行。",
-                "type": "bool",
-                "default": false
+            "wake_extend": {
+                "type": "object",
+                "description": "唤醒延长",
+                "hint": "LLM 响应后延长窗口内的唤醒维持。",
+                "items": {
+                    "wake_extend_window": {
+                        "description": "唤醒延长窗口（秒）",
+                        "hint": "LLM 响应后，在此时间窗口内可继续维持唤醒状态。设为 0 时关闭。",
+                        "type": "int",
+                        "default": 30,
+                        "slider": {
+                            "min": 0,
+                            "max": 300,
+                            "step": 5
+                        }
+                    },
+                    "wake_extend_same_user_only": {
+                        "description": "唤醒延长仅对原用户生效",
+                        "hint": "开启后，唤醒延长窗口内仅处理上次触发请求的用户消息，忽略其他用户。",
+                        "type": "bool",
+                        "default": true
+                    },
+                    "wake_extend_similarity": {
+                        "description": "唤醒延长相关性阈值",
+                        "hint": "唤醒延长期间，当前消息与上文的相关性阈值。",
+                        "type": "float",
+                        "default": 0.12,
+                        "slider": {
+                            "min": 0,
+                            "max": 1,
+                            "step": 0.1
+                        }
+                    },
+                    "wake_extend_provider_id": {
+                        "description": "唤醒延长判定 Provider ID",
+                        "type": "string",
+                        "_special": "select_provider",
+                        "default": "",
+                        "hint": "留空时不启用模型判定。配置后会让该模型仅输出 T/F，用于判断是否继续响应。"
+                    },
+                    "wake_extend_judge_prompt": {
+                        "description": "唤醒延长判定提示词",
+                        "type": "text",
+                        "obvious_hint": true,
+                        "editor_mode": true,
+                        "editor_language": "markdown",
+                        "editor_theme": "vs-dark",
+                        "default": "请判断当前消息是否与上文足够相关，是否需要继续响应。\n\n[当前时间]\n{time}\n\n[用户ID]\n{user_id}\n\n[用户名]\n{user_name}\n\n[群组ID]\n{group_id}\n\n[相关性阈值参考]\n{threshold}\n\n[上文]\n{history}\n\n[当前消息]\n{message}\n\n[判定规则]\n1) 如果当前消息是对上文的自然追问、补充、纠正、承接或继续讨论，输出 T。\n2) 如果当前消息与上文明显无关、话题跳转过大，或不需要机器人继续响应，输出 F。\n3) 不确定时优先结合上文连续性判断；只有在明显无关时才输出 F。\n\n[输出格式]\n只能输出一个大写字母：T 或 F。",
+                        "hint": "支持占位符：{time}、{user_id}、{user_name}、{group_id}、{threshold}、{history}、{message}、{persona}、{rN}、{schedule}。仅在配置了 唤醒延长判定 Provider ID 时生效。"
+                    },
+                    "wake_extend_timeout_sec": {
+                        "description": "唤醒延长判定超时（秒）",
+                        "hint": "唤醒延长判定的模型等待时间。超时后回退到本地相似度判定。设为 0 不启用。",
+                        "type": "float",
+                        "default": 10,
+                        "slider": {
+                            "min": 0,
+                            "max": 60,
+                            "step": 1
+                        }
+                    }
+                }
             },
-            "bot_account_ids": {
-                "description": "机器人 ID",
-                "hint": "配置其他机器人的用户 ID。",
-                "type": "list",
-                "default": []
-            },
-            "bot_account_skip_wake_types": {
-                "description": "机器人消息跳过类型",
-                "hint": "来自其他机器人的消息将跳过所选唤醒逻辑。",
-                "type": "list",
-                "options": [
-                    "explicit",
-                    "active",
-                    "wake_extend"
-                ],
-                "labels": [
-                    "显式唤醒",
-                    "主动唤醒",
-                    "唤醒延长"
-                ],
-                "default": []
+            "wake_filter": {
+                "type": "object",
+                "description": "唤醒过滤",
+                "hint": "唤醒屏蔽与机器人消息处理。",
+                "items": {
+                    "wake_forbidden_words": {
+                        "description": "屏蔽唤醒规则",
+                        "hint": "支持格式同唤醒规则。命中规则时不会唤醒 Bot。",
+                        "type": "list",
+                        "default": []
+                    },
+                    "require_at_for_wake_prefix": {
+                        "description": "唤醒需 @Bot",
+                        "hint": "开启后，仅通过唤醒前缀触发的 LLM 请求会被拦截，必须 @Bot 或引用 Bot 消息才放行。",
+                        "type": "bool",
+                        "default": false
+                    },
+                    "bot_account_ids": {
+                        "description": "机器人 ID",
+                        "hint": "配置其他机器人的用户 ID。",
+                        "type": "list",
+                        "default": []
+                    },
+                    "bot_account_skip_wake_types": {
+                        "description": "机器人消息跳过类型",
+                        "hint": "来自其他机器人的消息将跳过所选唤醒逻辑。",
+                        "type": "list",
+                        "options": [
+                            "explicit",
+                            "active",
+                            "wake_extend"
+                        ],
+                        "labels": [
+                            "显式唤醒",
+                            "主动唤醒",
+                            "唤醒延长"
+                        ],
+                        "default": []
+                    }
+                }
             }
         }
     },
     "request_orchestration": {
         "type": "object",
         "description": "请求编排",
-        "hint": "控制 LLM 请求的合并策略、并发上限和群聊按用户并发。",
+        "hint": "控制 LLM 请求的合并策略与并发上限。",
         "items": {
-            "merge_dynamic_mode": {
-                "description": "合并模式",
-                "hint": "硬合并：按合并延迟做等待收集；动态合并：检测到新消息时丢弃上一轮响应并在下一轮合并重算。",
-                "type": "string",
-                "options": [
-                    "hard",
-                    "dynamic"
-                ],
-                "labels": [
-                    "硬合并",
-                    "动态合并"
-                ],
-                "default": "dynamic"
+            "merge": {
+                "type": "object",
+                "description": "消息合并",
+                "hint": "配置消息合并策略、窗口与数量限制。",
+                "items": {
+                    "merge_dynamic_mode": {
+                        "description": "合并模式",
+                        "hint": "硬合并：按合并延迟做等待收集；动态合并：检测到新消息时丢弃上一轮响应并在下一轮合并重算。",
+                        "type": "string",
+                        "options": [
+                            "hard",
+                            "dynamic"
+                        ],
+                        "labels": [
+                            "硬合并",
+                            "动态合并"
+                        ],
+                        "default": "dynamic"
+                    },
+                    "merge_delay": {
+                        "description": "合并窗口（秒）",
+                        "hint": "硬合并下表示硬等待时间；动态合并下表示可并入消息的时间窗口上限。设为 0 时不启用消息合并。",
+                        "type": "int",
+                        "default": 0,
+                        "slider": {
+                            "min": 0,
+                            "max": 60,
+                            "step": 1
+                        }
+                    },
+                    "merge_max_count": {
+                        "description": "合并数量上限",
+                        "hint": "单次最多可合并的消息条数，超过上限后将停止继续收集。",
+                        "type": "int",
+                        "default": 2,
+                        "slider": {
+                            "min": 0,
+                            "max": 8,
+                            "step": 1
+                        }
+                    },
+                    "merge_premerge_window": {
+                        "description": "预合并窗口（秒）",
+                        "hint": "唤醒前，将在此窗口秒数内的用户消息作为预合并候选。仅动态合并模式生效，设为 0 时关闭预合并。",
+                        "type": "int",
+                        "default": 0,
+                        "slider": {
+                            "min": 0,
+                            "max": 60,
+                            "step": 1
+                        }
+                    },
+                    "merge_followup_require_wake": {
+                        "description": "后续合并需再次唤醒",
+                        "hint": "开启后，仅并入满足唤醒条件的后续消息；关闭时并入窗口内任意后续消息。",
+                        "type": "bool",
+                        "default": false
+                    },
+                    "merge_multi_user": {
+                        "description": "允许合并多人消息",
+                        "hint": "开启后，合并窗口期间若有其他群成员发送消息，也会被一并收集。",
+                        "type": "bool",
+                        "default": false
+                    }
+                }
             },
-            "merge_delay": {
-                "description": "合并窗口（秒）",
-                "hint": "硬合并下表示硬等待时间；动态合并下表示可并入消息的时间窗口上限。设为 0 时不启用消息合并。",
-                "type": "float",
-                "default": 0
-            },
-            "merge_max_count": {
-                "description": "合并数量上限",
-                "hint": "单次最多可合并的消息条数，超过上限后将停止继续收集。",
-                "type": "int",
-                "default": 2
-            },
-            "merge_premerge_window": {
-                "description": "预合并窗口（秒）",
-                "hint": "唤醒前，将在此窗口秒数内的用户消息作为预合并候选。仅动态合并模式生效，设为 0 时关闭预合并。",
-                "type": "int",
-                "default": 0
-            },
-            "merge_followup_require_wake": {
-                "description": "后续合并需再次唤醒",
-                "hint": "开启后，仅并入满足唤醒条件的后续消息；关闭时并入窗口内任意后续消息。",
-                "type": "bool",
-                "default": false
-            },
-            "merge_multi_user": {
-                "description": "允许合并多人消息",
-                "hint": "开启后，合并窗口期间若有其他群成员发送消息，也会被一并收集。",
-                "type": "bool",
-                "default": false
-            },
-            "max_user_concurrent_requests": {
-                "description": "用户级并发请求上限",
-                "hint": "限制单个用户同时进行中的 LLM 请求数。设为 0 表示不限制。",
-                "type": "int",
-                "minimum": 0,
-                "default": 0
-            },
-            "max_group_concurrent_requests": {
-                "description": "群聊级并发请求上限",
-                "hint": "限制单个群同时进行中的 LLM 请求数。设为 0 表示不限制。",
-                "type": "int",
-                "minimum": 0,
-                "default": 0
-            },
-            "group_sender_concurrency": {
-                "description": "群聊按用户并发",
-                "hint": "开启后，同群内不同用户的 LLM 请求各自独立排队，不再全局串行等待，可同时进行处理。同一用户连续发消息仍然串行。若同时开启了动态合并 + 多人合并，此功能将不会生效。",
-                "type": "bool",
-                "default": false
+            "concurrency": {
+                "type": "object",
+                "description": "并发控制",
+                "hint": "配置用户级与群聊级的并发上限。",
+                "items": {
+                    "max_user_concurrent_requests": {
+                        "description": "用户级并发请求上限",
+                        "hint": "限制单个用户同时进行中的 LLM 请求数。设为 0 表示不限制。",
+                        "type": "int",
+                        "default": 0
+                    },
+                    "max_group_concurrent_requests": {
+                        "description": "群聊级并发请求上限",
+                        "hint": "限制单个群同时进行中的 LLM 请求数。设为 0 表示不限制。",
+                        "type": "int",
+                        "default": 0
+                    },
+                    "group_sender_concurrency": {
+                        "description": "群聊按用户并发",
+                        "hint": "开启后，同群内不同用户的 LLM 请求各自独立排队，不再全局串行等待，可同时进行处理。同一用户连续发消息仍然串行。若同时开启了动态合并 + 多人合并，此功能将不会生效。",
+                        "type": "bool",
+                        "default": false
+                    }
+                }
             }
         }
     },
     "context_injection": {
         "type": "object",
         "description": "上下文注入",
-        "hint": "用于记录并注入轻量对话上下文，为后续读空气与主动唤醒优化提供基础数据。",
+        "hint": "用于记录并注入群聊对话上下文，为后续读空气与主动唤醒优化提供基础数据。",
         "items": {
             "context_injection_mode": {
                 "description": "上下文注入模式",
@@ -311,20 +370,25 @@
             },
             "context_injection_max_messages": {
                 "description": "上下文记录上限",
-                "hint": "每个会话最多保留的上下文消息条数。建议 6~50。",
+                "hint": "每个会话最多保留的上下文消息条数。设为 0 可关闭上下文记录。",
                 "type": "int",
-                "default": 12
+                "default": 20,
+                "slider": {
+                    "min": 0,
+                    "max": 50,
+                    "step": 5
+                }
             },
             "context_injection_format": {
                 "description": "上下文注入格式",
-                "hint": "精简：仅注入时间+发送者+文本（含引用摘要）；详细：注入完整结构字段（含 msg_id、uid、@信息、reply 信息）。",
+                "hint": "简洁：仅注入时间+发送者+文本（含引用摘要），适合日常对话上下文；详细：注入完整结构字段（含 msg_id、@信息、reply 信息等），适合工具调用场景。",
                 "type": "string",
                 "options": [
                     "simple",
                     "detailed"
                 ],
                 "labels": [
-                    "精简",
+                    "简洁",
                     "详细"
                 ],
                 "default": "simple"
@@ -351,6 +415,12 @@
                 ],
                 "default": []
             },
+            "context_line_max_length": {
+                "description": "上下文条目截断长度",
+                "hint": "每条上下文文本的最大字符数，超出部分截断。仅对简洁模式生效。",
+                "type": "int",
+                "default": 150
+            },
             "context_injection_image_caption_provider_id": {
                 "description": "上下文图像转述 Provider ID",
                 "type": "string",
@@ -365,126 +435,222 @@
         "description": "解析总开关",
         "hint": "统一控制各类内容解析能力是否启用。",
         "items": {
+            "gif_parse_enable": {
+                "description": "启用 GIF 解析",
+                "type": "bool",
+                "default": true,
+                "hint": "按 GIF 处理模式的设定解析动图。关闭后跳过 GIF 解析。"
+            },
             "video_parse_enable": {
                 "description": "启用视频解析",
                 "type": "bool",
                 "default": true,
-                "hint": "关闭后，不再执行视频与 GIF 的媒体增强解析。"
-            },
-            "forward_parse_enable": {
-                "description": "启用聊天记录解析",
-                "type": "bool",
-                "default": true,
-                "hint": "关闭后，不再解析聊天记录（合并转发消息）内容。"
-            },
-            "file_parse_enable": {
-                "description": "启用文件解析",
-                "type": "bool",
-                "default": true,
-                "hint": "关闭后，不再提取或注入引用消息中的文件信息。"
-            },
-            "json_parse_enable": {
-                "description": "启用 JSON 卡片解析",
-                "type": "bool",
-                "default": true,
-                "hint": "关闭后，不再提取引用消息中的 JSON 卡片关键信息（如分享卡片标题、摘要、链接）。"
-            },
-            "url_parse_enable": {
-                "description": "启用 URL 解析",
-                "type": "bool",
-                "default": true,
-                "hint": "关闭后，不再抓取并注入消息中的 URL 内容摘要。"
+                "hint": "按视频处理模式的设定解析视频。关闭后跳过视频解析。"
             },
             "record_parse_enable": {
                 "description": "启用语音解析",
                 "type": "bool",
                 "default": true,
-                "hint": "关闭后，不再进行语音转写（ASR），仅保留占位提示。"
+                "hint": "按音频处理模式的设定处理语音消息。关闭后跳过语音解析。"
+            },
+            "forward_parse_enable": {
+                "description": "启用聊天记录解析",
+                "type": "bool",
+                "default": true,
+                "hint": "解析合并转发消息的内容。关闭后跳过聊天记录解析。"
+            },
+            "file_parse_enable": {
+                "description": "启用文件解析",
+                "type": "bool",
+                "default": true,
+                "hint": "提取引用消息中的文件信息注入给主模型。关闭后跳过文件解析。"
+            },
+            "json_parse_enable": {
+                "description": "启用 JSON 卡片解析",
+                "type": "bool",
+                "default": true,
+                "hint": "提取引用消息中的分享卡片标题、摘要、链接等信息注入给主模型。关闭后跳过 JSON 卡片解析。"
+            },
+            "url_parse_enable": {
+                "description": "启用 URL 解析",
+                "type": "bool",
+                "default": true,
+                "hint": "抓取并注入消息中的 URL 内容摘要。关闭后跳过 URL 解析。"
             }
         }
     },
-    "video_injection": {
+    "media_parse": {
         "type": "object",
-        "description": "视频解析",
-        "hint": "配置视频抽帧、语音识别和相关模型参数。",
+        "description": "媒体解析策略",
+        "hint": "GIF / 视频 / 音频 三个子模块，各自独立配置。",
         "items": {
-            "video_max_size_mb": {
-                "description": "视频大小上限（MB）",
-                "hint": "单个视频超过该大小时将跳过解析。默认 50MB。",
-                "type": "int",
-                "default": 50
+            "gif": {
+                "type": "object",
+                "description": "GIF 解析",
+                "hint": "GIF 动图的解析模式与抽帧参数。",
+                "items": {
+                    "mode": {
+                        "description": "GIF 处理模式",
+                        "type": "string",
+                        "options": [
+                            "direct",
+                            "frame_pass",
+                            "full_analysis"
+                        ],
+                        "labels": [
+                            "直送描述",
+                            "抽帧直传",
+                            "逐帧汇总"
+                        ],
+                        "default": "full_analysis",
+                        "hint": "直送描述：原始 GIF 直送视觉模型做单次描述（需模型支持 GIF 格式）。抽帧直传：抽帧后所有 JPEG 直接供主模型自己看图。逐帧汇总：逐帧识图 + LLM 汇总后注入摘要。"
+                    },
+                    "frame_interval_sec": {
+                        "description": "GIF 抽帧间隔（秒）",
+                        "type": "float",
+                        "default": 0.5,
+                        "hint": "抽帧直传 / 逐帧汇总 模式下每隔 N 秒抽一帧。间隔越小越精细，但帧数越多。",
+                        "slider": {
+                            "min": 0.1,
+                            "max": 3,
+                            "step": 0.1
+                        }
+                    },
+                    "max_frames": {
+                        "description": "GIF 最大抽帧数",
+                        "type": "int",
+                        "default": 3,
+                        "hint": "抽帧直传 / 逐帧汇总 模式下最多抽取的帧数。抽帧间隔优先，此值为上限。",
+                        "slider": {
+                            "min": 1,
+                            "max": 10,
+                            "step": 1
+                        }
+                    },
+                    "provider_id": {
+                        "description": "GIF 视觉模型 Provider ID",
+                        "type": "string",
+                        "_special": "select_provider",
+                        "default": "",
+                        "hint": "直送描述模式使用此模型做单次描述；留空则沿用视频图片转述的提供商。"
+                    }
+                }
             },
-            "gif_parse_enable": {
-                "description": "启用 GIF 抽帧解析",
-                "type": "bool",
-                "default": false,
-                "hint": "关闭时，GIF 不走插件抽帧流程，保留框架原生图片处理；开启后，GIF 将按类似视频的方式抽帧总结。"
+            "video": {
+                "type": "object",
+                "description": "视频解析",
+                "hint": "配置视频抽帧、画面分析与 ASR 参数。",
+                "items": {
+                    "mode": {
+                        "description": "视频处理模式",
+                        "type": "string",
+                        "options": [
+                            "full_analysis",
+                            "frame_pass"
+                        ],
+                        "labels": [
+                            "逐帧汇总",
+                            "抽帧直传"
+                        ],
+                        "default": "full_analysis",
+                        "hint": "逐帧汇总：逐帧识图 + ASR（可选）+ LLM 汇总后注入摘要。抽帧直传：抽帧后所有 JPEG 直接供主模型自己看图，音频按音频处理模式的设定直传或转写。"
+                    },
+                    "max_size_mb": {
+                        "description": "视频大小上限（MB）",
+                        "type": "int",
+                        "default": 50,
+                        "hint": "超过该大小的视频跳过解析。"
+                    },
+                    "frame_interval_sec": {
+                        "description": "抽帧间隔（秒）",
+                        "type": "int",
+                        "default": 12,
+                        "hint": "每隔 N 秒取 1 帧。间隔越小描述越细腻，但会消耗更多 Token 和时间。"
+                    },
+                    "max_frame_count": {
+                        "description": "抽帧数量上限",
+                        "type": "int",
+                        "default": 8,
+                        "hint": "单个视频最多抽取的帧数。若根据抽帧间隔计算出的帧数超过此值，将自动调整间隔以匹配此上限。"
+                    },
+                    "sample_count": {
+                        "description": "视频抽帧数量",
+                        "type": "int",
+                        "default": 4,
+                        "hint": "当无法探测视频时长时，默认抽取该数量的帧。"
+                    },
+                    "asr_enable": {
+                        "description": "视频语音识别 (ASR)",
+                        "type": "bool",
+                        "default": false,
+                        "hint": "开启后，将提取视频音频并转写为文本，辅助模型理解视频内容。"
+                    },
+                    "image_provider_id": {
+                        "description": "图片转述 Provider ID",
+                        "type": "string",
+                        "_special": "select_provider",
+                        "hint": "用于理解视频/GIF 的逐帧画面内容。留空时自动选择当前可用的具备图片能力的 Provider。"
+                    },
+                    "summary_provider_id": {
+                        "description": "视频摘要 Provider ID",
+                        "type": "string",
+                        "_special": "select_provider",
+                        "hint": "用于将视频/GIF 的逐帧描述与语音转写结果汇总为最终摘要。留空时使用当前会话正在使用的 Provider。"
+                    },
+                    "quote_self_block_prob": {
+                        "description": "引用 Bot 自身视频的请求屏蔽概率",
+                        "hint": "当引用 Bot 自身发送的视频消息时，按该概率屏蔽请求。",
+                        "type": "float",
+                        "slider": {
+                            "min": 0,
+                            "max": 1,
+                            "step": 0.1
+                        },
+                        "default": 0
+                    }
+                }
             },
-            "video_frame_interval_sec": {
-                "description": "抽帧间隔（秒）",
-                "hint": "每隔 N 秒取 1 帧。间隔越小描述越细腻，但会消耗更多 Token 和时间。",
-                "type": "int",
-                "default": 12
-            },
-            "video_max_frame_count": {
-                "description": "抽帧数量上限",
-                "type": "int",
-                "default": 10,
-                "hint": "单个视频最多抽取的帧数。若根据抽帧间隔计算出的帧数超过此值，将自动调整间隔以匹配此上限。"
-            },
-            "video_sample_count": {
-                "description": "视频抽帧数量",
-                "type": "int",
-                "default": 3,
-                "hint": "当无法探测视频时长时，默认抽取该数量的帧。"
-            },
-            "video_asr_enable": {
-                "description": "视频语音识别 (ASR)",
-                "type": "bool",
-                "default": true,
-                "hint": "开启后，将提取视频音频并转写为文本，辅助模型理解视频内容。"
-            },
-            "asr_provider_id": {
-                "description": "ASR 提供商 ID",
-                "type": "string",
-                "_special": "select_provider_stt",
-                "hint": "用于将视频音频或语音内容转写为文本。若留空，则跳过 STT Provider，直接尝试下方配置的 LLM 语音转写提供商。"
-            },
-            "asr_llm_provider_id": {
-                "description": "LLM 语音转写提供商 ID",
-                "type": "string",
-                "_special": "select_provider",
-                "default": "",
-                "hint": "当指定的 STT Provider 未配置或转写失败时，使用此 LLM Provider 做语音转写。模型需在提供商配置中勾选 audio 能力；若不支持则直接放弃。"
-            },
-            "image_provider_id": {
-                "description": "图片转述 Provider ID",
-                "type": "string",
-                "_special": "select_provider",
-                "hint": "用于理解视频/GIF 的逐帧画面内容。留空时自动选择当前可用的具备图片能力的 Provider。"
-            },
-            "video_summary_provider_id": {
-                "description": "视频摘要 Provider ID",
-                "type": "string",
-                "_special": "select_provider",
-                "hint": "用于将视频/GIF 的逐帧描述与语音转写结果汇总为最终摘要。留空时使用当前会话正在使用的 Provider。"
+            "audio": {
+                "type": "object",
+                "description": "音频解析",
+                "hint": "配置语音转写 (ASR) 的提供商与回退策略。",
+                "items": {
+                    "mode": {
+                        "description": "音频处理模式",
+                        "type": "string",
+                        "options": [
+                            "asr",
+                            "passthrough",
+                            "off"
+                        ],
+                        "labels": [
+                            "转写为文本",
+                            "直传主模型",
+                            "关闭"
+                        ],
+                        "default": "asr",
+                        "hint": "转写为文本：ASR 转写后注入 prompt。直传主模型：原始音频直传主模型（需主模型支持 audio 输入）。关闭：跳过音频处理。"
+                    },
+                    "asr_provider_id": {
+                        "description": "ASR 提供商 ID",
+                        "type": "string",
+                        "_special": "select_provider_stt",
+                        "hint": "用于将视频音频或语音内容转写为文本。若留空，则跳过 STT Provider，直接尝试下方配置的 LLM 语音转写提供商。"
+                    },
+                    "asr_llm_provider_id": {
+                        "description": "LLM 语音转写提供商 ID",
+                        "type": "string",
+                        "_special": "select_provider",
+                        "default": "",
+                        "hint": "当指定的 STT Provider 未配置或转写失败时，使用此 LLM Provider 做语音转写。模型需在提供商配置中勾选 audio 能力；若不支持则直接放弃。"
+                    }
+                }
             },
             "ffmpeg_path": {
                 "description": "FFmpeg 路径",
-                "hint": "FFmpeg 可执行文件路径，不填则自动尝试从系统环境变量中寻找。",
                 "type": "string",
-                "default": ""
-            },
-            "quote_self_video_block_prob": {
-                "description": "引用 Bot 自身视频的请求屏蔽概率",
-                "hint": "当引用 Bot 自身发送的视频消息时，按该概率屏蔽请求。",
-                "type": "float",
-                "slider": {
-                    "min": 0,
-                    "max": 1,
-                    "step": 0.01
-                },
-                "default": 0
+                "default": "",
+                "hint": "FFmpeg 可执行文件路径，不填则自动尝试从系统环境变量中寻找。GIF 和视频的抽帧共用此路径。"
             }
         }
     },
@@ -496,7 +662,12 @@
             "nested_parse_depth": {
                 "description": "嵌套解析深度",
                 "type": "int",
-                "default": 5,
+                "default": 3,
+                "slider": {
+                    "min": 0,
+                    "max": 5,
+                    "step": 1
+                },
                 "hint": "限制递归解析层数。"
             },
             "forward_message_max_count": {
@@ -508,19 +679,19 @@
             "forward_image_max_count": {
                 "description": "图片注入上限",
                 "type": "int",
-                "default": 8,
+                "default": 4,
                 "hint": "单次聊天记录解析最多注入的图片数量，超出部分将被忽略。"
             },
             "forward_video_max_count": {
                 "description": "最多处理视频数量",
                 "type": "int",
-                "default": 2,
+                "default": 1,
                 "hint": "单次聊天记录解析最多处理的视频条数。设为 0 时关闭聊天记录视频抽帧，仅保留视频占位符。"
             },
             "forward_video_max_frame_count": {
-                "description": "聊天记录视频最多抽帧数量",
+                "description": "视频最多抽帧数量",
                 "type": "int",
-                "default": 1,
+                "default": 2,
                 "hint": "单个聊天记录视频最多抽取的帧数。设为 0 时关闭聊天记录视频抽帧，仅保留视频占位符。"
             },
             "quote_self_forward_block_prob": {
@@ -530,7 +701,7 @@
                 "slider": {
                     "min": 0,
                     "max": 1,
-                    "step": 0.01
+                    "step": 0.1
                 },
                 "default": 0
             }
@@ -545,14 +716,12 @@
                 "description": "文件内容解析大小上限（MB）",
                 "type": "int",
                 "default": 20,
-                "minimum": 0,
                 "hint": "超过该大小的文件不会解析内容并注入；设为 0 表示不限制。"
             },
             "inject_file_text_length": {
                 "description": "文件文本注入长度",
                 "type": "int",
                 "default": 0,
-                "minimum": 0,
                 "hint": "大于 0 时会读取可直接解析的文件并注入前 N 个字符；设为 0 表示关闭。"
             },
             "quote_self_file_block_prob": {
@@ -562,7 +731,7 @@
                 "slider": {
                     "min": 0,
                     "max": 1,
-                    "step": 0.01
+                    "step": 0.1
                 },
                 "default": 0
             }
@@ -573,20 +742,6 @@
         "description": "URL 解析注入",
         "hint": "配置 URL 抓取与安全策略。",
         "items": {
-            "inject_url_timeout_sec": {
-                "description": "URL 抓取超时（秒）",
-                "type": "int",
-                "default": 8,
-                "minimum": 2,
-                "hint": "单个链接抓取的超时时间。"
-            },
-            "inject_url_max_download_kb": {
-                "description": "URL 下载大小上限（KB）",
-                "type": "int",
-                "default": 2048,
-                "minimum": 32,
-                "hint": "单个链接最多下载的内容大小，超出将停止正文解析。"
-            },
             "inject_url_block_private_network": {
                 "description": "拦截内网 URL",
                 "type": "bool",
@@ -596,151 +751,192 @@
             "inject_url_blocked_domains": {
                 "description": "URL 黑名单域名",
                 "type": "list",
-                "items": {
-                    "type": "string"
-                },
                 "default": [],
                 "hint": "命中黑名单域名（含子域名）时直接跳过解析。"
             },
-            "tavily_api_keys": {
-                "description": "Tavily API 密钥",
-                "hint": "填写后 URL 解析优先使用 Tavily extract 服务，全部失败则回退到内置 HTTP 抓取。留空时仅使用内置抓取。",
+            "url_parse_provider": {
+                "description": "URL 解析提供商",
+                "hint": "选择 URL 内容提取使用的服务提供商，需在下方配置对应 API 密钥。",
+                "type": "string",
+                "options": [
+                    "tavily",
+                    "exa"
+                ],
+                "labels": [
+                    "Tavily",
+                    "Exa"
+                ],
+                "default": "exa"
+            },
+            "url_parse_api_keys": {
+                "description": "URL 解析 API 密钥",
+                "hint": "填写对应提供商的 API 密钥（可填写多个用于轮换），URL 解析优先使用该服务提取页面内容，全部失败则回退到内置 HTTP 抓取。留空时仅使用内置抓取。",
                 "type": "list",
                 "default": []
+            },
+            "inject_url_timeout_sec": {
+                "description": "URL 抓取超时（秒）",
+                "type": "int",
+                "default": 10,
+                "hint": "单个链接抓取的超时时间。"
+            },
+            "inject_url_max_download_kb": {
+                "description": "URL 下载大小上限（KB）",
+                "type": "int",
+                "default": 2048,
+                "hint": "单个链接最多下载的内容大小，超出将停止正文解析。"
             }
         }
     },
     "qq_platform": {
         "type": "object",
         "description": "QQ 平台配置",
-        "hint": "集中配置 QQ 群聊场景的上下文注入与工具权限控制。",
+        "hint": "集中配置环境感知注入与工具权限控制。",
         "items": {
-            "perception_injection_fields": {
-                "type": "list",
-                "default": [
-                    "时间"
-                ],
-                "options": [
-                    "平台",
-                    "会话类型",
-                    "群名",
-                    "群号",
-                    "时间",
-                    "星期",
-                    "节假日"
-                ],
-                "description": "环境感知注入字段",
-                "hint": "按需勾选注入给 LLM 的环境信息。留空表示关闭该注入；节假日字段在非节假日时会自动跳过。"
+            "perception": {
+                "type": "object",
+                "description": "环境感知",
+                "hint": "控制注入给 LLM 的群聊环境与发送者信息。",
+                "items": {
+                    "perception_injection_fields": {
+                        "type": "list",
+                        "default": [
+                            "时间"
+                        ],
+                        "options": [
+                            "平台",
+                            "会话类型",
+                            "群名",
+                            "群号",
+                            "时间",
+                            "星期",
+                            "节假日"
+                        ],
+                        "description": "环境感知注入字段",
+                        "hint": "按需勾选注入给 LLM 的环境信息。留空表示关闭该注入；节假日字段在非节假日时会自动跳过。"
+                    },
+                    "extra_info_injection_fields": {
+                        "type": "list",
+                        "default": [
+                            "用户ID",
+                            "昵称",
+                            "群名片",
+                            "群身份"
+                        ],
+                        "options": [
+                            "用户ID",
+                            "昵称",
+                            "群名片",
+                            "备注",
+                            "性别",
+                            "年龄",
+                            "群等级",
+                            "群身份",
+                            "群头衔",
+                            "入群时间",
+                            "生日",
+                            "地区",
+                            "签名",
+                            "标签",
+                            "Q龄",
+                            "QQ等级",
+                            "会员信息",
+                            "是否机器人"
+                        ],
+                        "description": "发送者信息注入字段",
+                        "hint": "按需勾选要注入给 LLM 的字段。留空表示关闭该注入。仅 QQ (aiocqhttp) 群聊生效。"
+                    },
+                    "extra_info_injection_include_bot_self": {
+                        "type": "bool",
+                        "default": false,
+                        "description": "注入 Bot 自身信息",
+                        "hint": "开启后，将按相同配置注入 Bot 在当前群中的成员信息。"
+                    },
+                    "extra_info_injection_no_cache": {
+                        "type": "bool",
+                        "default": false,
+                        "description": "注入查询忽略缓存",
+                        "hint": "开启后，每次注入将忽略缓存直接查询最新成员信息。"
+                    }
+                }
             },
-            "extra_info_injection_fields": {
-                "type": "list",
-                "default": [
-                    "用户ID",
-                    "昵称",
-                    "群名片",
-                    "群身份"
-                ],
-                "options": [
-                    "用户ID",
-                    "昵称",
-                    "群名片",
-                    "备注",
-                    "性别",
-                    "年龄",
-                    "群等级",
-                    "群身份",
-                    "群头衔",
-                    "入群时间",
-                    "生日",
-                    "地区",
-                    "签名",
-                    "标签",
-                    "Q龄",
-                    "QQ等级",
-                    "会员信息",
-                    "是否机器人"
-                ],
-                "description": "发送者信息注入字段",
-                "hint": "按需勾选要注入给 LLM 的字段。留空表示关闭该注入。仅 QQ (aiocqhttp) 群聊生效。"
-            },
-            "extra_info_injection_include_bot_self": {
-                "type": "bool",
-                "default": false,
-                "description": "注入 Bot 自身信息",
-                "hint": "开启后，将按相同配置注入 Bot 在当前群中的成员信息。"
-            },
-            "extra_info_injection_no_cache": {
-                "type": "bool",
-                "default": false,
-                "description": "注入查询忽略缓存",
-                "hint": "开启后，每次注入将忽略缓存直接查询最新成员信息。"
-            },
-            "enabled_risk_tools": {
-                "type": "list",
-                "default": [
-                    "设置群名片",
-                    "设置群头衔",
-                    "设置群名称",
-                    "设置精华消息",
-                    "发送群公告",
-                    "拉黑用户",
-                    "解除拉黑"
-                ],
-                "options": [
-                    "设置群名称",
-                    "设置群管理员",
-                    "设置群名片",
-                    "设置群头衔",
-                    "设置精华消息",
-                    "发送群公告",
-                    "删除群公告",
-                    "移出精华消息",
-                    "撤回消息",
-                    "禁言成员",
-                    "群组踢人",
-                    "全员禁言",
-                    "解散群",
-                    "拉黑用户",
-                    "解除拉黑"
-                ],
-                "description": "允许启用的风险工具",
-                "hint": "默认仅启用低风险工具，高风险操作（踢人/解散群等）需手动勾选。"
-            },
-            "self_only_tools": {
-                "type": "list",
-                "default": [],
-                "options": [
-                    "拉黑用户",
-                    "解除拉黑",
-                    "禁言成员",
-                    "群组踢人",
-                    "设置群名片",
-                    "设置群头衔"
-                ],
-                "description": "启用自我操作限制的工具",
-                "hint": "勾选后，非管理员调用该工具时只能操作自己，管理员不受限制。"
-            },
-            "confirm_required_tools": {
-                "type": "list",
-                "default": [],
-                "options": [
-                    "撤回消息",
-                    "群组踢人",
-                    "全员禁言",
-                    "删除群公告",
-                    "设置群管理员",
-                    "移出精华消息",
-                    "解散群"
-                ],
-                "description": "启用二次确认的工具",
-                "hint": "勾选后，工具首次调用只会返回确认请求；需要二次确认后再次调用才会真正执行。"
-            },
-            "confirm_timeout_sec": {
-                "type": "int",
-                "default": 90,
-                "minimum": 10,
-                "description": "二次确认有效期（秒）",
-                "hint": "超过有效期后 token 失效，需要重新发起操作。"
+            "tool_control": {
+                "type": "object",
+                "description": "工具控制",
+                "hint": "配置工具权限、二次确认与安全策略。",
+                "items": {
+                    "enabled_risk_tools": {
+                        "type": "list",
+                        "default": [
+                            "设置群名片",
+                            "设置群头衔",
+                            "设置群名称",
+                            "设置精华消息",
+                            "发送群公告",
+                            "拉黑用户",
+                            "解除拉黑"
+                        ],
+                        "options": [
+                            "设置群名称",
+                            "设置群管理员",
+                            "设置群名片",
+                            "设置群头衔",
+                            "设置精华消息",
+                            "发送群公告",
+                            "删除群公告",
+                            "移出精华消息",
+                            "撤回消息",
+                            "禁言成员",
+                            "群组踢人",
+                            "全员禁言",
+                            "解散群",
+                            "拉黑用户",
+                            "解除拉黑"
+                        ],
+                        "description": "允许启用的风险工具",
+                        "hint": "默认仅启用低风险工具，高风险操作（踢人/解散群等）需手动勾选。"
+                    },
+                    "self_only_tools": {
+                        "type": "list",
+                        "default": [],
+                        "options": [
+                            "拉黑用户",
+                            "解除拉黑",
+                            "禁言成员",
+                            "群组踢人",
+                            "设置群名片",
+                            "设置群头衔"
+                        ],
+                        "description": "启用自我操作限制的工具",
+                        "hint": "勾选后，非管理员调用该工具时只能操作自己，管理员不受限制。"
+                    },
+                    "confirm_required_tools": {
+                        "type": "list",
+                        "default": [],
+                        "options": [
+                            "撤回消息",
+                            "群组踢人",
+                            "全员禁言",
+                            "删除群公告",
+                            "设置群管理员",
+                            "移出精华消息",
+                            "解散群"
+                        ],
+                        "description": "启用二次确认的工具",
+                        "hint": "勾选后，工具首次调用只会返回确认请求；需要二次确认后再次调用才会真正执行。"
+                    },
+                    "confirm_timeout_sec": {
+                        "type": "int",
+                        "default": 120,
+                        "description": "二次确认有效期（秒）",
+                        "hint": "超过有效期后 token 失效，需要重新发起操作。",
+                        "slider": {
+                            "min": 10,
+                            "max": 600,
+                            "step": 10
+                        }
+                    }
+                }
             }
         }
     },
@@ -768,7 +964,6 @@
             "max_blacklist_duration": {
                 "type": "int",
                 "default": 86400,
-                "minimum": 0,
                 "description": "黑名单最长时长（秒）",
                 "hint": "仅对 LLM 工具生效。设置为 0 表示允许永久拉黑。"
             },
@@ -787,7 +982,7 @@
                 ],
                 "labels": [
                     "图片",
-                    "纯文本"
+                    "文本"
                 ],
                 "description": "黑名单输出模式",
                 "hint": "列表和详情命令的输出形式。"

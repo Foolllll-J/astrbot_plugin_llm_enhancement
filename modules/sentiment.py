@@ -4,21 +4,21 @@ import jieba
 import re
 from astrbot.api import logger
 
-# 扩充 jieba 词典，优先补充分词易拆散的高价值词
+# 扩充 jieba 词典，优先补充分词易拆散的高价值词。
 CUSTOM_JIEBA_WORDS = (
-    # insult
+    # 辱骂类
     "傻逼",
     "神经病",
     "草泥马",
-    # shutup
+    # 叫停类
     "闭嘴",
     "安静",
-    # bored
+    # 无聊类
     "无聊",
     "没劲",
     "没意思",
     "有人吗",
-    # ask
+    # 提问类
     "请问",
     "求教",
     "求助",
@@ -37,13 +37,14 @@ CUSTOM_JIEBA_WORDS = (
     "谁知道",
     "谁懂",
     "有人会",
-    # discourse
+    # 引导类
     "别骂人",
     "不要骂人",
 )
 
 for _word in CUSTOM_JIEBA_WORDS:
     jieba.add_word(_word)
+
 
 class Sentiment:
     """
@@ -202,7 +203,7 @@ class Sentiment:
         "有人会": (0.7, 1.3),
     }
 
-    # 否定词表 - 用于降低可信度
+    # 否定词表 - 用于降低可信度。
     NEGATION_WORDS = {
         "不",
         "没",
@@ -220,7 +221,7 @@ class Sentiment:
         "才不会",
     }
 
-    # 反问词表 - 可能改变语义
+    # 反问词表 - 可能改变语义。
     RHETORICAL_WORDS = {"难道", "何必", "怎么可以", "怎么可能", "哪能", "岂能", "谁还"}
     QUESTION_CUES = (
         "请问",
@@ -336,16 +337,16 @@ class Sentiment:
     )
 
     @classmethod
-    async def _seg(cls, text: str) -> list:
+    async def _seg(cls, text: str) -> list[str]:
         """分词并保留位置信息"""
         text = re.sub(r"[^\w\s\u4e00-\u9fa5]", "", text.lower())
         words = []
-        # jieba.lcut 是 CPU 密集型操作，在大文本下可能阻塞事件循环
+        # jieba.lcut 是 CPU 密集型操作，在大文本下可能阻塞事件循环。
         if len(text) > 500:
             lcut_res = await asyncio.to_thread(jieba.lcut, text)
         else:
             lcut_res = jieba.lcut(text)
-            
+
         for word in lcut_res:
             if word.strip() and word not in cls.STOP:
                 words.append(word)
@@ -386,30 +387,36 @@ class Sentiment:
         return any(neg in left for neg in cls.NEGATION_WORDS)
 
     @classmethod
-    def _calculate_confidence(cls, words: list, keyword_dict: dict, raw_text: str = "") -> float:
+    def _calculate_confidence(
+        cls,
+        words: list[str],
+        keyword_dict: dict[str, tuple[float, float]],
+        raw_text: str = "",
+    ) -> float:
         """计算语义可信度"""
         norm_text = cls._normalize_text(raw_text)
 
-        # 1) 构建 token 索引，确保每个关键词只计一次
+        # 1. 构建 token 索引，确保每个关键词只计一次
         token_index: dict[str, int] = {}
         for i, w in enumerate(words):
             if w not in token_index:
                 token_index[w] = i
 
-        # 2) 基础匹配分数
+        # 2. 基础匹配分数
         base_score = 0
         matched_keywords: list[str] = []
 
-        # 反问表达：token 或原文任一命中即视为存在
-        has_rhetorical = any(r_word in token_index for r_word in cls.RHETORICAL_WORDS) or any(
-            r_word in norm_text for r_word in cls.RHETORICAL_WORDS
+        # 反问表达：token 或原文任一命中即视为存在（一次遍历）。
+        has_rhetorical = any(
+            r_word in token_index or r_word in norm_text
+            for r_word in cls.RHETORICAL_WORDS
         )
 
         for keyword, (weight, intensity) in keyword_dict.items():
             matched = False
             has_negation = False
 
-            # A. 优先 token 精确命中
+            # 3. 优先 token 精确命中
             if keyword in token_index:
                 matched = True
                 kw_idx = token_index[keyword]
@@ -418,7 +425,7 @@ class Sentiment:
                     for neg_word in cls.NEGATION_WORDS
                 )
             else:
-                # B. 分词未命中时，走原文短语兜底
+                # 4. 分词未命中时，走原文短语兜底
                 phrase_pos = cls._keyword_text_fallback_pos(norm_text, keyword)
                 if phrase_pos >= 0:
                     matched = True
@@ -427,11 +434,11 @@ class Sentiment:
             if not matched:
                 continue
 
-            # 否定词降低权重
+            # 否定词降低权重。
             if has_negation:
                 weight *= 0.3
                 intensity *= 0.5
-            # 反问句可能反转语义
+            # 反问句可能反转语义。
             elif has_rhetorical:
                 weight *= 0.7
                 intensity *= 0.8
@@ -439,7 +446,7 @@ class Sentiment:
             base_score += weight * intensity
             matched_keywords.append(keyword)
 
-        # 3) 上下文增强分数
+        # 5. 上下文增强分数
         context_score = 0
         if matched_keywords:
             # 关键词密度增强
@@ -450,13 +457,13 @@ class Sentiment:
             if len(matched_keywords) > 1:
                 context_score += min(1.0, (len(matched_keywords) - 1) * 0.4)
 
-        # 4) 总分数计算
+        # 6. 总分数计算
         total_score = base_score + context_score
 
-        # 5) 应用 Sigmoid 函数转换为概率值
+        # 7. 应用 Sigmoid 函数转换为概率值
         confidence = 1 / (1 + math.exp(-4 * (total_score - 1.5)))
 
-        # 6) 上限控制
+        # 8. 上限控制
         return min(0.99, confidence)
 
     @classmethod
@@ -478,10 +485,14 @@ class Sentiment:
         if not s:
             return False
 
-        if len(s) > 30 and not any(cue in s for cue in ("无聊", "寂寞", "冷清", "冷场", "死群", "好闲")):
+        if len(s) > 30 and not any(
+            cue in s for cue in ("无聊", "寂寞", "冷清", "冷场", "死群", "好闲")
+        ):
             return False
 
-        if cls.is_question_like_message(s) and any(cue in s for cue in cls.ASK_STRONG_CUES):
+        if cls.is_question_like_message(s) and any(
+            cue in s for cue in cls.ASK_STRONG_CUES
+        ):
             return False
 
         return any(cue in s for cue in cls.BORED_WAKE_CUES)
@@ -523,6 +534,8 @@ class Sentiment:
     @classmethod
     async def shut(cls, text: str) -> float:
         """判断是否要闭嘴"""
+        if not text or not text.strip():
+            return 0.0
         words = await cls._seg(text)
         score = cls._calculate_confidence(words, cls.SHUT_WORDS, raw_text=text)
         if score <= 0:
@@ -534,6 +547,8 @@ class Sentiment:
     @classmethod
     async def insult(cls, text: str) -> float:
         """判断是否辱骂"""
+        if not text or not text.strip():
+            return 0.0
         words = await cls._seg(text)
         score = cls._calculate_confidence(words, cls.INSULT_WORDS, raw_text=text)
         if score <= 0:
@@ -545,6 +560,8 @@ class Sentiment:
     @classmethod
     async def bored(cls, text: str) -> float:
         """判断是否无聊"""
+        if not text or not text.strip():
+            return 0.0
         if not cls.is_bored_like_message(text):
             return 0.0
         words = await cls._seg(text)
@@ -553,6 +570,8 @@ class Sentiment:
     @classmethod
     async def ask(cls, text: str) -> float:
         """判断是否疑惑"""
+        if not text or not text.strip():
+            return 0.0
         if not cls.is_question_like_message(text):
             return 0.0
         words = await cls._seg(text)

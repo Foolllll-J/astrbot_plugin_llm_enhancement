@@ -2,6 +2,7 @@ import asyncio
 import datetime
 import json
 import os
+import tempfile
 import time
 import uuid
 from typing import Any, Optional
@@ -9,10 +10,15 @@ from typing import Any, Optional
 from astrbot.api import logger
 import astrbot.api.message_components as Comp
 from astrbot.api.provider import ProviderRequest
-from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import AiocqhttpMessageEvent
+from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import (
+    AiocqhttpMessageEvent,
+)
 
 from .state_manager import GroupState
 from .runtime_helpers import (
+    _fetch_messages_by_ids,
+    _is_unavailable_get_msg_payload,
+    _normalize_emoji_summary,
     cleanup_paths_later,
     transcribe_record_from_chain,
     clear_effective_dialog_history,
@@ -20,25 +26,28 @@ from .runtime_helpers import (
 )
 from .wake_logic import build_media_trigger_message
 
-_CONTEXT_IMAGE_CAPTION_PROMPT = "请用中文描述这张图片。包含：主体、数量、位置关系、动作、场景背景、画面中的文字内容、情绪氛围。控制在120字以内。"
+_CONTEXT_IMAGE_CAPTION_PROMPT = "请用中文描述这张图片。包含：主体、数量、位置关系、动作、场景背景、画面中的文字内容、情绪氛围。控制在120字以内。如果识图异常请直接回复【处理失败】。"
 _NON_TEXT_PARSE_OPTIONS = {"image", "forward", "url", "file", "json", "record"}
 _LAST_USER_INTERACTION_TTL_SEC = 24 * 60 * 60
-_CONTEXT_IMAGE_CAPTION_CACHE_TTL_SEC = 10 * 60
-_CONTEXT_IMAGE_CAPTION_CACHE_MAX_SIZE = 256
+_CONTEXT_IMAGE_CAPTION_CACHE_TTL_SEC = 86400
+_CONTEXT_IMAGE_CAPTION_CACHE_MAX_SIZE = 100
 _context_image_caption_cache: dict[str, dict[str, Any]] = {}
 _context_image_caption_semaphore = asyncio.Semaphore(3)
 
-
-def _is_unavailable_get_msg_payload(payload: Any) -> bool:
-    return isinstance(payload, dict) and payload.get("status") == "deleted"
+_CONTEXT_EMOJI_CAPTION_CACHE_TTL_SEC = 86400
+_CONTEXT_EMOJI_CAPTION_CACHE_MAX_SIZE = 200
+_context_emoji_cache: dict[str, dict[str, Any]] = {}
+_CONTEXT_EMOJI_CAPTION_PROMPT = "请识别这个表情包/贴图传达的情感和含义，关注表情、动作、画面中的文字和使用场景，用中文简要描述。控制在60字以内。如果识图异常请直接回复【处理失败】。"
 
 
 def is_context_injection_enabled(get_cfg: Any) -> bool:
+    """判断上下文注入功能是否已启用。"""
     mode = str(get_cfg("context_injection_mode", "off") or "off").strip().lower()
     return mode in {"before_active_only", "before_all_wake"}
 
 
 def get_context_injection_mode(get_cfg: Any) -> str:
+    """获取上下文注入模式（off / before_active_only / before_all_wake）。"""
     mode = str(get_cfg("context_injection_mode", "off") or "off").strip().lower()
     if mode not in {"off", "before_active_only", "before_all_wake"}:
         return "off"
@@ -46,6 +55,7 @@ def get_context_injection_mode(get_cfg: Any) -> str:
 
 
 def get_context_injection_format(get_cfg: Any) -> str:
+    """获取上下文注入格式（simple / detailed）。"""
     fmt = str(get_cfg("context_injection_format", "simple") or "simple").strip().lower()
     if fmt not in {"simple", "detailed"}:
         return "simple"
@@ -53,21 +63,18 @@ def get_context_injection_format(get_cfg: Any) -> str:
 
 
 def get_context_injection_max_messages(get_cfg: Any) -> int:
-    raw = get_cfg("context_injection_max_messages", 12)
+    """获取上下文注入的最大消息数。"""
+    raw = get_cfg("context_injection_max_messages", 20)
     try:
         value = int(raw)
     except Exception:
-        value = 12
-    return max(6, min(50, value))
+        value = 20
+    return max(0, value)
 
 
 def get_wake_judge_context_count(get_cfg: Any) -> int:
-    raw = get_cfg("wake_judge_context_count", 10)
-    try:
-        value = int(raw)
-    except Exception:
-        value = 10
-    return max(1, min(50, value))
+    """获取唤醒判断时使用的上下文消息数量。"""
+    return max(0, int(get_cfg("wake_judge_context_count", 10)))
 
 
 def prune_group_context_state(
@@ -76,10 +83,15 @@ def prune_group_context_state(
     get_cfg: Any,
     now_ts: Optional[float] = None,
 ) -> None:
-    max_len = max(6, get_context_injection_max_messages(get_cfg))
+    """裁剪群组上下文状态：限制消息数量并清理过期的用户交互记录。"""
+    max_len = get_context_injection_max_messages(get_cfg)
     ts_now = float(now_ts if now_ts is not None else time.time())
 
     messages = list(group_state.context_messages or [])
+    if max_len <= 0:
+        group_state.context_messages = []
+        group_state.last_user_interaction = {}
+        return
     if len(messages) > max_len:
         messages = messages[-max_len:]
     group_state.context_messages = messages
@@ -111,6 +123,7 @@ def prune_group_context_state(
 
 
 def get_context_non_text_parse_options(get_cfg: Any) -> set[str]:
+    """获取非文本上下文注入的解析选项集合（url / json / file 等）。"""
     raw = get_cfg("context_injection_non_text_parse_options", [])
     if not isinstance(raw, list):
         return set()
@@ -129,7 +142,7 @@ def get_wake_history_messages(
     count: int = 0,
 ) -> list[str]:
     """
-    为唤醒判定/唤醒延长提供上下文（固定使用精简样式）。
+    为唤醒判定/唤醒延长提供上下文（固定使用简洁样式）。
     内部会约束：wake_judge_context_count <= context_injection_max_messages。
     """
     prune_group_context_state(group_state=group_state, get_cfg=get_cfg)
@@ -149,9 +162,10 @@ def get_wake_history_messages(
     if limit <= 0:
         return []
 
+    max_line_len = int(get_cfg("context_line_max_length", 120) or 120)
     selected = context_messages[-limit:]
     return [
-        _render_context_line(item, detailed=False)
+        _render_context_line(item, detailed=False, limit=max_line_len)
         for item in selected
         if str(item.get("text") or "").strip()
     ]
@@ -171,7 +185,10 @@ def _extract_file_names_from_chain(message_chain: Any) -> list[str]:
                 data = seg.get("data") or {}
                 if isinstance(data, dict):
                     name = str(
-                        data.get("name") or data.get("file_name") or data.get("file") or ""
+                        data.get("name")
+                        or data.get("file_name")
+                        or data.get("file")
+                        or "",
                     ).strip()
             if not name:
                 continue
@@ -226,7 +243,7 @@ def compute_active_wake_adjustment(
         factor *= 0.65
         reasons.append("reply_other")
 
-    # 近 8 条非 bot 上下文中若存在多人发言，进一步轻降权
+    # 近 8 条非 bot 上下文中若存在多人发言，进一步轻降权。
     recent = list(group_state.context_messages or [])[-8:]
     non_bot_uids: set[str] = set()
     for item in recent:
@@ -243,15 +260,24 @@ def compute_active_wake_adjustment(
 
     if include_state_bias:
         # Bot 最近回复对象偏置：若当前发言人不是最近回复目标，则轻降权（仅用于相关性主动唤醒）。
-        last_replied_uid = str(getattr(group_state, "context_bot_last_replied_to_uid", "") or "").strip()
-        if last_replied_uid and current_uid_text and current_uid_text != last_replied_uid:
+        last_replied_uid = str(
+            getattr(group_state, "context_bot_last_replied_to_uid", "") or ""
+        ).strip()
+        if (
+            last_replied_uid
+            and current_uid_text
+            and current_uid_text != last_replied_uid
+        ):
             factor *= 0.90
             reasons.append("not_last_replied_target")
 
         # 当前用户最近互动时间过旧时，进一步降权。
         last_interaction = 0.0
         try:
-            last_interaction = float((group_state.last_user_interaction or {}).get(current_uid_text, 0.0) or 0.0)
+            last_interaction = float(
+                (group_state.last_user_interaction or {}).get(current_uid_text, 0.0)
+                or 0.0
+            )
         except Exception:
             last_interaction = 0.0
         if last_interaction > 0:
@@ -266,7 +292,7 @@ def compute_active_wake_adjustment(
         get_cfg=get_cfg,
     )
     if silence_bonus > 0:
-        factor *= (1.0 + silence_bonus)
+        factor *= 1.0 + silence_bonus
         reasons.append(f"silence_bonus+{silence_bonus:.2f}")
 
     factor = max(0.05, min(1.30, factor))
@@ -310,22 +336,9 @@ def _compute_active_wake_silence_bonus(
     return max(0.0, min(cap, bonus))
 
 
-def _extract_first_image_url(message_chain: Any) -> str:
-    try:
-        for seg in (message_chain or []):
-            if isinstance(seg, Comp.Image):
-                return str(getattr(seg, "url", "") or getattr(seg, "file", "") or "").strip()
-            if isinstance(seg, dict) and seg.get("type") == "image":
-                data = seg.get("data") or {}
-                return str(data.get("url") or data.get("file") or "").strip()
-    except Exception:
-        return ""
-    return ""
-
-
 def _extract_first_image_file_and_url(message_chain: Any) -> tuple[str, str]:
     try:
-        for seg in (message_chain or []):
+        for seg in message_chain or []:
             if isinstance(seg, Comp.Image):
                 file_val = str(getattr(seg, "file", "") or "").strip()
                 url_val = str(getattr(seg, "url", "") or "").strip()
@@ -376,7 +389,11 @@ def _get_cached_image_caption(cache_key: str) -> str:
     if expire_at <= time.time():
         _context_image_caption_cache.pop(key, None)
         return ""
-    return str(item.get("caption") or "").strip()
+    text = str(item.get("caption") or "").strip()
+    if text:
+        item["expire_at"] = time.time() + _CONTEXT_IMAGE_CAPTION_CACHE_TTL_SEC
+        logger.debug(f"[图片转述] 图片转述缓存命中(已刷新TTL): {cache_key}")
+    return text
 
 
 def _set_cached_image_caption(cache_key: str, caption: str) -> None:
@@ -388,18 +405,44 @@ def _set_cached_image_caption(cache_key: str, caption: str) -> None:
         "caption": val,
         "expire_at": time.time() + _CONTEXT_IMAGE_CAPTION_CACHE_TTL_SEC,
     }
+    logger.debug(f"[图片转述] 图片转述已缓存: {cache_key}")
     if len(_context_image_caption_cache) > _CONTEXT_IMAGE_CAPTION_CACHE_MAX_SIZE:
-        now_ts = time.time()
-        expired_keys = [
-            k
-            for k, v in _context_image_caption_cache.items()
-            if float((v or {}).get("expire_at", 0.0) or 0.0) <= now_ts
-        ]
-        for k in expired_keys:
-            _context_image_caption_cache.pop(k, None)
-        if len(_context_image_caption_cache) > _CONTEXT_IMAGE_CAPTION_CACHE_MAX_SIZE:
-            # 兜底：仍超限时直接清空，避免内存持续增长。
-            _context_image_caption_cache.clear()
+        oldest_key = next(iter(_context_image_caption_cache))
+        del _context_image_caption_cache[oldest_key]
+
+
+def _get_cached_emoji(cache_key: str) -> str:
+    key = str(cache_key or "").strip()
+    if not key:
+        return ""
+    item = _context_emoji_cache.get(key) or {}
+    try:
+        expire_at = float(item.get("expire_at", 0.0) or 0.0)
+    except Exception:
+        expire_at = 0.0
+    if expire_at <= time.time():
+        _context_emoji_cache.pop(key, None)
+        return ""
+    text = str(item.get("caption") or "").strip()
+    if text:
+        item["expire_at"] = time.time() + _CONTEXT_EMOJI_CAPTION_CACHE_TTL_SEC
+        logger.debug(f"[表情包转述] 表情包转述缓存命中(已刷新TTL): {cache_key}")
+    return text
+
+
+def _set_cached_emoji(cache_key: str, caption: str) -> None:
+    key = str(cache_key or "").strip()
+    val = str(caption or "").strip()
+    if not key or not val:
+        return
+    _context_emoji_cache[key] = {
+        "caption": val,
+        "expire_at": time.time() + _CONTEXT_EMOJI_CAPTION_CACHE_TTL_SEC,
+    }
+    logger.debug(f"[表情包转述] 表情包转述已缓存: {cache_key}")
+    if len(_context_emoji_cache) > _CONTEXT_EMOJI_CAPTION_CACHE_MAX_SIZE:
+        oldest_key = next(iter(_context_emoji_cache))
+        del _context_emoji_cache[oldest_key]
 
 
 def _normalize_local_image_path(path_or_uri: str) -> str:
@@ -435,11 +478,7 @@ def _is_emoji_image_data(seg_data: dict[str, Any]) -> bool:
             return True
     package = seg_data.get("emoji_package") or seg_data.get("emojiPackage")
     if isinstance(package, dict):
-        if (
-            package.get("id")
-            or package.get("package_id")
-            or package.get("packageId")
-        ):
+        if package.get("id") or package.get("package_id") or package.get("packageId"):
             return True
 
     for key in ("url", "file"):
@@ -457,7 +496,12 @@ def _is_emoji_image_data(seg_data: dict[str, Any]) -> bool:
 
     for key in ("type", "image_type", "imageType"):
         value = seg_data.get(key)
-        if isinstance(value, str) and value.strip().lower() in {"emoji", "sticker", "face", "meme"}:
+        if isinstance(value, str) and value.strip().lower() in {
+            "emoji",
+            "sticker",
+            "face",
+            "meme",
+        }:
             return True
 
     summary = seg_data.get("summary")
@@ -480,13 +524,6 @@ def _is_emoji_image_data(seg_data: dict[str, Any]) -> bool:
     return False
 
 
-def _normalize_emoji_summary(summary: str) -> str:
-    text = str(summary or "").strip()
-    if text.startswith("[") and text.endswith("]"):
-        text = text[1:-1].strip()
-    return text
-
-
 def _extract_emoji_summary_from_data(seg_data: dict[str, Any]) -> str:
     summary = seg_data.get("summary")
     if isinstance(summary, str):
@@ -500,19 +537,34 @@ def get_emoji_summary_from_sources(
     message_chain: Any,
     raw_image_datas: Optional[list[dict[str, Any]]] = None,
 ) -> str:
+    """从消息链或原始图片数据中提取表情包/贴图的文字描述。"""
     for data in list(raw_image_datas or []):
         if _is_emoji_image_data(data):
             text = _extract_emoji_summary_from_data(data)
             if text:
                 return text
     try:
-        for seg in (message_chain or []):
+        for seg in message_chain or []:
             if isinstance(seg, dict) and str(seg.get("type") or "").lower() == "image":
                 data = seg.get("data") or {}
                 if isinstance(data, dict) and _is_emoji_image_data(data):
                     text = _extract_emoji_summary_from_data(data)
                     if text:
                         return text
+            elif isinstance(seg, dict) and str(seg.get("type") or "").lower() in (
+                "mface",
+                "marketface",
+            ):
+                data = seg.get("data") or {}
+                name = None
+                if isinstance(data, dict):
+                    for k in ("name", "summary", "emoji_id", "id"):
+                        v = data.get(k)
+                        if isinstance(v, str) and v.strip():
+                            name = v.strip()
+                            break
+                if name:
+                    return _normalize_emoji_summary(name)
             elif isinstance(seg, Comp.Image):
                 seg_data = _extract_image_data_from_component(seg)
                 if _is_emoji_image_data(seg_data):
@@ -537,6 +589,7 @@ def _merge_image_caption_and_emoji_summary(caption: str, emoji_summary: str) -> 
 
 
 def append_emoji_summary_suffix(base_text: str, emoji_summary: str) -> str:
+    """在文本末尾追加表情包描述的附注信息。"""
     base = str(base_text or "").strip()
     summary = str(emoji_summary or "").strip()
     if not base or not summary:
@@ -545,9 +598,19 @@ def append_emoji_summary_suffix(base_text: str, emoji_summary: str) -> str:
         return base
     return f"{base}（表情：{summary}）"
 
+
 def _extract_image_data_from_component(comp: Any) -> dict[str, Any]:
     seg_data: dict[str, Any] = {}
-    for attr in ("subType", "sub_type", "summary", "file", "url", "type", "imageType", "image_type"):
+    for attr in (
+        "subType",
+        "sub_type",
+        "summary",
+        "file",
+        "url",
+        "type",
+        "imageType",
+        "image_type",
+    ):
         value = getattr(comp, attr, None)
         if value not in (None, ""):
             seg_data[attr] = value
@@ -565,6 +628,7 @@ def _extract_image_data_from_component(comp: Any) -> dict[str, Any]:
 
 
 def extract_raw_image_datas_from_event(event: Any) -> list[dict[str, Any]]:
+    """从事件的原始消息中提取所有图片组件的 data 字典列表。"""
     raw_message = getattr(getattr(event, "message_obj", None), "raw_message", None)
     if raw_message is None:
         return []
@@ -586,7 +650,10 @@ def extract_raw_image_datas_from_event(event: Any) -> list[dict[str, Any]]:
     return image_datas
 
 
-def get_image_component_label(message_chain: Any, raw_image_datas: Optional[list[dict[str, Any]]] = None) -> str:
+def get_image_component_label(
+    message_chain: Any, raw_image_datas: Optional[list[dict[str, Any]]] = None
+) -> str:
+    """判断图片组件的标签：是表情包还是普通图片。"""
     fallback_image_data: dict[str, Any] = {}
     for data in list(raw_image_datas or []):
         if _is_emoji_image_data(data):
@@ -594,7 +661,7 @@ def get_image_component_label(message_chain: Any, raw_image_datas: Optional[list
         if (not fallback_image_data) and isinstance(data, dict):
             fallback_image_data = dict(data)
     try:
-        for seg in (message_chain or []):
+        for seg in message_chain or []:
             if isinstance(seg, dict) and str(seg.get("type") or "").lower() == "image":
                 data = seg.get("data") or {}
                 if _is_emoji_image_data(data):
@@ -616,6 +683,7 @@ def extract_addressing_signals(
     message_chain: Any,
     bot_id: str = "",
 ) -> tuple[list[dict[str, str]], bool, bool, str, str]:
+    """提取消息链中的寻址信号：@列表、是否@机器人、是否@全体、回复目标。"""
     at_targets: list[dict[str, str]] = []
     at_bot = False
     at_all = False
@@ -623,7 +691,7 @@ def extract_addressing_signals(
     reply_msg_id = ""
     bid = str(bot_id or "").strip()
     try:
-        for seg in (message_chain or []):
+        for seg in message_chain or []:
             if isinstance(seg, Comp.At):
                 target_id = str(getattr(seg, "qq", "") or "").strip()
                 target_name = str(getattr(seg, "name", "") or "").strip()
@@ -637,7 +705,9 @@ def extract_addressing_signals(
                 sender_id = str(getattr(seg, "sender_id", "") or "").strip()
                 if sender_id:
                     reply_to_id = sender_id
-                rid = str(getattr(seg, "id", "") or getattr(seg, "message_id", "") or "").strip()
+                rid = str(
+                    getattr(seg, "id", "") or getattr(seg, "message_id", "") or ""
+                ).strip()
                 if rid:
                     reply_msg_id = rid
             elif isinstance(seg, dict):
@@ -653,7 +723,9 @@ def extract_addressing_signals(
                 elif seg_type == "atall":
                     at_all = True
                 elif seg_type == "reply":
-                    sender_id = str(data.get("sender_id") or data.get("user_id") or "").strip()
+                    sender_id = str(
+                        data.get("sender_id") or data.get("user_id") or ""
+                    ).strip()
                     if sender_id:
                         reply_to_id = sender_id
                     rid = str(data.get("id") or data.get("message_id") or "").strip()
@@ -674,7 +746,7 @@ def _summary_from_raw_message_chain(chain: Any) -> str:
     file_name = ""
     emoji_summary = get_emoji_summary_from_sources(chain)
     try:
-        for seg in (chain or []):
+        for seg in chain or []:
             if isinstance(seg, dict):
                 seg_type = str(seg.get("type") or "").lower()
                 data = seg.get("data") or {}
@@ -710,7 +782,9 @@ def _summary_from_raw_message_chain(chain: Any) -> str:
                 elif isinstance(seg, Comp.Json):
                     has_json = True
                 elif isinstance(seg, Comp.File):
-                    file_name = str(getattr(seg, "name", "") or getattr(seg, "file", "") or "").strip()
+                    file_name = str(
+                        getattr(seg, "name", "") or getattr(seg, "file", "") or ""
+                    ).strip()
     except Exception:
         pass
 
@@ -735,6 +809,7 @@ def _summary_from_raw_message_chain(chain: Any) -> str:
 
 
 async def try_build_reply_preview(event: Any, reply_msg_id: str) -> str:
+    """尝试根据回复消息 ID 构建引用消息的预览文本。"""
     rid = str(reply_msg_id or "").strip()
     if not rid:
         return ""
@@ -749,12 +824,17 @@ async def try_build_reply_preview(event: Any, reply_msg_id: str) -> str:
         if not isinstance(original_msg, dict):
             return ""
         sender = original_msg.get("sender", {}) or {}
-        sender_name = str(sender.get("nickname") or sender.get("card") or sender.get("user_id") or "对方").strip()
+        sender_name = str(
+            sender.get("nickname")
+            or sender.get("card")
+            or sender.get("user_id")
+            or "对方"
+        ).strip()
         chain = original_msg.get("message") or []
         summary = _summary_from_raw_message_chain(chain)
         return f"{sender_name}: {summary}"
     except Exception as e:
-        logger.debug(f"[LLMEnhancement][ContextInjection] 获取引用消息摘要失败：{e}")
+        logger.debug(f"[上下文注入] 获取引用消息摘要失败：{e}")
         return ""
 
 
@@ -769,15 +849,47 @@ async def try_get_image_caption(
     timeout_sec: float = 60.0,
     preferred_provider_id: str = "",
     allow_default_provider: bool = True,
+    emoji_mode: bool = False,
 ) -> str:
-    emoji_summary = get_emoji_summary_from_sources(message_chain, raw_image_datas=raw_image_datas)
+    """尝试调用视觉模型为图片生成文字描述，优先使用表情包摘要缓存。"""
+    emoji_summary = get_emoji_summary_from_sources(
+        message_chain, raw_image_datas=raw_image_datas
+    )
     image_file, image_url = _extract_first_image_file_and_url(message_chain)
+    _raw_cache_datas = raw_image_datas or extract_raw_image_datas_from_event(event)
+    _cache_file, _cache_url = "", ""
+    for _d in _raw_cache_datas or []:
+        if isinstance(_d, dict):
+            _cache_file = str(_d.get("file") or "").strip()
+            _cache_url = str(_d.get("url") or "").strip()
+            if _cache_file or _cache_url:
+                break
     if not image_file and not image_url:
         return emoji_summary or ""
-    cache_key = _build_image_caption_cache_key(image_file, image_url)
-    cached_caption = _get_cached_image_caption(cache_key)
-    if cached_caption:
-        return _merge_image_caption_and_emoji_summary(cached_caption, emoji_summary)
+    cache_key = _build_image_caption_cache_key(
+        _cache_file or image_file,
+        _cache_url or image_url,
+    )
+    _is_emoji = False
+    if emoji_mode:
+        _is_emoji = bool(emoji_summary)
+        if not _is_emoji:
+            for _d in _raw_cache_datas or []:
+                if isinstance(_d, dict) and _is_emoji_image_data(_d):
+                    _is_emoji = True
+                    break
+    if _is_emoji:
+        cached_caption = _get_cached_emoji(cache_key)
+        if cached_caption:
+            return _merge_image_caption_and_emoji_summary(cached_caption, emoji_summary)
+    else:
+        cached_caption = _get_cached_image_caption(cache_key)
+        if cached_caption:
+            return _merge_image_caption_and_emoji_summary(cached_caption, emoji_summary)
+
+    logger.debug(
+        f"{'[表情包转述]' if _is_emoji else '[图片转述]'} 转述生成: cache_key={cache_key}"
+    )
 
     provider_id = str(
         preferred_provider_id
@@ -785,7 +897,7 @@ async def try_get_image_caption(
             "context_injection_image_caption_provider_id",
             "",
         )
-        or ""
+        or "",
     ).strip()
     provider = provider_by_id_resolver(provider_id) if provider_id else None
     if provider is None and allow_default_provider:
@@ -793,11 +905,15 @@ async def try_get_image_caption(
     if not provider or (not hasattr(provider, "text_chat")):
         return emoji_summary or ""
 
-    prompt = _CONTEXT_IMAGE_CAPTION_PROMPT
+    prompt = (
+        _CONTEXT_EMOJI_CAPTION_PROMPT if _is_emoji else _CONTEXT_IMAGE_CAPTION_PROMPT
+    )
     if not prompt:
         return emoji_summary or ""
 
-    image_input = _normalize_local_image_path(image_file) or _normalize_local_image_path(image_url)
+    image_input = _normalize_local_image_path(
+        image_file
+    ) or _normalize_local_image_path(image_url)
     temp_image_path = ""
     if not image_input:
         # 优先通过 OneBot get_image(file) 拉取本地路径，和引用图片链路保持一致。
@@ -809,51 +925,62 @@ async def try_get_image_caption(
                 image_resp = await api.call_action("get_image", file=file_key)
                 if isinstance(image_resp, dict):
                     image_input = (
-                        _normalize_local_image_path(str(image_resp.get("file") or "").strip())
-                        or _normalize_local_image_path(str(image_resp.get("path") or "").strip())
-                        or _normalize_local_image_path(str(image_resp.get("url") or "").strip())
+                        _normalize_local_image_path(
+                            str(image_resp.get("file") or "").strip()
+                        )
+                        or _normalize_local_image_path(
+                            str(image_resp.get("path") or "").strip()
+                        )
+                        or _normalize_local_image_path(
+                            str(image_resp.get("url") or "").strip()
+                        )
                     )
         except Exception as e:
-            logger.debug(f"[LLMEnhancement][ContextInjection] 图像转述失败(get_image): {type(e).__name__}: {e}")
+            logger.debug(
+                f"[上下文注入] 图像转述失败(get_image): {type(e).__name__}: {e}"
+            )
 
     if not image_input:
         # 兜底：下载外链到本地临时文件再传给模型。
         try:
-            from .video_parser import download_video_to_temp
+            from .media_parser import download_media_to_temp
 
             source = str(image_url or image_file or "").strip()
             if not source:
                 return emoji_summary or ""
             temp_image_path = str(
-                await download_video_to_temp(
+                await download_media_to_temp(
                     source,
                     size_mb_limit=10,
                 )
-                or ""
+                or "",
             ).strip()
             image_input = _normalize_local_image_path(temp_image_path)
         except Exception as e:
-            logger.debug(f"[LLMEnhancement][ContextInjection] 图像转述失败(download): {type(e).__name__}: {e}")
+            logger.debug(
+                f"[上下文注入] 图像转述失败(download): {type(e).__name__}: {e}"
+            )
             image_input = ""
     if not image_input:
-        return emoji_summary or ""
+        return (emoji_summary + " [处理失败]") if emoji_summary else "[处理失败]"
 
     resized_tmp_path = ""
     if image_input and os.path.exists(image_input):
         try:
             from PIL import Image
+
             img = Image.open(image_input)
             max_dim = 2048
             if img.width > max_dim or img.height > max_dim:
                 ratio = max_dim / max(img.width, img.height)
                 new_size = (int(img.width * ratio), int(img.height * ratio))
                 img = img.resize(new_size, Image.LANCZOS)
-                fd, resized_tmp_path = tempfile.mkstemp(suffix='.jpg')
+                fd, resized_tmp_path = tempfile.mkstemp(suffix=".jpg")
                 os.close(fd)
-                img.save(resized_tmp_path, 'JPEG', quality=95)
+                img.save(resized_tmp_path, "JPEG", quality=95)
                 image_input = resized_tmp_path
         except Exception as e:
-            logger.debug(f"[LLMEnhancement][ContextInjection] 图片压缩失败: {e}")
+            logger.debug(f"[上下文注入] 图片压缩失败: {e}")
 
     try:
         async with _context_image_caption_semaphore:
@@ -868,20 +995,34 @@ async def try_get_image_caption(
                     timeout=max(5.0, float(timeout_sec)),
                 )
             else:
-                resp = await provider.text_chat(
-                    prompt=prompt,
-                    session_id=uuid.uuid4().hex,
-                    image_urls=[image_input],
-                    persist=False,
+                resp = await asyncio.wait_for(
+                    provider.text_chat(
+                        prompt=prompt,
+                        session_id=uuid.uuid4().hex,
+                        image_urls=[image_input],
+                        persist=False,
+                    ),
+                    timeout=60,
                 )
             text = str(getattr(resp, "completion_text", "") or "").strip()
-            caption = text[:200]
+            if "处理失败" in text:
+                caption = "[处理失败]"
+            else:
+                caption = text[:200]
             if caption:
-                _set_cached_image_caption(cache_key, caption)
+                if _is_emoji:
+                    _set_cached_emoji(
+                        cache_key,
+                        _merge_image_caption_and_emoji_summary(caption, emoji_summary),
+                    )
+                else:
+                    _set_cached_image_caption(cache_key, caption)
+            if _is_emoji:
+                return _merge_image_caption_and_emoji_summary(caption, emoji_summary)
             return _merge_image_caption_and_emoji_summary(caption, emoji_summary)
     except Exception as e:
-        logger.debug(f"[LLMEnhancement][ContextInjection] 图像转述失败(model): {type(e).__name__}: {e}")
-        return emoji_summary or ""
+        logger.debug(f"[上下文注入] 图像转述失败(model): {type(e).__name__}: {e}")
+        return (emoji_summary + " [处理失败]") if emoji_summary else "[处理失败]"
     finally:
         if temp_image_path:
             try:
@@ -895,33 +1036,6 @@ async def try_get_image_caption(
                     os.remove(resized_tmp_path)
             except Exception:
                 pass
-
-
-async def _fetch_messages_by_ids(
-    event: Any,
-    msg_ids: list[str],
-) -> list[dict[str, Any]]:
-    if not isinstance(event, AiocqhttpMessageEvent):
-        return []
-    if not msg_ids:
-        return []
-    bot = getattr(event, "bot", None)
-    api = getattr(bot, "api", None) if bot else None
-    if api is None or not hasattr(api, "call_action"):
-        return []
-
-    messages: list[dict[str, Any]] = []
-    for msg_id in msg_ids:
-        sid = str(msg_id or "").strip()
-        if not sid:
-            continue
-        try:
-            original_msg = await api.call_action("get_msg", message_id=sid)
-        except Exception:
-            continue
-        if isinstance(original_msg, dict) and isinstance(original_msg.get("message"), list):
-            messages.append(original_msg)
-    return messages
 
 
 async def _resolve_image_input_from_segment_data(
@@ -952,7 +1066,9 @@ async def _resolve_image_input_from_segment_data(
                     candidate = str(image_resp.get(key) or "").strip()
                     if not candidate:
                         continue
-                    if candidate.startswith(("file:///", "http://", "https://", "base64://")):
+                    if candidate.startswith(
+                        ("file:///", "http://", "https://", "base64://")
+                    ):
                         return candidate
                     if os.path.exists(candidate):
                         return os.path.abspath(candidate)
@@ -980,7 +1096,10 @@ async def inject_merged_images_by_provider(
     provider_by_id_resolver: Any,
     default_provider_resolver: Any,
 ) -> dict[str, Any]:
-    batch_msg_ids = [str(mid).strip() for mid in (merged_msg_ids or []) if str(mid or "").strip()]
+    """将合并消息中的图片补入 ProviderRequest 的 image_urls，或降级为文字描述。返回注入结果统计。"""
+    batch_msg_ids = [
+        str(mid).strip() for mid in (merged_msg_ids or []) if str(mid or "").strip()
+    ]
     if not batch_msg_ids:
         return {"mode": "none", "image_count": 0, "caption_count": 0}
 
@@ -1007,7 +1126,9 @@ async def inject_merged_images_by_provider(
         if not hasattr(req, "image_urls") or req.image_urls is None:
             req.image_urls = []
         existing_urls = {
-            str(item).strip() for item in list(req.image_urls or []) if str(item).strip()
+            str(item).strip()
+            for item in list(req.image_urls or [])
+            if str(item).strip()
         }
         injected_count = 0
         for segment in image_segments:
@@ -1022,7 +1143,7 @@ async def inject_merged_images_by_provider(
             logger.debug(
                 "[LLMEnhancement] 已将合并消息中的图片补入 req.image_urls："
                 f"group={getattr(event, 'get_group_id', lambda: None)() or 'private'}, "
-                f"uid={getattr(event, 'get_sender_id', lambda: None)()}, count={injected_count}"
+                f"uid={getattr(event, 'get_sender_id', lambda: None)()}, count={injected_count}",
             )
         return {"mode": "image", "image_count": injected_count, "caption_count": 0}
 
@@ -1032,13 +1153,13 @@ async def inject_merged_images_by_provider(
         else {}
     )
     caption_provider_id = str(
-        provider_settings.get("default_image_caption_provider_id", "") or ""
+        provider_settings.get("default_image_caption_provider_id", "") or "",
     ).strip()
     if not caption_provider_id:
         logger.debug(
             "[LLMEnhancement] 当前 Provider 不支持视觉，且未配置图像转述模型，跳过合并图片注入："
             f"group={getattr(event, 'get_group_id', lambda: None)() or 'private'}, "
-            f"uid={getattr(event, 'get_sender_id', lambda: None)()}, image_count={len(image_segments)}"
+            f"uid={getattr(event, 'get_sender_id', lambda: None)()}, image_count={len(image_segments)}",
         )
         return {"mode": "skip", "image_count": len(image_segments), "caption_count": 0}
 
@@ -1068,22 +1189,26 @@ async def inject_merged_images_by_provider(
             f"group={getattr(event, 'get_group_id', lambda: None)() or 'private'}, "
             f"uid={getattr(event, 'get_sender_id', lambda: None)()}, "
             f"image_count={len(image_segments)}, caption_count={caption_count}, "
-            f"caption_provider={caption_provider_id}"
+            f"caption_provider={caption_provider_id}",
         )
-        return {"mode": "caption", "image_count": len(image_segments), "caption_count": caption_count}
+        return {
+            "mode": "caption",
+            "image_count": len(image_segments),
+            "caption_count": caption_count,
+        }
 
     logger.debug(
         "[LLMEnhancement] 当前 Provider 不支持视觉，但合并图片转述未产出内容："
         f"group={getattr(event, 'get_group_id', lambda: None)() or 'private'}, "
         f"uid={getattr(event, 'get_sender_id', lambda: None)()}, "
-        f"image_count={len(image_segments)}, caption_provider={caption_provider_id}"
+        f"image_count={len(image_segments)}, caption_provider={caption_provider_id}",
     )
     return {"mode": "caption", "image_count": len(image_segments), "caption_count": 0}
 
 
 def _extract_forward_id_from_chain(message_chain: Any) -> str:
     try:
-        for seg in (message_chain or []):
+        for seg in message_chain or []:
             if isinstance(seg, Comp.Forward):
                 fid = str(getattr(seg, "id", "") or "").strip()
                 if fid:
@@ -1107,9 +1232,10 @@ async def build_text_context_enrichment(
     message_chain: Any,
     parse_options: set[str],
 ) -> str:
+    """构建文本上下文的富化内容：解析 URL、JSON 卡片、文件信息等。"""
     parts: list[str] = []
 
-    # URL 解析（文本链路天然可命中，非文本链路也会复用该函数）
+    # URL 解析（文本链路天然可命中，非文本链路也会复用该函数）。
     if "url" in parse_options and bool(get_cfg("url_parse_enable", True)):
         try:
             from .url_parser import extract_url_infos_from_chain
@@ -1117,23 +1243,32 @@ async def build_text_context_enrichment(
             url_result = await extract_url_infos_from_chain(
                 event=event,
                 chain=list(message_chain or []),
-                timeout_sec=int(get_cfg("inject_url_timeout_sec", 8) or 8),
-                max_download_kb=int(get_cfg("inject_url_max_download_kb", 512) or 512),
-                block_private_network=bool(get_cfg("inject_url_block_private_network", True)),
+                timeout_sec=max(2, int(get_cfg("inject_url_timeout_sec", 8) or 8)),
+                max_download_kb=max(
+                    32, int(get_cfg("inject_url_max_download_kb", 512) or 512)
+                ),
+                block_private_network=bool(
+                    get_cfg("inject_url_block_private_network", True)
+                ),
                 blocked_domains=get_cfg("inject_url_blocked_domains", []) or [],
-                tavily_api_keys=get_cfg("tavily_api_keys", []) or [],
+                url_parse_provider=get_cfg("url_parse_provider", "exa") or "exa",
+                url_parse_api_keys=get_cfg("url_parse_api_keys", []) or [],
             )
             if getattr(url_result, "details", None):
-                parts.append(f"URL解析: {_clip('；'.join(list(url_result.details)[:2]), 220)}")
+                parts.append(
+                    f"URL解析: {_clip('；'.join(list(url_result.details)[:2]), 220)}"
+                )
         except Exception:
             pass
 
-    # JSON 卡片解析（复用引用解析中的同源能力）
+    # JSON 卡片解析（复用引用解析中的同源能力）。
     if "json" in parse_options and bool(get_cfg("json_parse_enable", True)):
         try:
             from .json_parser import extract_json_infos_from_chain
 
-            json_news_texts, json_infos = extract_json_infos_from_chain(list(message_chain or []))
+            json_news_texts, json_infos = extract_json_infos_from_chain(
+                list(message_chain or [])
+            )
             json_news_texts = list(dict.fromkeys(json_news_texts))
             json_infos = list(dict.fromkeys(json_infos))
             if json_infos or json_news_texts:
@@ -1141,12 +1276,14 @@ async def build_text_context_enrichment(
                 if json_infos:
                     json_parts.append(f"卡片信息: {_clip('；'.join(json_infos), 220)}")
                 if json_news_texts:
-                    json_parts.append(f"正文摘录: {_clip('；'.join(json_news_texts[:5]), 220)}")
+                    json_parts.append(
+                        f"正文摘录: {_clip('；'.join(json_news_texts[:5]), 220)}"
+                    )
                 parts.append("JSON解析: " + " | ".join(json_parts))
         except Exception:
             pass
 
-    # 文件解析（仅在主配置开启文件文本注入且长度>0时生效）
+    # 文件解析（仅在主配置开启文件文本注入且长度>0时生效）。
     if "file" in parse_options and bool(get_cfg("file_parse_enable", True)):
         try:
             file_names = _extract_file_names_from_chain(message_chain)
@@ -1170,11 +1307,13 @@ async def build_non_text_context_text(
     raw_image_datas: Optional[list[dict[str, Any]]] = None,
     provider_by_id_resolver: Any,
     default_provider_resolver: Any,
+    emoji_mode: bool = False,
 ) -> str:
+    """为非文本消息（图片、语音等）构建用于上下文注入的文字描述。"""
     parts: list[str] = []
     has_record_component = False
     try:
-        for seg in (message_chain or []):
+        for seg in message_chain or []:
             if isinstance(seg, Comp.Record):
                 has_record_component = True
                 break
@@ -1193,9 +1332,12 @@ async def build_non_text_context_text(
             get_cfg=get_cfg,
             provider_by_id_resolver=provider_by_id_resolver,
             default_provider_resolver=default_provider_resolver,
+            emoji_mode=emoji_mode,
         )
         if image_caption:
-            image_label = get_image_component_label(message_chain, raw_image_datas=raw_image_datas)
+            image_label = get_image_component_label(
+                message_chain, raw_image_datas=raw_image_datas
+            )
             parts.append(f"{image_label}转述: {image_caption}")
 
     # forward: 仅抽取聊天记录文本，不做媒体解析
@@ -1205,10 +1347,16 @@ async def build_non_text_context_text(
             try:
                 from .forward_parser import extract_forward_content
 
-                max_forward_messages = int(get_cfg("forward_message_max_count", 50) or 50)
+                max_forward_messages = int(
+                    get_cfg("forward_message_max_count", 50) or 50
+                )
                 nested_parse_depth = int(get_cfg("nested_parse_depth", 5) or 5)
                 enable_json_parse = bool(get_cfg("json_parse_enable", True))
-                extracted_texts, _image_urls, _video_sources = await extract_forward_content(
+                (
+                    extracted_texts,
+                    _image_urls,
+                    _video_sources,
+                ) = await extract_forward_content(
                     event.bot,
                     forward_id=forward_id,
                     max_message_count=max_forward_messages,
@@ -1220,7 +1368,9 @@ async def build_non_text_context_text(
                     preview_texts = extracted_texts[:preview_count]
                     # 按聊天记录解析配置动态放宽摘要长度，避免较长转发被额外截断过多。
                     clip_limit = max(220, min(4000, preview_count * 120))
-                    parts.append(f"聊天记录抽取: {_clip('；'.join(preview_texts), clip_limit)}")
+                    parts.append(
+                        f"聊天记录抽取: {_clip('；'.join(preview_texts), clip_limit)}"
+                    )
             except Exception:
                 pass
 
@@ -1288,10 +1438,13 @@ def build_context_text(
     image_label: str = "图片",
     emoji_summary: str = "",
 ) -> str:
+    """构建单条上下文消息的最终文本，融合图片描述、表情摘要和媒体标记。"""
     text = str(message_text or "").strip()
     if has_image_component and image_caption:
         if text:
-            return append_emoji_summary_suffix(f"{text} [{image_label}描述: {image_caption}]", emoji_summary)
+            return append_emoji_summary_suffix(
+                f"{text} [{image_label}描述: {image_caption}]", emoji_summary
+            )
         return append_emoji_summary_suffix(
             f"{sender_name}发送了1张{image_label}：{image_caption}",
             emoji_summary,
@@ -1310,6 +1463,7 @@ def build_context_text(
         image_label=image_label,
     )
     return append_emoji_summary_suffix(str(media_text or "").strip(), emoji_summary)
+
 
 def _clip(text: str, limit: int = 120) -> str:
     t = str(text or "").replace("\n", " ").replace("\r", " ").strip()
@@ -1352,6 +1506,7 @@ def build_active_wake_prompt_note(
     direct_wake: bool,
     wake_reason: str,
 ) -> str:
+    """构建主动唤醒的提示说明文本，供附加到请求中。"""
     if direct_wake:
         return ""
     wake_type = _classify_active_wake_reason(wake_reason)
@@ -1369,11 +1524,7 @@ def build_active_wake_prompt_note(
     if not note_body:
         return ""
 
-    return (
-        "\n\n[主动唤醒说明]\n"
-        "本次回复属于主动参与，用户未显式@你。\n"
-        f"{note_body}"
-    )
+    return f"\n\n[主动唤醒说明]\n本次回复属于主动参与，用户未显式@你。\n{note_body}"
 
 
 def inject_active_wake_note_into_request(
@@ -1382,6 +1533,7 @@ def inject_active_wake_note_into_request(
     direct_wake: bool,
     wake_reason: str,
 ) -> tuple[bool, str, str]:
+    """将主动唤醒说明注入到请求中（优先使用 TextPart，降级到 prompt）。"""
     block = build_active_wake_prompt_note(
         direct_wake=direct_wake,
         wake_reason=wake_reason,
@@ -1401,12 +1553,13 @@ def should_inject_context(
     direct_wake: bool,
     wake_reason: str,
 ) -> bool:
+    """根据配置和唤醒类型判断是否应该向请求注入上下文。"""
     mode = get_context_injection_mode(get_cfg)
     if mode == "off":
         return False
     if mode == "before_all_wake":
         return True
-    # before_active_only
+    # before_active_only 模式
     if direct_wake:
         return False
     return _is_active_wake_reason(wake_reason)
@@ -1424,13 +1577,15 @@ def _dedup_simple_notice_text(sender: str, text: str) -> str:
         right = right.strip()
         if not right.startswith(sender_text):
             continue
-        tail = right[len(sender_text):].lstrip()
+        tail = right[len(sender_text) :].lstrip()
         if tail:
             return f"{left}{marker}{tail}"
     return value
 
 
-def _render_context_line(item: dict[str, Any], *, detailed: bool, limit: int = 130) -> str:
+def _render_context_line(
+    item: dict[str, Any], *, detailed: bool, limit: int = 120
+) -> str:
     sender = str(item.get("sender_name") or item.get("uid") or "未知用户").strip()
     uid_text = str(item.get("uid") or "").strip()
     ts = item.get("ts")
@@ -1443,7 +1598,9 @@ def _render_context_line(item: dict[str, Any], *, detailed: bool, limit: int = 1
     if not detailed:
         source_text = str(item.get("source") or "").strip().lower()
         text_raw = str(item.get("text") or "")
-        is_notice_line = source_text.startswith("notice_") or source_text.startswith("request_")
+        is_notice_line = source_text.startswith("notice_") or source_text.startswith(
+            "request_"
+        )
         sender_with_uid = f"{sender}(uid={uid_text})" if uid_text else sender
         if is_notice_line:
             text = _clip(text_raw, limit)
@@ -1477,7 +1634,9 @@ def _render_context_line(item: dict[str, Any], *, detailed: bool, limit: int = 1
     at_targets = item.get("at_targets") or []
     if at_targets:
         try:
-            at_targets_text = json.dumps(at_targets, ensure_ascii=False, separators=(",", ":"))
+            at_targets_text = json.dumps(
+                at_targets, ensure_ascii=False, separators=(",", ":")
+            )
             detail_parts.append(f"at_targets={at_targets_text}")
         except Exception:
             pass
@@ -1557,6 +1716,7 @@ def append_notice_context_from_raw(
     raw_message: Any,
     get_cfg: Any,
 ) -> tuple[bool, str]:
+    """从原始消息中解析系统通知（如群成员变动）并追加到群组上下文。返回（是否成功, 来源标识）。"""
     if not is_context_injection_enabled(get_cfg):
         return False, "context_disabled"
 
@@ -1603,8 +1763,7 @@ def append_notice_context_from_raw(
             sender_name = actor_label
             if actor_uid and user_id and actor_uid != user_id:
                 message_text = (
-                    f"撤回通知: {actor_label}"
-                    f"撤回了 {target_label} 的一条消息"
+                    f"撤回通知: {actor_label}撤回了 {target_label} 的一条消息"
                 )
                 reply_to_id = user_id
             else:
@@ -1614,7 +1773,11 @@ def append_notice_context_from_raw(
             reply_to_id = user_id
             if sub_type == "invite":
                 actor_uid = operator_id
-                actor_label = _resolve_uid_label(group_state, actor_uid) if actor_uid else "管理员"
+                actor_label = (
+                    _resolve_uid_label(group_state, actor_uid)
+                    if actor_uid
+                    else "管理员"
+                )
                 uid_text = actor_uid or user_id
                 sender_name = actor_label
                 message_text = f"入群通知: {actor_label}邀请 {target_label} 加入了群聊"
@@ -1631,7 +1794,11 @@ def append_notice_context_from_raw(
             reply_to_id = user_id
             if sub_type == "kick":
                 actor_uid = operator_id if operator_id and operator_id != "0" else ""
-                actor_label = _resolve_uid_label(group_state, actor_uid) if actor_uid else "管理员"
+                actor_label = (
+                    _resolve_uid_label(group_state, actor_uid)
+                    if actor_uid
+                    else "管理员"
+                )
                 uid_text = actor_uid or user_id
                 sender_name = actor_label
                 message_text = f"退群通知: {actor_label}将 {target_label} 移出了群聊"
@@ -1641,7 +1808,11 @@ def append_notice_context_from_raw(
                 message_text = f"退群通知: {target_label}退出了群聊"
             elif sub_type == "kick_me":
                 actor_uid = operator_id if operator_id and operator_id != "0" else ""
-                actor_label = _resolve_uid_label(group_state, actor_uid) if actor_uid else "管理员"
+                actor_label = (
+                    _resolve_uid_label(group_state, actor_uid)
+                    if actor_uid
+                    else "管理员"
+                )
                 uid_text = actor_uid or user_id
                 sender_name = actor_label
                 message_text = f"退群通知: {actor_label}将机器人移出了群聊"
@@ -1657,20 +1828,26 @@ def append_notice_context_from_raw(
             if sub_type == "set":
                 if operator_id and operator_id != user_id:
                     actor_label = _resolve_uid_label(group_state, operator_id)
-                    message_text = f"管理通知: {actor_label}将 {target_label} 设为了管理员"
+                    message_text = (
+                        f"管理通知: {actor_label}将 {target_label} 设为了管理员"
+                    )
                 else:
                     message_text = f"管理通知: {target_label}被设为了管理员"
             elif sub_type == "unset":
                 if operator_id and operator_id != user_id:
                     actor_label = _resolve_uid_label(group_state, operator_id)
-                    message_text = f"管理通知: {actor_label}取消了 {target_label} 的管理员身份"
+                    message_text = (
+                        f"管理通知: {actor_label}取消了 {target_label} 的管理员身份"
+                    )
                 else:
                     message_text = f"管理通知: {target_label}被取消了管理员身份"
             else:
                 message_text = f"管理通知: {target_label}管理员身份发生变更"
         elif notice_type == "group_ban":
             actor_uid = operator_id if operator_id and operator_id != "0" else ""
-            actor_label = _resolve_uid_label(group_state, actor_uid) if actor_uid else "管理员"
+            actor_label = (
+                _resolve_uid_label(group_state, actor_uid) if actor_uid else "管理员"
+            )
             target_label = _resolve_uid_label(group_state, user_id)
             uid_text = actor_uid or user_id
             sender_name = actor_label
@@ -1682,7 +1859,9 @@ def append_notice_context_from_raw(
             if sub_type in {"lift_ban", "unban"} or duration <= 0:
                 message_text = f"禁言通知: {actor_label}取消了 {target_label} 的禁言"
             else:
-                message_text = f"禁言通知: {actor_label}禁言了 {target_label} {duration}秒"
+                message_text = (
+                    f"禁言通知: {actor_label}禁言了 {target_label} {duration}秒"
+                )
         elif notice_type == "notify" and sub_type == "poke":
             actor_uid = user_id
             target_uid = target_id
@@ -1694,16 +1873,24 @@ def append_notice_context_from_raw(
             uid_text = actor_uid
             sender_name = actor_label
             reply_to_id = target_uid
-            target_display = "自己" if (actor_uid and target_uid and actor_uid == target_uid) else target_label
+            target_display = (
+                "自己"
+                if (actor_uid and target_uid and actor_uid == target_uid)
+                else target_label
+            )
             if action_parts:
                 action_head = str(action_parts[0] or "").strip()
                 action_tail = str("".join(action_parts[1:]) or "").strip()
                 if action_head and action_tail:
                     message_text = f"互动通知: {actor_label} {action_head} {target_display} {action_tail}"
                 elif action_head:
-                    message_text = f"互动通知: {actor_label} {action_head} {target_display}"
+                    message_text = (
+                        f"互动通知: {actor_label} {action_head} {target_display}"
+                    )
                 elif action_text:
-                    message_text = f"互动通知: {actor_label} {action_text} {target_display}"
+                    message_text = (
+                        f"互动通知: {actor_label} {action_text} {target_display}"
+                    )
                 else:
                     message_text = f"互动通知: {actor_label} 戳了戳 {target_display}"
             elif action_text:
@@ -1721,12 +1908,16 @@ def append_notice_context_from_raw(
             reply_to_id = sender_uid
             if sub_type == "add":
                 if actor_uid and sender_uid and actor_uid != sender_uid:
-                    message_text = f"精华通知: {actor_label}将 {sender_label} 的消息设为了精华"
+                    message_text = (
+                        f"精华通知: {actor_label}将 {sender_label} 的消息设为了精华"
+                    )
                 else:
                     message_text = f"精华通知: {sender_label}的一条消息被设为了精华"
             elif sub_type in {"del", "delete", "remove"}:
                 if actor_uid and sender_uid and actor_uid != sender_uid:
-                    message_text = f"精华通知: {actor_label}取消了 {sender_label} 的精华消息"
+                    message_text = (
+                        f"精华通知: {actor_label}取消了 {sender_label} 的精华消息"
+                    )
                 else:
                     message_text = f"精华通知: {sender_label}的一条精华消息被取消"
             else:
@@ -1734,7 +1925,9 @@ def append_notice_context_from_raw(
         else:
             return False, "unsupported_notice"
     else:
-        request_type = str(_raw_value(raw_message, "request_type") or "").strip().lower()
+        request_type = (
+            str(_raw_value(raw_message, "request_type") or "").strip().lower()
+        )
         sub_type = str(_raw_value(raw_message, "sub_type") or "").strip().lower()
         if request_type != "group" or sub_type != "add":
             return False, "unsupported_request"
@@ -1748,8 +1941,7 @@ def append_notice_context_from_raw(
         reply_to_id = user_id
         if comment:
             message_text = (
-                f"入群申请: {requester_label}申请加入群聊，"
-                f"验证信息：{comment}"
+                f"入群申请: {requester_label}申请加入群聊，验证信息：{comment}"
             )
         else:
             message_text = f"入群申请: {requester_label}申请加入群聊"
@@ -1790,8 +1982,11 @@ def inject_context_into_request(
     direct_wake: bool,
     wake_reason: str,
 ) -> tuple[bool, str, str]:
+    """将群组上下文消息列表格式化后注入到请求中。返回（是否成功, 标识, 内容摘要）。"""
     prune_group_context_state(group_state=group_state, get_cfg=get_cfg)
-    if not should_inject_context(get_cfg=get_cfg, direct_wake=direct_wake, wake_reason=wake_reason):
+    if not should_inject_context(
+        get_cfg=get_cfg, direct_wake=direct_wake, wake_reason=wake_reason
+    ):
         return False, "mode_skip", ""
 
     context_messages = sorted(
@@ -1801,11 +1996,14 @@ def inject_context_into_request(
     if not context_messages:
         return False, "no_context", ""
 
-    max_keep = max(4, min(12, get_context_injection_max_messages(get_cfg)))
+    max_keep = get_context_injection_max_messages(get_cfg)
+    if max_keep <= 0:
+        return False, "max_keep_zero", ""
     detailed = get_context_injection_format(get_cfg) == "detailed"
+    max_line_len = int(get_cfg("context_line_max_length", 150) or 150)
     selected = context_messages[-max_keep:]
     lines = [
-        _render_context_line(item, detailed=detailed)
+        _render_context_line(item, detailed=detailed, limit=max_line_len)
         for item in selected
         if str(item.get("text") or "").strip()
     ]
@@ -1813,7 +2011,7 @@ def inject_context_into_request(
         return False, "empty_lines", ""
 
     block = (
-        f"\n\n[上下文注入|格式={'详细' if detailed else '精简'}]\n"
+        f"\n\n[上下文注入|格式={'详细' if detailed else '简洁'}]\n"
         + "\n".join(lines)
         + "\n[说明] 以上为最近对话片段，请据此理解当前上下文。"
     )
@@ -1842,6 +2040,7 @@ def append_group_context_message(
     now_ts: Optional[float] = None,
     get_cfg: Any = None,
 ) -> bool:
+    """向群组上下文中追加一条消息记录，超出限制时自动裁剪。返回是否成功。"""
     text = str(message_text or "").strip()
     if not text:
         return False
@@ -1887,18 +2086,21 @@ def append_group_context_message(
     if get_cfg:
         prune_group_context_state(group_state=group_state, get_cfg=get_cfg, now_ts=ts)
     else:
-        max_len = max(6, int(max_messages))
+        max_len = int(max_messages)
+        if max_len <= 0:
+            return False
         if len(group_state.context_messages) > max_len:
             group_state.context_messages = group_state.context_messages[-max_len:]
     logger.debug(
-        "[LLMEnhancement][ContextInjection] 记录上下文："
+        "[上下文注入] 记录上下文："
         f"source={entry.get('source', 'incoming')}, uid={entry['uid'] or 'unknown'}, "
-        f"total={len(group_state.context_messages)}"
+        f"total={len(group_state.context_messages)}",
     )
     return True
 
 
 def clear_group_context_records(group_state: GroupState) -> int:
+    """清空群组的所有上下文记录，返回被移除的消息数量。"""
     removed = len(group_state.context_messages or [])
     group_state.context_messages = []
     group_state.last_user_interaction = {}
@@ -1912,12 +2114,13 @@ def clear_context_records_for_group(
     effective_history: Any,
     umo: str,
 ) -> tuple[int, int]:
+    """清除群组的上下文记录和有效对话历史，返回（上下文条数, 历史条数）。"""
     removed = clear_group_context_records(group_state)
     effective_removed = clear_effective_dialog_history(effective_history, umo)
     gid = str(getattr(group_state, "gid", "") or "")
     scope_label = f"群({gid})" if gid else "群(unknown)"
     logger.debug(
         "[LLMEnhancement] 清除上下文完成："
-        f"{scope_label}, removed={removed}, effective_removed={effective_removed}"
+        f"{scope_label}, removed={removed}, effective_removed={effective_removed}",
     )
     return removed, effective_removed

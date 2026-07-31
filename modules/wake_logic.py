@@ -9,8 +9,24 @@ from astrbot.api.event import AstrMessageEvent
 import astrbot.api.message_components as Comp
 from astrbot.core import astrbot_config, db_helper, sp
 
-from .qq_face import build_message_text_with_qq_faces, build_qq_face_text, has_qq_face_segment
+from .qq_face import (
+    build_message_text_with_qq_faces,
+    build_qq_face_text,
+    has_qq_face_segment,
+)
+from .runtime_helpers import (
+    _append_emoji_summary_suffix,
+    _history_segment_to_text as _history_segment_to_text_base,
+    _safe_int,
+)
 from .state_manager import GroupState, MemberState
+
+
+def _history_segment_to_text(seg: Any) -> str:
+    face_text = build_qq_face_text(seg)
+    if face_text:
+        return face_text
+    return _history_segment_to_text_base(seg)
 
 
 _MENTION_WAKE_REGEX_CACHE: dict[str, re.Pattern[str]] = {}
@@ -19,6 +35,7 @@ _SCOPE_RE = re.compile(r"(?:^| )@([gu]):([^\s]+)")
 _WAKE_JUDGE_TYPES = {"explicit", "mention", "relevant", "ask", "bored", "prob"}
 _BOT_ACCOUNT_SKIP_WAKE_TYPES = {"explicit", "active", "wake_extend"}
 WAKE_LLM_TIMEOUT_SEC = 5
+WAKE_EXTEND_TIMEOUT_SEC = 10
 _WAKE_JUDGE_PROMPT_DEFAULT = """你是群聊“唤醒判定器”。请判断机器人是否应该响应这条显式唤醒请求。
 
 [当前时间]
@@ -79,19 +96,12 @@ _WAKE_EXTEND_JUDGE_PROMPT_DEFAULT = """请判断当前消息是否与上文足�
 只能输出一个大写字母：T 或 F。"""
 
 
-def normalize_concurrency_limit(raw: Any) -> int:
-    try:
-        value = int(raw)
-    except Exception:
-        return 0
-    return max(0, value)
-
-
 def is_wake_prefix_triggered(
     *,
     original_message: Any,
     wake_prefixes: Any,
 ) -> bool:
+    """判断消息是否以指定的唤醒前缀开头。"""
     text = str(original_message or "").strip()
     if not text:
         return False
@@ -111,6 +121,7 @@ def is_wake_prefix_only_message(
     original_message: Any,
     wake_prefixes: Any,
 ) -> bool:
+    """判断消息是否仅包含唤醒前缀（无附加内容）。"""
     text = str(original_message or "").strip()
     if not text:
         return False
@@ -134,6 +145,7 @@ def build_request_concurrency_key(
     event_identity: int,
     now_ns: int,
 ) -> str:
+    """构建请求并发控制键，用于对相同会话的消息去重。"""
     if dynamic_merge_mode:
         return f"dynamic::{scope_id}::{state_uid}"
     sid = str(current_msg_id or "").strip()
@@ -183,10 +195,7 @@ def try_acquire_request_concurrency_slot(
     group_limit: int,
     allow_existing_dynamic_session_reuse: bool = False,
 ) -> tuple[bool, str, str]:
-    """Try to allocate one request-concurrency slot.
-
-    Returns: (accepted, key, detail)
-    """
+    """尝试分配一个请求并发槽位。"""
     scope_id = gid or f"private_{uid}"
     key = build_request_concurrency_key(
         dynamic_merge_mode=dynamic_merge_mode,
@@ -203,8 +212,12 @@ def try_acquire_request_concurrency_slot(
         active_request_refs[key] = current_ref + 1
         return True, key, "reuse_existing_dynamic_session"
 
-    user_active = _count_active_user_requests(active_request_refs, active_request_meta, uid)
-    group_active = _count_active_group_requests(active_request_refs, active_request_meta, gid)
+    user_active = _count_active_user_requests(
+        active_request_refs, active_request_meta, uid
+    )
+    group_active = _count_active_group_requests(
+        active_request_refs, active_request_meta, gid
+    )
     if gid and user_limit > 0 and user_active >= user_limit:
         detail = f"user_limit({user_active}/{user_limit}, uid={uid}, group={gid or 'private'})"
         return False, key, detail
@@ -246,8 +259,12 @@ def can_accept_request_concurrency_slot(
         if current_ref > 0:
             return True, "reuse_existing_dynamic_session"
 
-    user_active = _count_active_user_requests(active_request_refs, active_request_meta, uid)
-    group_active = _count_active_group_requests(active_request_refs, active_request_meta, gid)
+    user_active = _count_active_user_requests(
+        active_request_refs, active_request_meta, uid
+    )
+    group_active = _count_active_group_requests(
+        active_request_refs, active_request_meta, gid
+    )
     if user_limit > 0 and user_active >= user_limit:
         detail = f"user_limit({user_active}/{user_limit}, uid={uid}, group={gid or 'private'})"
         return False, detail
@@ -263,7 +280,7 @@ def release_request_concurrency_slot(
     active_request_meta: Dict[str, Tuple[str, str]],
     key: str,
 ) -> int:
-    """Release one request-concurrency ref and return the remaining ref count."""
+    """释放一个请求并发引用，返回剩余引用计数。"""
     current_ref = int(active_request_refs.get(key, 0) or 0)
     if current_ref <= 1:
         active_request_refs.pop(key, None)
@@ -304,7 +321,7 @@ def evict_stale_concurrency_slots(
             evicted += 1
             logger.warning(
                 "[LLMEnhancement] 并发槽位过期："
-                f"key={key}, age={age:.1f}s, uid={meta[0] or 'unknown'}, gid={meta[1] or 'private'}"
+                f"key={key}, age={age:.1f}s, uid={meta[0] or 'unknown'}, gid={meta[1] or 'private'}",
             )
     return evicted
 
@@ -362,7 +379,9 @@ def match_mention_wake_rule(
     if not raw or not text:
         return False
 
-    pattern, groups_include, users_include, groups_exclude, users_exclude = _parse_scoped_rule(raw)
+    pattern, groups_include, users_include, groups_exclude, users_exclude = (
+        _parse_scoped_rule(raw)
+    )
 
     # 包含检查：有限定时 gid/uid 必须在白名单内
     if groups_include and (not gid or str(gid) not in groups_include):
@@ -399,7 +418,9 @@ def match_mention_wake_rule(
     return pattern in text
 
 
-def detect_wake_media_components(message_chain: Any) -> tuple[bool, bool, bool, bool, bool, bool, str]:
+def detect_wake_media_components(
+    message_chain: Any,
+) -> tuple[bool, bool, bool, bool, bool, bool, str]:
     """识别消息链中的视频/文件/转发/JSON 组件，并返回文件名。"""
     has_image_component = False
     has_video_component = False
@@ -409,7 +430,7 @@ def detect_wake_media_components(message_chain: Any) -> tuple[bool, bool, bool, 
     has_record_component = False
     file_name = ""
     try:
-        for seg in (message_chain or []):
+        for seg in message_chain or []:
             if isinstance(seg, Comp.Image):
                 has_image_component = True
             elif isinstance(seg, Comp.Video):
@@ -418,7 +439,9 @@ def detect_wake_media_components(message_chain: Any) -> tuple[bool, bool, bool, 
                 has_record_component = True
             elif isinstance(seg, Comp.File):
                 has_file_component = True
-                file_name = str(getattr(seg, "name", "") or getattr(seg, "file", "") or "").strip()
+                file_name = str(
+                    getattr(seg, "name", "") or getattr(seg, "file", "") or ""
+                ).strip()
             elif isinstance(seg, Comp.Forward):
                 has_forward_component = True
             elif isinstance(seg, Comp.Json):
@@ -435,7 +458,9 @@ def detect_wake_media_components(message_chain: Any) -> tuple[bool, bool, bool, 
                 elif seg_type == "file":
                     has_file_component = True
                     if not file_name:
-                        file_name = str(data.get("name") or data.get("file") or "").strip()
+                        file_name = str(
+                            data.get("name") or data.get("file") or ""
+                        ).strip()
                 elif seg_type == "forward":
                     has_forward_component = True
                 elif seg_type == "json":
@@ -453,24 +478,8 @@ def detect_wake_media_components(message_chain: Any) -> tuple[bool, bool, bool, 
     )
 
 
-def _normalize_emoji_summary(summary: str) -> str:
-    text = str(summary or "").strip()
-    if text.startswith("[") and text.endswith("]"):
-        text = text[1:-1].strip()
-    return text
-
-
-def _append_emoji_summary_suffix(base_text: str, emoji_summary: str) -> str:
-    base = str(base_text or "").strip()
-    summary = _normalize_emoji_summary(emoji_summary)
-    if not base or not summary:
-        return base
-    if summary in base:
-        return base
-    return f"{base}（表情：{summary}）"
-
-
 def build_media_trigger_message(
+    *,
     sender_name: str,
     has_image_component: bool,
     has_video_component: bool,
@@ -482,6 +491,7 @@ def build_media_trigger_message(
     image_label: str = "图片",
     emoji_summary: str = "",
 ) -> tuple[str, Optional[str]]:
+    """根据消息中的媒体组件类型构建唤醒占位文本。"""
     if has_image_component:
         if image_label == "表情包":
             return _append_emoji_summary_suffix(
@@ -504,6 +514,7 @@ def build_media_trigger_message(
 
 
 def normalize_wake_trigger_message(
+    *,
     wake: bool,
     msg: str,
     gid: Optional[str],
@@ -552,47 +563,6 @@ def _clip_text(text: str, limit: int = 120) -> str:
     if len(s) <= limit:
         return s
     return s[: max(20, limit - 1)] + "…"
-
-
-def _history_segment_to_text(seg: Any) -> str:
-    if isinstance(seg, str):
-        return seg
-    face_text = build_qq_face_text(seg)
-    if face_text:
-        return face_text
-    if not isinstance(seg, dict):
-        return ""
-    seg_type = str(seg.get("type") or "").strip().lower()
-    data = seg.get("data") or {}
-    if not isinstance(data, dict):
-        data = {}
-
-    if seg_type == "text":
-        return str(data.get("text") or "")
-    if seg_type == "at":
-        qq = str(data.get("qq") or "").strip()
-        if qq.lower() == "all":
-            return "@全体成员"
-        return f"@{qq}" if qq else "@"
-    if seg_type == "reply":
-        rid = str(data.get("id") or "").strip()
-        return f"[回复:{rid}]" if rid else "[回复]"
-    if seg_type == "image":
-        return "[图片]"
-    if seg_type == "video":
-        return "[视频]"
-    if seg_type == "record":
-        return "[语音]"
-    if seg_type == "file":
-        name = str(data.get("name") or "").strip()
-        return f"[文件:{name}]" if name else "[文件]"
-    if seg_type == "json":
-        return "[JSON]"
-    if seg_type == "xml":
-        return "[XML]"
-    if seg_type == "forward":
-        return "[合并转发]"
-    return ""
 
 
 def _history_message_to_text(message: Any, raw_message: Any = "") -> str:
@@ -648,18 +618,6 @@ def _history_message_id(item: Dict[str, Any]) -> str:
     return str(item.get("message_id") or item.get("msg_id") or "").strip()
 
 
-def _safe_int(value: Any) -> Optional[int]:
-    try:
-        if value is None:
-            return None
-        text = str(value).strip()
-        if not text:
-            return None
-        return int(float(text))
-    except Exception:
-        return None
-
-
 def _history_sort_key(item: Dict[str, Any]) -> tuple[int, int]:
     ts = _safe_int(item.get("time"))
     seq = _safe_int(item.get("message_seq")) or _safe_int(item.get("message_id"))
@@ -686,10 +644,20 @@ def build_empty_mention_context_block(
 
         sender_name = _history_sender_name(item)
         sender_id = _history_sender_id(item)
-        content = _clip_text(_history_message_to_text(item.get("message"), item.get("raw_message")))
+        content = _clip_text(
+            _history_message_to_text(item.get("message"), item.get("raw_message"))
+        )
         if not content:
             continue
-        usable.append((_history_sort_key(item), idx, sender_name, sender_id, content if content else "[空消息]"))
+        usable.append(
+            (
+                _history_sort_key(item),
+                idx,
+                sender_name,
+                sender_id,
+                content if content else "[空消息]",
+            )
+        )
 
     if not usable:
         return "", 0, 0
@@ -718,9 +686,7 @@ def build_empty_mention_context_block(
     )
     ctx_block = (
         "[空@上文补充]\n"
-        "以下为该消息之前最近5条群聊消息：\n"
-        + "\n".join(lines)
-        + f"\n{hint_line}"
+        "以下为该消息之前最近5条群聊消息：\n" + "\n".join(lines) + f"\n{hint_line}"
     )
     return ctx_block, same_user_streak, len(lines)
 
@@ -888,6 +854,7 @@ def is_bot_account_message(
     uid: str,
     get_cfg: Callable[[str, Any], Any],
 ) -> bool:
+    """判断用户 ID 是否属于已配置的机器人账号。"""
     normalized_uid = str(uid or "").strip()
     if not normalized_uid:
         return False
@@ -900,6 +867,7 @@ def should_skip_bot_wake_type(
     skip_type: str,
     get_cfg: Callable[[str, Any], Any],
 ) -> bool:
+    """判断机器人账号是否应跳过指定类型的唤醒判定。"""
     normalized_type = str(skip_type or "").strip().lower()
     if normalized_type not in _BOT_ACCOUNT_SKIP_WAKE_TYPES:
         return False
@@ -928,7 +896,7 @@ def _wake_reason_to_active_type(wake_reason: str) -> Optional[str]:
     return None
 
 
-def _resolve_wake_judge_type(wake_reason: str, direct_wake: bool) -> Optional[str]:
+def _resolve_wake_judge_type(*, wake_reason: str, direct_wake: bool) -> Optional[str]:
     if direct_wake:
         return "explicit"
     return _wake_reason_to_active_type(wake_reason)
@@ -938,31 +906,25 @@ def get_prob_wake_observe_threshold(
     group_state: GroupState,
     get_cfg: Callable[[str, Any], Any],
 ) -> int:
-    activity = get_prob_wake_activity(get_cfg)
+    """获取概率唤醒的观察批次阈值，含退避补偿。"""
+    activity = float(get_cfg("prob_wake", 0.3))
     base, _chance, backoff_step, backoff_max = _build_prob_wake_profile(activity)
 
     base = max(1, base)
     backoff_step = max(0, backoff_step)
     backoff_max = max(0, backoff_max)
-    no_reply_count = max(0, int(getattr(group_state, "prob_wake_no_reply_count", 0) or 0))
+    no_reply_count = max(
+        0, int(getattr(group_state, "prob_wake_no_reply_count", 0) or 0)
+    )
     extra = min(backoff_max, no_reply_count * backoff_step)
     return base + extra
-
-
-def get_prob_wake_activity(
-    get_cfg: Callable[[str, Any], Any],
-) -> float:
-    try:
-        value = float(get_cfg("prob_wake", 0.3) or 0.0)
-    except Exception:
-        value = 0.3
-    return max(0.0, min(1.0, value))
 
 
 def get_prob_wake_trigger_chance(
     get_cfg: Callable[[str, Any], Any],
 ) -> float:
-    activity = get_prob_wake_activity(get_cfg)
+    """获取概率唤醒的触发概率值。"""
+    activity = float(get_cfg("prob_wake", 0.3))
     _base, chance, _backoff_step, _backoff_max = _build_prob_wake_profile(activity)
     return chance
 
@@ -981,6 +943,7 @@ def compute_wake_extend_batch_threshold(
     group_state: GroupState,
     get_cfg: Callable[[str, Any], Any],
 ) -> float:
+    """计算经过批次延长调整后的唤醒阈值，随连续未唤醒次数逐步降低。"""
     adjusted = float(threshold or 0.0)
     if adjusted <= 0:
         return adjusted
@@ -1022,7 +985,7 @@ async def wake_extend_llm_decision(
     provider_id: str,
     prompt_template: str,
     find_provider: Callable[[str], Any],
-    timeout_sec: Optional[int] = WAKE_LLM_TIMEOUT_SEC,
+    timeout_sec: Optional[float] = WAKE_LLM_TIMEOUT_SEC,
 ) -> Optional[bool]:
     """使用配置的 Provider 做唤醒延长判定。返回 True/False，失败返回 None。"""
     provider = find_provider(provider_id)
@@ -1034,7 +997,10 @@ async def wake_extend_llm_decision(
     sender_name = str(event.get_sender_name() or sender_id or "unknown")
     group_id = str(event.get_group_id() or "") or "private"
     now_text = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    history_text = "\n".join([f"{idx + 1}. {h}" for idx, h in enumerate(history_msgs[-5:])]) or "<empty>"
+    history_text = (
+        "\n".join([f"{idx + 1}. {h}" for idx, h in enumerate(history_msgs[-5:])])
+        or "<empty>"
+    )
     placeholders: Dict[str, str] = {
         "time": now_text,
         "user_id": sender_id,
@@ -1071,7 +1037,7 @@ async def wake_extend_llm_decision(
     except asyncio.TimeoutError:
         logger.warning(
             "[LLMEnhancement] 唤醒延长模型判定超时，改用本地相似度兜底："
-            f"provider={provider_id}, timeout_sec={timeout_sec}"
+            f"provider={provider_id}, timeout_sec={timeout_sec}",
         )
         return None
     except Exception as e:
@@ -1080,6 +1046,7 @@ async def wake_extend_llm_decision(
 
 
 async def wake_judge_llm_decision(
+    *,
     event: AstrMessageEvent,
     msg: str,
     history_msgs: List[str],
@@ -1088,7 +1055,7 @@ async def wake_judge_llm_decision(
     provider_id: str,
     prompt_template: str,
     find_provider: Callable[[str], Any],
-    timeout_sec: Optional[int] = WAKE_LLM_TIMEOUT_SEC,
+    timeout_sec: Optional[float] = WAKE_LLM_TIMEOUT_SEC,
     context: Any = None,
 ) -> Tuple[Optional[bool], str]:
     """使用可配置提示词模板执行唤醒判定。"""
@@ -1101,7 +1068,10 @@ async def wake_judge_llm_decision(
     sender_name = str(event.get_sender_name() or sender_id or "unknown")
     group_id = str(event.get_group_id() or "") or "private"
     now_text = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    history_text = "\n".join([f"{idx + 1}. {h}" for idx, h in enumerate(history_msgs[-5:])]) or "<empty>"
+    history_text = (
+        "\n".join([f"{idx + 1}. {h}" for idx, h in enumerate(history_msgs[-5:])])
+        or "<empty>"
+    )
 
     placeholders: Dict[str, str] = {
         "time": now_text,
@@ -1114,7 +1084,9 @@ async def wake_judge_llm_decision(
     await _ensure_persona_placeholder(event, placeholders, prompt_template)
     placeholders.update(await _build_prompt_extra_placeholders(event, context=context))
     prompt = _render_prompt_template(prompt_template, placeholders)
-    trigger_note = _build_wake_trigger_note(wake_reason, direct_wake)
+    trigger_note = _build_wake_trigger_note(
+        wake_reason=wake_reason, direct_wake=direct_wake
+    )
     if trigger_note:
         prompt = f"{trigger_note}\n\n{prompt}"
     system_prompt = (
@@ -1143,7 +1115,7 @@ async def wake_judge_llm_decision(
     except asyncio.TimeoutError:
         logger.warning(
             "[LLMEnhancement] 唤醒判定模型超时，直接按放行兜底："
-            f"provider={provider_id}, timeout_sec={timeout_sec}"
+            f"provider={provider_id}, timeout_sec={timeout_sec}",
         )
         return None, "timeout"
     except Exception as e:
@@ -1151,27 +1123,8 @@ async def wake_judge_llm_decision(
         return None, "model_error"
 
 
-
 def _get_wake_judge_provider_id(get_cfg: Callable[[str, Any], Any]) -> str:
     return str(get_cfg("wake_judge_provider_id", "") or "").strip()
-
-
-def _get_wake_judge_context_count(get_cfg: Callable[[str, Any], Any]) -> int:
-    raw = get_cfg("wake_judge_context_count", 10)
-    try:
-        value = int(raw)
-    except Exception:
-        value = 10
-    return max(1, min(50, value))
-
-
-def _get_wake_llm_timeout_sec(get_cfg: Callable[[str, Any], Any]) -> int:
-    raw = get_cfg("wake_llm_timeout_sec", WAKE_LLM_TIMEOUT_SEC)
-    try:
-        value = int(raw)
-    except Exception:
-        value = WAKE_LLM_TIMEOUT_SEC
-    return max(0, min(30, value))
 
 
 def _get_wake_judge_prompt_template(get_cfg: Callable[[str, Any], Any]) -> str:
@@ -1187,19 +1140,20 @@ def _get_wake_extend_judge_prompt_template(get_cfg: Callable[[str, Any], Any]) -
         return template
     return _WAKE_EXTEND_JUDGE_PROMPT_DEFAULT
 
+
 def _render_prompt_template(template: str, values: Dict[str, str]) -> str:
     def repl(match: re.Match[str]) -> str:
         key = match.group(1)
         if key in values:
             return str(values.get(key, ""))
-        if re.match(r'^r\d+$', key):
+        if re.match(r"^r\d+$", key):
             return str(random.randint(1, 100))
         return match.group(0)
 
     return re.sub(r"\{([a-zA-Z_][a-zA-Z0-9_]*)\}", repl, template)
 
 
-def _build_wake_trigger_note(wake_reason: str, direct_wake: bool = False) -> str:
+def _build_wake_trigger_note(*, wake_reason: str, direct_wake: bool = False) -> str:
     """构造唤醒判定前置说明"""
     reason = str(wake_reason or "").strip()
     if not reason:
@@ -1221,11 +1175,7 @@ def _build_wake_trigger_note(wake_reason: str, direct_wake: bool = False) -> str
         }
         source_desc = source_map.get(wake_type, "其他触发")
 
-    return (
-        "[触发说明]\n"
-        f"- 本次唤醒来源: {source_desc}\n"
-        f"- 原始触发原因: {reason}"
-    )
+    return f"[触发说明]\n- 本次唤醒来源: {source_desc}\n- 原始触发原因: {reason}"
 
 
 async def _build_prompt_extra_placeholders(
@@ -1236,7 +1186,7 @@ async def _build_prompt_extra_placeholders(
     if context is not None:
         try:
             meta = context.get_registered_star("astrbot_plugin_life_scheduler")
-            if meta and meta.star_cls and hasattr(meta.star_cls, 'get_life_context'):
+            if meta and meta.star_cls and hasattr(meta.star_cls, "get_life_context"):
                 data = await meta.star_cls.get_life_context()
                 if data and data.get("schedule"):
                     result["schedule"] = data["schedule"]
@@ -1265,7 +1215,9 @@ async def _ensure_persona_placeholder(
             default={},
         )
         force_persona_id = (
-            (session_cfg or {}).get("persona_id") if isinstance(session_cfg, dict) else None
+            (session_cfg or {}).get("persona_id")
+            if isinstance(session_cfg, dict)
+            else None
         )
 
         conv_id = await sp.session_get(umo, "sel_conv_id", None)
@@ -1294,8 +1246,8 @@ async def _ensure_persona_placeholder(
     placeholders["persona"] = persona_text
 
 
-
 def should_apply_post_wake_gate(
+    *,
     wake_reason: str,
     command_trigger_event: bool,
     direct_wake: bool,
@@ -1310,7 +1262,7 @@ def should_apply_post_wake_gate(
         return False
 
     reason = str(wake_reason or "")
-    wake_type = _resolve_wake_judge_type(reason, direct_wake)
+    wake_type = _resolve_wake_judge_type(wake_reason=reason, direct_wake=direct_wake)
     if not wake_type:
         return False
     enabled_types = _parse_wake_judge_types(get_cfg("wake_judge_types", []))
@@ -1325,6 +1277,7 @@ def is_post_wake_gate_enabled(
 
 
 async def evaluate_post_wake_judge(
+    *,
     event: AstrMessageEvent,
     msg: str,
     gid: str,
@@ -1341,8 +1294,10 @@ async def evaluate_post_wake_judge(
         return True, "skip:disabled"
 
     prompt_template = _get_wake_judge_prompt_template(get_cfg)
-    history_count = _get_wake_judge_context_count(get_cfg)
-    timeout_sec = _get_wake_llm_timeout_sec(get_cfg)
+    history_count = max(0, int(get_cfg("wake_judge_context_count", 10)))
+    timeout_sec = max(
+        0.0, float(get_cfg("wake_judge_timeout_sec", WAKE_LLM_TIMEOUT_SEC))
+    )
     history_msgs = await get_history_msg(event, history_count)
     llm_decision, detail = await wake_judge_llm_decision(
         event=event,
@@ -1361,9 +1316,8 @@ async def evaluate_post_wake_judge(
     return llm_decision, detail
 
 
-
-
 async def apply_post_wake_judge_gate(
+    *,
     event: AstrMessageEvent,
     msg: str,
     gid: str,
@@ -1389,12 +1343,10 @@ async def apply_post_wake_judge_gate(
         return wake, "skip:not_woken"
     if str(wake_reason or "").strip().startswith("唤醒延长"):
         return True, "skip:wake_extend"
-    wake_type = _resolve_wake_judge_type(str(wake_reason or ""), direct_wake)
-    if (
-        wake_type == "explicit"
-        and group_state is not None
-        and member is not None
-    ):
+    wake_type = _resolve_wake_judge_type(
+        wake_reason=str(wake_reason or ""), direct_wake=direct_wake
+    )
+    if wake_type == "explicit" and group_state is not None and member is not None:
         skip_explicit, skip_detail = should_skip_explicit_post_wake_judge(
             uid=uid,
             now=now,
@@ -1445,7 +1397,7 @@ def should_skip_explicit_post_wake_judge(
     1. 若启用了唤醒延长，则复用其窗口与 same_user_only 约束。
     2. 若未启用唤醒延长，则默认同用户距上次响应 60s 内免判定。
     """
-    wake_extend = float(get_cfg("wake_extend", 0) or 0)
+    wake_extend = float(get_cfg("wake_extend_window", 0) or 0)
     if wake_extend > 0:
         same_user_only = bool(get_cfg("wake_extend_same_user_only", True))
         ref_uid, ref_ts = _resolve_wake_extend_reference(
@@ -1466,7 +1418,9 @@ def should_skip_explicit_post_wake_judge(
 
     fallback_window = 60.0
     ref_ts = float(getattr(member, "last_response", 0.0) or 0.0)
-    if ref_ts <= 0 and str(getattr(group_state, "last_response_uid", "") or "") == str(uid):
+    if ref_ts <= 0 and str(getattr(group_state, "last_response_uid", "") or "") == str(
+        uid
+    ):
         ref_ts = float(getattr(group_state, "last_response_ts", 0.0) or 0.0)
     if ref_ts > 0 and (now - ref_ts) <= fallback_window:
         return True, f"skip:explicit_same_user_recent({fallback_window:.0f}s)"
@@ -1477,7 +1431,9 @@ def _wake_extend_consumed_for_ref(group_state: GroupState, ref_ts: float) -> boo
     if ref_ts <= 0:
         return False
     try:
-        consumed_ref_ts = float(getattr(group_state, "wake_extend_consumed_ref_ts", 0.0) or 0.0)
+        consumed_ref_ts = float(
+            getattr(group_state, "wake_extend_consumed_ref_ts", 0.0) or 0.0
+        )
     except Exception:
         consumed_ref_ts = 0.0
     return consumed_ref_ts >= ref_ts
@@ -1487,7 +1443,9 @@ def _mark_wake_extend_consumed(group_state: GroupState, ref_ts: float) -> None:
     if ref_ts <= 0:
         return
     try:
-        consumed_ref_ts = float(getattr(group_state, "wake_extend_consumed_ref_ts", 0.0) or 0.0)
+        consumed_ref_ts = float(
+            getattr(group_state, "wake_extend_consumed_ref_ts", 0.0) or 0.0
+        )
     except Exception:
         consumed_ref_ts = 0.0
     if ref_ts > consumed_ref_ts:
@@ -1495,6 +1453,7 @@ def _mark_wake_extend_consumed(group_state: GroupState, ref_ts: float) -> None:
 
 
 def _resolve_wake_extend_reference(
+    *,
     uid: str,
     group_state: GroupState,
     member: MemberState,
@@ -1525,10 +1484,11 @@ def is_bot_message_in_wake_extend_window(
     member: MemberState,
     get_cfg: Callable[[str, Any], Any],
 ) -> bool:
+    """检查机器人消息是否处于唤醒延长窗口内。"""
     if not should_skip_bot_wake_type(uid, "wake_extend", get_cfg):
         return False
 
-    wake_extend = float(get_cfg("wake_extend", 0) or 0)
+    wake_extend = float(get_cfg("wake_extend_window", 0) or 0)
     if wake_extend <= 0:
         return False
 
@@ -1543,8 +1503,6 @@ def is_bot_message_in_wake_extend_window(
     if in_window and same_user_only and ref_uid and uid != ref_uid:
         in_window = False
     return in_window
-
-
 
 
 async def evaluate_wake_extend(
@@ -1564,13 +1522,13 @@ async def evaluate_wake_extend(
     评估唤醒延长是否成立。
     返回 (should_wake, reason)。
     """
-    wake_extend = float(get_cfg("wake_extend", 0) or 0)
+    wake_extend = float(get_cfg("wake_extend_window", 0) or 0)
     if wake_extend <= 0:
         return False, None
 
     same_user_only = bool(get_cfg("wake_extend_same_user_only", True))
 
-    # 以群级“最近一次请求用户/时间”为主，历史数据缺失时回退旧状态字段
+    # 以群级“最近一次请求用户/时间”为主，历史数据缺失时回退旧状态字段。
     ref_uid, ref_ts = _resolve_wake_extend_reference(
         uid=uid,
         group_state=group_state,
@@ -1586,7 +1544,7 @@ async def evaluate_wake_extend(
     if _wake_extend_consumed_for_ref(group_state, ref_ts):
         return False, None
 
-    threshold = float(get_cfg("wake_extend_similarity", 0.1) or 0.0)
+    threshold = max(0.0, float(get_cfg("wake_extend_similarity", 0.1) or 0.0))
     adjusted_threshold = compute_wake_extend_batch_threshold(
         threshold=threshold,
         group_state=group_state,
@@ -1596,8 +1554,10 @@ async def evaluate_wake_extend(
         _mark_wake_extend_consumed(group_state, ref_ts)
         return True, "唤醒延长(阈值0)"
 
-    history_count = _get_wake_judge_context_count(get_cfg)
-    timeout_sec = _get_wake_llm_timeout_sec(get_cfg)
+    history_count = max(0, int(get_cfg("wake_judge_context_count", 10)))
+    timeout_sec = max(
+        0.0, float(get_cfg("wake_extend_timeout_sec", WAKE_EXTEND_TIMEOUT_SEC))
+    )
     history_msgs = await get_history_msg(event, history_count)
     if not history_msgs:
         return False, None
@@ -1623,13 +1583,13 @@ async def evaluate_wake_extend(
         logger.debug(
             "[LLMEnhancement] 唤醒延长模型判定未返回有效结果，回退本地相似度："
             f"group={gid}, uid={uid}, threshold={adjusted_threshold:.4f}, "
-            f"batch_count={int(getattr(group_state, 'wake_extend_batch_count', 0) or 0)}"
+            f"batch_count={int(getattr(group_state, 'wake_extend_batch_count', 0) or 0)}",
         )
         simi = await similarity_fn(gid, msg, history_msgs)
         logger.debug(
             f" [LLMEnhancement] 唤醒延长检查(本地回退): 相关系数={simi:.4f}, "
             f"阈值={adjusted_threshold:.4f}, 历史参考={len(history_msgs)}条, "
-            f"batch_count={int(getattr(group_state, 'wake_extend_batch_count', 0) or 0)}"
+            f"batch_count={int(getattr(group_state, 'wake_extend_batch_count', 0) or 0)}",
         )
         if simi >= adjusted_threshold:
             _mark_wake_extend_consumed(group_state, ref_ts)
@@ -1640,7 +1600,7 @@ async def evaluate_wake_extend(
     logger.debug(
         f" [LLMEnhancement] 唤醒延长检查: 相关系数={simi:.4f}, "
         f"阈值={adjusted_threshold:.4f}, 历史参考={len(history_msgs)}条, "
-        f"batch_count={int(getattr(group_state, 'wake_extend_batch_count', 0) or 0)}"
+        f"batch_count={int(getattr(group_state, 'wake_extend_batch_count', 0) or 0)}",
     )
     if simi >= adjusted_threshold:
         _mark_wake_extend_consumed(group_state, ref_ts)

@@ -137,7 +137,11 @@ def extract_json_infos_from_chain(chain: List[Any]) -> Tuple[List[str], List[str
                 seg_type_obj = getattr(seg, "type", None)
                 seg_type_name = str(getattr(seg_type_obj, "name", "")).lower()
                 seg_type_text = str(seg_type_obj).lower()
-                if seg_type_name != "json" and not seg_type_text.endswith(".json") and seg_type_text != "json":
+                if (
+                    seg_type_name != "json"
+                    and not seg_type_text.endswith(".json")
+                    and seg_type_text != "json"
+                ):
                     continue
 
                 seg_data = getattr(seg, "data", None)

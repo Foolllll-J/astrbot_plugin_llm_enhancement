@@ -5,16 +5,16 @@ import os
 import tempfile
 import time
 import uuid
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 from astrbot.api import logger
+from astrbot.api.event import AstrMessageEvent
 import astrbot.api.message_components as Comp
 from astrbot.api.provider import ProviderRequest
 from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import (
     AiocqhttpMessageEvent,
 )
-
-from .state_manager import GroupState
+from .state_manager import GroupState, StateManager
 from .runtime_helpers import (
     _fetch_messages_by_ids,
     _is_unavailable_get_msg_payload,
@@ -2097,6 +2097,49 @@ def append_group_context_message(
         f"total={len(group_state.context_messages)}",
     )
     return True
+
+
+def record_wake_judge_reject_context(
+    event: AstrMessageEvent,
+    gid: str,
+    uid: str,
+    msg: str,
+    get_cfg: Callable[[str, Any], Any],
+) -> None:
+    """唤醒判定拒绝时记录一条上下文，避免后续将“主动不回应”误判为消息丢失。
+
+    仅在上下文注入开启时记录；同一用户连续多次拒绝只保留首条，避免刷屏占用上下文窗口。
+    """
+    if not gid or not is_context_injection_enabled(get_cfg):
+        return
+    g = StateManager.get_group(gid)
+    last = g.context_messages[-1] if g.context_messages else None
+    if (
+        last
+        and str(last.get("source") or "") == "request_judge_reject"
+        and str(last.get("target_uid") or "") == str(uid or "")
+    ):
+        return
+    sender_name = event.get_sender_name() or str(uid) or "某成员"
+    preview = str(msg or "").strip()
+    if len(preview) > 20:
+        preview = preview[:20] + "…"
+    append_group_context_message(
+        g,
+        uid=str(event.get_self_id() or "bot"),
+        sender_name="Bot",
+        message_text=f"已收到{sender_name}的消息（{preview}），但经唤醒判定主动选择不回应，未回复。",
+        max_messages=get_context_injection_max_messages(get_cfg),
+        is_bot=True,
+        source="request_judge_reject",
+        now_ts=time.time(),
+        get_cfg=get_cfg,
+    )
+    if (
+        g.context_messages
+        and g.context_messages[-1].get("source") == "request_judge_reject"
+    ):
+        g.context_messages[-1]["target_uid"] = str(uid or "")
 
 
 def clear_group_context_records(group_state: GroupState) -> int:

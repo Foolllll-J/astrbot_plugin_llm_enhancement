@@ -260,7 +260,8 @@ def apply_merged_message_to_request(
                 pass
 
     event.message_str = merged_msg
-    req.prompt = merged_msg
+    if merged_msg.strip():
+        req.prompt = merged_msg
     return len(senders)
 
 

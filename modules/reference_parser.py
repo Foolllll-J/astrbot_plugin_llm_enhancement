@@ -33,6 +33,7 @@ from .runtime_helpers import (
     _provider_supports_audio_input,
 )
 from .qq_face import build_message_text_with_qq_faces, has_qq_face_segment
+from .wake_logic import contains_forbidden_wake_word
 
 
 VIDEO_FILE_EXTENSIONS = {
@@ -473,6 +474,58 @@ async def inject_current_message_forward_origin_context(
         block_title="消息来源补充",
     )
     return True
+
+
+def _collect_quoted_match_texts(reply_seg: Comp.Reply) -> list[str]:
+    """收集引用消息中参与关键词匹配的文本（纯文本段 + JSON 分享卡片内容）。"""
+    texts: list[str] = []
+    text = str(getattr(reply_seg, "message_str", "") or "").strip()
+    if text:
+        texts.append(text)
+    chain = getattr(reply_seg, "chain", None)
+    if isinstance(chain, list):
+        for seg in chain:
+            if not isinstance(seg, Comp.Json):
+                continue
+            data = getattr(seg, "data", None)
+            if not data:
+                continue
+            try:
+                dumped = (
+                    json.dumps(data, ensure_ascii=False)
+                    if isinstance(data, dict)
+                    else str(data)
+                ).strip()
+            except Exception:
+                dumped = ""
+            if dumped:
+                texts.append(dumped)
+    return list(dict.fromkeys(texts))
+
+
+def check_quote_keyword_block(
+    event: AstrMessageEvent,
+    reply_seg: Comp.Reply,
+    get_cfg: Callable[[str, Any], Any],
+) -> tuple[bool, str]:
+    """检测引用消息内容是否命中关键词屏蔽规则。"""
+    if not event.get_group_id():
+        return False, ""
+    rules = get_cfg("quote_block_keywords", []) or []
+    if not rules:
+        return False, ""
+
+    quoted_texts = _collect_quoted_match_texts(reply_seg)
+    if not quoted_texts:
+        return False, ""
+
+    gid = str(event.get_group_id() or "")
+    uid = str(event.get_sender_id() or "")
+    for text in quoted_texts:
+        hit = contains_forbidden_wake_word(text, rules, gid=gid, uid=uid)
+        if hit:
+            return True, f"引用消息命中关键词屏蔽规则：{hit}"
+    return False, ""
 
 
 async def check_self_reply_block(

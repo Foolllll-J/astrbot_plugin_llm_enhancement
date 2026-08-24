@@ -4,18 +4,21 @@ import io
 import json
 import math
 import re
-import time
 import unicodedata
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Callable, Dict, Optional, Tuple
+from typing import Any, Callable, Dict, Optional
 
 import aiosqlite
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent
 import astrbot.api.message_components as Comp
-from .qq_utils import check_self_only_operation, _parse_user_id_list
+from .qq_utils import (
+    check_self_only_operation,
+    _parse_user_id_list,
+    get_group_info_internal,
+)
 
 try:
     from PIL import Image, ImageDraw, ImageFont
@@ -24,8 +27,6 @@ except Exception:
     ImageDraw = None
     ImageFont = None
 
-CACHE_TTL_SEC = 15
-CACHE_MAX_SIZE = 4096
 FONT_PATH = (
     Path(__file__).resolve().parents[1] / "resources" / "font" / "MiSans-Regular.ttf"
 )
@@ -34,6 +35,11 @@ BLACKLIST_WORDING_HINT = (
     "向用户转述时请使用“拉黑/解除拉黑”表述，不要使用“解封/解禁”表述。"
 )
 BOT_ADMIN_BLOCK_MESSAGE = "这个人是管理员，我不能把他拉黑。"
+BLACKLIST_LEVEL_LABELS = {
+    "llm_only": "LLM 请求",
+    "command_and_llm": "指令与 LLM 请求",
+    "all_messages": "所有消息",
+}
 
 
 def _fmt_user(uid: str, name: str = "") -> str:
@@ -334,44 +340,28 @@ class BlacklistDatabase:
                 user_name TEXT,
                 ban_time TEXT NOT NULL,
                 expire_time TEXT,
-                reason TEXT
+                reason TEXT,
+                level TEXT
             )
             """,
         )
         await self._db.execute(
             "CREATE INDEX IF NOT EXISTS idx_blacklist_expire_time ON blacklist(expire_time)",
         )
+        cursor = await self._db.execute("PRAGMA table_info(blacklist)")
+        columns = [str(row[1] or "") for row in await cursor.fetchall()]
+        if "level" not in columns:
+            await self._db.execute("ALTER TABLE blacklist ADD COLUMN level TEXT")
         await self._db.commit()
 
-    async def get_user_info(self, user_id: str) -> Optional[tuple]:
-        if not self._db:
-            return None
-        cursor = await self._db.execute(
-            "SELECT user_id, user_name, ban_time, expire_time, reason FROM blacklist WHERE user_id = ?",
-            (str(user_id),),
-        )
-        return await cursor.fetchone()
-
-    async def get_blacklist_count(self) -> int:
-        if not self._db:
-            return 0
-        cursor = await self._db.execute("SELECT COUNT(*) FROM blacklist")
-        row = await cursor.fetchone()
-        return int(row[0]) if row else 0
-
-    async def get_blacklist_users(
-        self, page: int = 1, page_size: int = 10
-    ) -> list[tuple]:
+    async def get_all_users(self) -> list[tuple]:
         if not self._db:
             return []
-        offset = max(page - 1, 0) * page_size
         cursor = await self._db.execute(
             """
-            SELECT user_id, user_name, ban_time, expire_time, reason
+            SELECT user_id, user_name, ban_time, expire_time, reason, level
             FROM blacklist
-            ORDER BY ban_time DESC LIMIT ? OFFSET ?
             """,
-            (page_size, offset),
         )
         return await cursor.fetchall()
 
@@ -382,21 +372,36 @@ class BlacklistDatabase:
         user_name: str = "",
         expire_time: Optional[str] = None,
         reason: str = "",
+        level: Optional[str] = None,
     ) -> bool:
         if not self._db:
             return False
         try:
             await self._db.execute(
                 """
-                INSERT OR REPLACE INTO blacklist (user_id, user_name, ban_time, expire_time, reason)
-                VALUES (?, ?, ?, ?, ?)
+                INSERT OR REPLACE INTO blacklist (user_id, user_name, ban_time, expire_time, reason, level)
+                VALUES (?, ?, ?, ?, ?, ?)
                 """,
-                (str(user_id), user_name, ban_time, expire_time, reason),
+                (str(user_id), user_name, ban_time, expire_time, reason, level),
             )
             await self._db.commit()
             return True
         except Exception as e:
             logger.error(f"[LLMEnhancement] 添加黑名单用户失败 {user_id}: {e}")
+            return False
+
+    async def update_user_level(self, user_id: str, level: Optional[str]) -> bool:
+        if not self._db:
+            return False
+        try:
+            await self._db.execute(
+                "UPDATE blacklist SET level = ? WHERE user_id = ?",
+                (level, str(user_id)),
+            )
+            await self._db.commit()
+            return True
+        except Exception as e:
+            logger.error(f"[LLMEnhancement] 更新黑名单等级失败 {user_id}: {e}")
             return False
 
     async def remove_user(self, user_id: str) -> bool:
@@ -413,6 +418,26 @@ class BlacklistDatabase:
             logger.error(f"[LLMEnhancement] 移除黑名单用户失败 {user_id}: {e}")
             return False
 
+    async def remove_users(self, user_ids: list[str]) -> int:
+        if not self._db or not user_ids:
+            return 0
+        try:
+            placeholders = ",".join("?" * len(user_ids))
+            cursor = await self._db.execute(
+                f"DELETE FROM blacklist WHERE user_id IN ({placeholders})",
+                [str(uid) for uid in user_ids],
+            )
+            await self._db.commit()
+            removed = cursor.rowcount if cursor.rowcount is not None else 0
+            if removed < 0:
+                changes_cursor = await self._db.execute("SELECT changes()")
+                row = await changes_cursor.fetchone()
+                removed = int(row[0]) if row else 0
+            return removed
+        except Exception as e:
+            logger.error(f"[LLMEnhancement] 批量移除黑名单用户失败: {e}")
+            return 0
+
     async def clear_blacklist(self) -> bool:
         if not self._db:
             return False
@@ -424,29 +449,15 @@ class BlacklistDatabase:
             logger.error(f"[LLMEnhancement] 清空黑名单失败: {e}")
             return False
 
-    async def cleanup_expired_records(self) -> int:
-        if not self._db:
-            return 0
-        try:
-            now_iso = datetime.now().isoformat()
-            cursor = await self._db.execute(
-                """
-                DELETE FROM blacklist
-                WHERE expire_time IS NOT NULL
-                  AND expire_time <= ?
-                """,
-                (now_iso,),
-            )
-            await self._db.commit()
-            removed = cursor.rowcount if cursor.rowcount is not None else 0
-            if removed < 0:
-                changes_cursor = await self._db.execute("SELECT changes()")
-                row = await changes_cursor.fetchone()
-                removed = int(row[0]) if row else 0
-            return removed
-        except Exception as e:
-            logger.warning(f"[LLMEnhancement] 清理过期黑名单失败: {e}")
-            return 0
+
+@dataclass
+class BlacklistRecord:
+    user_id: str
+    user_name: str
+    ban_time: str
+    expire_time: Optional[str]
+    reason: str
+    level: Optional[str]
 
 
 class BlacklistManager:
@@ -454,37 +465,21 @@ class BlacklistManager:
         self,
         data_dir: str | Path,
         get_cfg: Callable[[str, Any], Any],
+        send_message_cb: Optional[Callable[[str, str], Any]] = None,
     ):
         self._data_dir = Path(data_dir)
         self._db = BlacklistDatabase(self._data_dir / "blacklist.db")
         self._get_cfg = get_cfg
-        self._cache: Dict[str, Tuple[bool, float]] = {}
+        self._send_message_cb = send_message_cb
+        self._records: Dict[str, BlacklistRecord] = {}
 
-    def _set_cache(self, user_id: str, *, blocked: bool, now_ts: float) -> None:
-        if len(self._cache) >= CACHE_MAX_SIZE:
-            expired_keys = [
-                k for k, (_, exp_ts) in self._cache.items() if exp_ts <= now_ts
-            ]
-            for key in expired_keys:
-                self._cache.pop(key, None)
-            if len(self._cache) >= CACHE_MAX_SIZE:
-                self._cache.clear()
-        self._cache[user_id] = (blocked, now_ts + CACHE_TTL_SEC)
-
-    def _get_cache(self, user_id: str, now_ts: float) -> Optional[bool]:
-        cached = self._cache.get(user_id)
-        if not cached:
-            return None
-        if cached[1] <= now_ts:
-            self._cache.pop(user_id, None)
-            return None
-        return cached[0]
-
-    def _invalidate_cache(self, user_id: str) -> None:
-        self._cache.pop(user_id, None)
-
-    def _clear_cache(self) -> None:
-        self._cache.clear()
+    def _is_record_expired(self, record: BlacklistRecord) -> bool:
+        if not record.expire_time:
+            return False
+        expire_dt = _parse_iso_datetime(record.expire_time)
+        if not expire_dt:
+            return False
+        return expire_dt <= datetime.now()
 
     def _cfg_str(self, key: str, default: str) -> str:
         raw = self._get_cfg(key, default)
@@ -496,11 +491,45 @@ class BlacklistManager:
     def allow_blacklist_bot_admin(self) -> bool:
         return bool(self._get_cfg("allow_blacklist_bot_admin", False))
 
+    def allow_blacklist_level_param(self) -> bool:
+        return bool(self._get_cfg("allow_blacklist_level_param", False))
+
     def blacklist_intercept_level(self) -> str:
         raw = self._cfg_str("blacklist_intercept_level", "llm_only").lower()
         if raw in {"llm_only", "command_and_llm", "all_messages"}:
             return raw
         return "llm_only"
+
+    def _normalize_level(self, raw: Any) -> Optional[str]:
+        text = str(raw or "").strip().lower()
+        if text in BLACKLIST_LEVEL_LABELS:
+            return text
+        return None
+
+    def _level_label(self, level: Optional[str]) -> str:
+        normalized = self._normalize_level(level)
+        if not normalized:
+            return ""
+        return BLACKLIST_LEVEL_LABELS.get(normalized, "")
+
+    def _get_notify_sessions(self) -> list[str]:
+        raw_sessions = self._get_cfg("blacklist_notify_sessions", []) or []
+        if not isinstance(raw_sessions, (list, tuple, set)):
+            return []
+        sessions: list[str] = []
+        for item in raw_sessions:
+            text = str(item or "").strip()
+            if text:
+                sessions.append(text)
+        return sessions
+
+    async def _effective_intercept_level_for(self, user_id: str) -> str:
+        record = self._records.get(user_id)
+        if record:
+            record_level = self._normalize_level(record.level)
+            if record_level:
+                return record_level
+        return self.blacklist_intercept_level()
 
     def _should_render_image(self) -> bool:
         mode = self._cfg_str("blacklist_output_mode", "image").lower()
@@ -538,28 +567,54 @@ class BlacklistManager:
     async def initialize(self) -> None:
         self._data_dir.mkdir(parents=True, exist_ok=True)
         await self._db.initialize()
+        await self._load_all_records()
+
+    async def _load_all_records(self) -> None:
+        """启动时全量加载黑名单到内存镜像。加载失败仅记日志，空镜像继续运行。"""
+        try:
+            rows = await self._db.get_all_users()
+        except Exception as e:
+            logger.error(f"[LLMEnhancement] 黑名单全量加载失败，内存镜像为空: {e}")
+            return
+        expired_ids: list[str] = []
+        for row in rows:
+            record = BlacklistRecord(
+                user_id=str(row[0] or ""),
+                user_name=str(row[1] or ""),
+                ban_time=str(row[2] or ""),
+                expire_time=row[3],
+                reason=str(row[4] or ""),
+                level=row[5],
+            )
+            if self._is_record_expired(record):
+                expired_ids.append(record.user_id)
+                continue
+            self._records[record.user_id] = record
+        if expired_ids:
+            removed = await self._db.remove_users(expired_ids)
+            logger.info(
+                f"[LLMEnhancement] 黑名单加载时过滤过期记录 {len(expired_ids)} 条"
+                f"（数据库清理 {removed} 条）。"
+            )
 
     async def terminate(self) -> None:
         await self._db.terminate()
 
     async def _cleanup_expired_on_query(self) -> None:
-        removed = await self._db.cleanup_expired_records()
-        if removed > 0:
-            self._clear_cache()
-            logger.info(f"[LLMEnhancement] 黑名单清理过期记录 {removed} 条。")
-
-    async def _is_user_blacklisted_now(self, user_id: str) -> bool:
-        user = await self._db.get_user_info(user_id)
-        if not user:
-            return False
-
-        expire_time = user[3]
-        expire_dt = _parse_iso_datetime(expire_time) if expire_time else None
-        if expire_dt and expire_dt <= datetime.now():
-            await self._db.remove_user(user_id)
-            self._invalidate_cache(user_id)
-            return False
-        return True
+        expired_ids = [
+            user_id
+            for user_id, record in self._records.items()
+            if self._is_record_expired(record)
+        ]
+        if not expired_ids:
+            return
+        for user_id in expired_ids:
+            self._records.pop(user_id, None)
+        removed = await self._db.remove_users(expired_ids)
+        logger.info(
+            f"[LLMEnhancement] 黑名单清理过期记录 {len(expired_ids)} 条"
+            f"（数据库清理 {removed} 条）。"
+        )
 
     def _parse_duration_seconds(
         self, duration: Any
@@ -681,16 +736,20 @@ class BlacklistManager:
         if not user_id:
             return False
 
-        now_ts = time.time()
-        cached = self._get_cache(user_id, now_ts)
-        if cached is not None:
-            return cached
+        record = self._records.get(user_id)
+        if not record:
+            return False
 
-        blocked = await self._is_user_blacklisted_now(user_id)
-        self._set_cache(user_id, blocked=blocked, now_ts=now_ts)
-        return blocked
+        if self._is_record_expired(record):
+            self._records.pop(user_id, None)
+            await self._db.remove_user(user_id)
+            logger.info(f"[LLMEnhancement] 黑名单记录已过期，自动移除 {user_id}。")
+            return False
+        return True
 
-    async def intercept_event(self, event: AstrMessageEvent) -> bool:
+    async def intercept_event(
+        self, event: AstrMessageEvent, command_trigger: bool = False
+    ) -> bool:
         sender_id = str(event.get_sender_id() or "")
         if not sender_id:
             return False
@@ -699,9 +758,16 @@ class BlacklistManager:
         if not blocked:
             return False
 
-        logger.debug(f"[LLMEnhancement] {sender_id} 在黑名单中，已拦截消息。")
-        event.stop_event()
-        return True
+        effective_level = await self._effective_intercept_level_for(sender_id)
+        if effective_level == "all_messages":
+            logger.debug(f"[LLMEnhancement] {sender_id} 在黑名单中，已拦截消息。")
+            event.stop_event()
+            return True
+        if effective_level == "command_and_llm" and command_trigger:
+            logger.debug(f"[LLMEnhancement] {sender_id} 在黑名单中，已拦截指令消息。")
+            event.stop_event()
+            return True
+        return False
 
     async def intercept_llm_request(self, event: AstrMessageEvent) -> bool:
         sender_id = str(event.get_sender_id() or "")
@@ -715,6 +781,93 @@ class BlacklistManager:
         logger.debug(f"[LLMEnhancement] {sender_id} 在黑名单中，已拦截 LLM 请求。")
         event.stop_event()
         return True
+
+    def _schedule_block_notify(
+        self,
+        *,
+        event: AstrMessageEvent,
+        users: list[tuple[str, str]],
+        duration: int,
+        reason: str,
+        level: Optional[str],
+    ) -> None:
+        if not users:
+            return
+        if self._send_message_cb is None:
+            return
+        sessions = self._get_notify_sessions()
+        if not sessions:
+            return
+        asyncio.create_task(
+            self._notify_block_task(
+                event=event,
+                users=users,
+                duration=duration,
+                reason=reason,
+                level=level,
+                sessions=sessions,
+            )
+        )
+
+    async def _notify_block_task(
+        self,
+        *,
+        event: AstrMessageEvent,
+        users: list[tuple[str, str]],
+        duration: int,
+        reason: str,
+        level: Optional[str],
+        sessions: list[str],
+    ) -> None:
+        try:
+            text = await self._build_block_notify_text(
+                event=event,
+                users=users,
+                duration=duration,
+                reason=reason,
+                level=level,
+            )
+        except Exception as e:
+            logger.warning(f"[LLMEnhancement] 构建拉黑通知失败: {e}")
+            return
+        for umo in sessions:
+            try:
+                await self._send_message_cb(umo, text)
+            except Exception as e:
+                logger.warning(f"[LLMEnhancement] 拉黑通知发送失败 umo={umo}: {e}")
+
+    async def _build_block_notify_text(
+        self,
+        *,
+        event: AstrMessageEvent,
+        users: list[tuple[str, str]],
+        duration: int,
+        reason: str,
+        level: Optional[str],
+    ) -> str:
+        lines = ["【黑名单通知】"]
+        user_text = "、".join(_fmt_user(tid, name) for tid, name in users)
+        lines.append(f"用户: {user_text}")
+        gid = str(event.get_group_id() or "").strip()
+        if gid:
+            group_label = gid
+            try:
+                group_info = await get_group_info_internal(event, group_id=gid)
+                if group_info:
+                    group_name = str(
+                        group_info.get("group_name") or group_info.get("name") or ""
+                    ).strip()
+                    if group_name:
+                        group_label = f"{group_name}({gid})"
+            except Exception:
+                pass
+            lines.append(f"群: {group_label}")
+        lines.append(f"时长: {duration if duration and duration > 0 else '永久'}")
+        if reason:
+            lines.append(f"原因: {reason}")
+        if level:
+            lines.append(f"等级: {self._level_label(level)}")
+        return "\n".join(lines)
 
     def _format_datetime(
         self,
@@ -801,7 +954,7 @@ class BlacklistManager:
 
         page = max(1, int(page or 1))
         page_size = max(1, min(int(page_size or 10), 50))
-        total_count = await self._db.get_blacklist_count()
+        total_count = len(self._records)
         if total_count == 0:
             return BlacklistCommandResult(text="黑名单为空。")
 
@@ -809,7 +962,11 @@ class BlacklistManager:
         if page > total_pages:
             page = total_pages
 
-        users = await self._db.get_blacklist_users(page, page_size)
+        sorted_records = sorted(
+            self._records.values(), key=lambda r: r.ban_time, reverse=True
+        )
+        offset = (page - 1) * page_size
+        users = sorted_records[offset : offset + page_size]
 
         text_headers = [
             self._pad_for_table("序号", 4),
@@ -831,7 +988,13 @@ class BlacklistManager:
         table_rows: list[list[str]] = []
 
         for idx, user in enumerate(users, start=1 + (page - 1) * page_size):
-            user_id, user_name, ban_time, expire_time, reason = user
+            user_id, user_name, ban_time, expire_time, reason = (
+                user.user_id,
+                user.user_name,
+                user.ban_time,
+                user.expire_time,
+                user.reason,
+            )
             text_cells = [
                 self._pad_for_table(str(idx), 4),
                 self._pad_for_table(str(user_id or ""), 14),
@@ -888,20 +1051,28 @@ class BlacklistManager:
         if not target_id:
             return BlacklistCommandResult(text="请提供用户 ID 或 @目标用户。")
 
-        user = await self._db.get_user_info(target_id)
-        if not user:
+        record = self._records.get(target_id)
+        if not record:
             return BlacklistCommandResult(
                 text=f"{_fmt_user(target_id, target_name)} 不在黑名单中。"
             )
 
-        _uid, user_name, ban_time, expire_time, reason = user
+        user_name, ban_time, expire_time, reason, level = (
+            record.user_name,
+            record.ban_time,
+            record.expire_time,
+            record.reason,
+            record.level,
+        )
         display_name = user_name or ""
+        level_label = self._level_label(level)
         text_lines = [
             f"{_fmt_user(target_id, display_name)} 的黑名单信息",
             "=" * 36,
             f"用户名: {display_name or '未知'}",
             f"加入时间: {self._format_datetime(ban_time)}",
             f"过期时间: {self._format_datetime(expire_time, show_remaining=True, check_expire=True)}",
+            f"等级: {level_label}",
             f"原因: {reason or '无'}",
         ]
         text = "\n".join(text_lines)
@@ -909,15 +1080,18 @@ class BlacklistManager:
             expire_str = self._format_datetime(
                 expire_time, show_remaining=True, check_expire=True
             )
+            info_rows = [
+                ["用户名", user_name or "未知"],
+                ["加入时间", self._format_datetime(ban_time)],
+                ["过期时间", expire_str],
+            ]
+            if level_label:
+                info_rows.append(["等级", level_label])
+            info_rows.append(["原因", reason or "无"])
             image_base64 = await table_to_image_base64(
                 title=f"{_fmt_user(target_id, display_name)}",
                 headers=["字段", "值"],
-                rows=[
-                    ["用户名", user_name or "未知"],
-                    ["加入时间", self._format_datetime(ban_time)],
-                    ["过期时间", expire_str],
-                    ["原因", reason or "无"],
-                ],
+                rows=info_rows,
                 max_col_widths=[120, 600],
                 show_header=False,
             )
@@ -992,7 +1166,14 @@ class BlacklistManager:
                 fail_messages.append(f"{_fmt_user(tid, tname)} 写入失败")
                 continue
 
-            self._invalidate_cache(tid)
+            self._records[tid] = BlacklistRecord(
+                user_id=tid,
+                user_name=tname,
+                ban_time=ban_time,
+                expire_time=expire_time,
+                reason=reason or "",
+                level=None,
+            )
             success_items.append((tid, tname))
 
         parts: list[str] = []
@@ -1030,18 +1211,17 @@ class BlacklistManager:
         not_found_ids: list[str] = []
         fail_messages: list[str] = []
         for tid in ids:
-            user = await self._db.get_user_info(tid)
-            if not user:
+            record = self._records.get(tid)
+            if not record:
                 not_found_ids.append(tid)
                 continue
 
-            _uid, user_name, _bt, _et, _rs = user
             ok = await self._db.remove_user(tid)
             if not ok:
-                fail_messages.append(f"{_fmt_user(tid, user_name)} 删除失败")
+                fail_messages.append(f"{_fmt_user(tid, record.user_name)} 删除失败")
                 continue
-            self._invalidate_cache(tid)
-            success_items.append((tid, user_name))
+            self._records.pop(tid, None)
+            success_items.append((tid, record.user_name))
 
         parts: list[str] = []
         if success_items:
@@ -1060,14 +1240,14 @@ class BlacklistManager:
     async def command_clear(self) -> str:
         await self._cleanup_expired_on_query()
 
-        count = await self._db.get_blacklist_count()
+        count = len(self._records)
         if count == 0:
             return "黑名单已经为空。"
 
         ok = await self._db.clear_blacklist()
         if not ok:
             return "清空黑名单时出错。"
-        self._clear_cache()
+        self._records.clear()
         return f"黑名单已清空，共移除 {count} 个用户。"
 
     async def tool_block_user(
@@ -1077,6 +1257,7 @@ class BlacklistManager:
         user_name: str = "",
         duration: int = 0,
         reason: str = "",
+        level: str = "",
     ) -> str:
         await self._cleanup_expired_on_query()
 
@@ -1108,6 +1289,14 @@ class BlacklistManager:
                 ensure_ascii=False,
             )
 
+        level_val = self._normalize_level(level)
+        invalid_level_hint = ""
+        if self.allow_blacklist_level_param():
+            if str(level or "").strip() and not level_val:
+                invalid_level_hint = "，等级参数无效，已按默认处理"
+        else:
+            level_val = None
+
         actual_duration = parsed_duration or 0
         max_duration = self.max_blacklist_duration()
         if actual_duration == 0 and max_duration > 0:
@@ -1123,12 +1312,11 @@ class BlacklistManager:
             ).isoformat()
 
         target_name = str(user_name or "").strip()
-        if not target_name:
-            target_name = str(event.get_sender_name() or "")
 
         results = []
         success_count = 0
         fail_count = 0
+        notify_users: list[tuple[str, str]] = []
 
         for target_user_id in user_id_list:
             target_user_id = str(target_user_id or "").strip()
@@ -1160,12 +1348,27 @@ class BlacklistManager:
                 continue
 
             # 检查是否已在黑名单
-            if await self._db.get_user_info(target_user_id):
+            existing_record = self._records.get(target_user_id)
+            if existing_record:
+                existing_level = self._normalize_level(existing_record.level)
+                level_updated = False
+                if level_val and level_val != existing_level:
+                    level_updated = await self._db.update_user_level(
+                        target_user_id, level_val
+                    )
+                    if level_updated:
+                        existing_record.level = level_val
+                message = (
+                    f"{_fmt_user(target_user_id, target_name)} 已在黑名单中，已更新等级"
+                    if level_updated
+                    else f"{_fmt_user(target_user_id, target_name)} 已在黑名单中，无需重复添加"
+                )
                 results.append(
                     {
                         "success": True,
-                        "message": f"{_fmt_user(target_user_id, target_name)} 已在黑名单中，无需重复添加。",
+                        "message": message + invalid_level_hint + "。",
                         "user_id": target_user_id,
+                        "level": level_val or "",
                         "wording_hint": BLACKLIST_WORDING_HINT,
                     }
                 )
@@ -1184,6 +1387,7 @@ class BlacklistManager:
                 ban_time=ban_time,
                 expire_time=expire_time,
                 reason=reason or "",
+                level=level_val,
             )
             if not ok:
                 fail_count += 1
@@ -1196,18 +1400,27 @@ class BlacklistManager:
                 )
                 continue
 
-            self._invalidate_cache(target_user_id)
+            self._records[target_user_id] = BlacklistRecord(
+                user_id=target_user_id,
+                user_name=current_target_name,
+                ban_time=ban_time,
+                expire_time=expire_time,
+                reason=reason or "",
+                level=level_val,
+            )
             logger.info(
                 f"[LLMEnhancement] {target_user_id} 已由 {sender_id} 通过 LLM 工具拉黑。"
             )
+            notify_users.append((target_user_id, current_target_name))
             results.append(
                 {
                     "success": True,
-                    "message": f"{_fmt_user(target_user_id, current_target_name)} 已拉黑。",
+                    "message": f"{_fmt_user(target_user_id, current_target_name)} 已拉黑{invalid_level_hint}。",
                     "user_id": target_user_id,
                     "user_name": current_target_name,
                     "duration": actual_duration if actual_duration > 0 else "永久",
                     "reason": reason,
+                    "level": level_val or "",
                     "hint": "操作已生效。"
                     if not is_self_defense
                     else "操作已生效，将来这段时间内对方向你发送的消息将被屏蔽。",
@@ -1215,6 +1428,15 @@ class BlacklistManager:
                 }
             )
             success_count += 1
+
+        if notify_users:
+            self._schedule_block_notify(
+                event=event,
+                users=notify_users,
+                duration=actual_duration,
+                reason=reason or "",
+                level=level_val,
+            )
 
         if len(user_id_list) == 1:
             if results and results[0].get("success"):
@@ -1275,8 +1497,8 @@ class BlacklistManager:
                 )
                 continue
 
-            user = await self._db.get_user_info(target_user_id)
-            if not user:
+            record = self._records.get(target_user_id)
+            if not record:
                 results.append(
                     {
                         "success": True,
@@ -1289,7 +1511,7 @@ class BlacklistManager:
                 success_count += 1
                 continue
 
-            _uid, user_name, _ban_time, _expire_time, _reason = user
+            user_name = record.user_name
             ok = await self._db.remove_user(target_user_id)
             if not ok:
                 fail_count += 1
@@ -1302,7 +1524,7 @@ class BlacklistManager:
                 )
                 continue
 
-            self._invalidate_cache(target_user_id)
+            self._records.pop(target_user_id, None)
             logger.info(
                 f"[LLMEnhancement] {target_user_id} 已由 {sender_id} 通过 LLM 工具解除拉黑。"
             )
@@ -1342,7 +1564,7 @@ class BlacklistManager:
 
         page = max(1, int(page or 1))
         page_size = max(1, min(int(page_size or 20), 50))
-        total_count = await self._db.get_blacklist_count()
+        total_count = len(self._records)
         if total_count == 0:
             return json.dumps(
                 {
@@ -1363,17 +1585,21 @@ class BlacklistManager:
         if page > total_pages:
             page = total_pages
 
-        users_data = await self._db.get_blacklist_users(page, page_size)
+        sorted_records = sorted(
+            self._records.values(), key=lambda r: r.ban_time, reverse=True
+        )
+        offset = (page - 1) * page_size
+        page_records = sorted_records[offset : offset + page_size]
         users = []
-        for user in users_data:
-            user_id, user_name, ban_time, expire_time, reason = user
+        for record in page_records:
             users.append(
                 {
-                    "user_id": user_id,
-                    "user_name": user_name or "",
-                    "ban_time": ban_time,
-                    "expire_time": expire_time if expire_time else "永久",
-                    "reason": reason if reason else "无",
+                    "user_id": record.user_id,
+                    "user_name": record.user_name or "",
+                    "ban_time": record.ban_time,
+                    "expire_time": record.expire_time if record.expire_time else "永久",
+                    "reason": record.reason if record.reason else "无",
+                    "level": record.level or "",
                 },
             )
 
@@ -1426,22 +1652,21 @@ class BlacklistManager:
                 )
                 continue
 
-            user_info = await self._db.get_user_info(target_id)
-            if user_info:
-                uid, user_name, ban_time, expire_time, reason = user_info
+            record = self._records.get(target_id)
+            if record:
                 results.append(
                     {
                         "is_blacklisted": True,
-                        "user_id": uid,
-                        "user_name": user_name or "",
-                        "ban_time": ban_time,
-                        "expire_time": expire_time if expire_time else "永久",
-                        "reason": reason if reason else "无",
+                        "user_id": record.user_id,
+                        "user_name": record.user_name or "",
+                        "ban_time": record.ban_time,
+                        "expire_time": record.expire_time if record.expire_time else "永久",
+                        "reason": record.reason if record.reason else "无",
+                        "level": record.level or "",
                         "expire_time_hint": "expire_time 表示黑名单失效时间，失效后意味着你将其移出黑名单。",
                         "wording_hint": BLACKLIST_WORDING_HINT,
                     }
                 )
-                success_count += 1
             else:
                 results.append(
                     {
@@ -1450,7 +1675,7 @@ class BlacklistManager:
                         "wording_hint": BLACKLIST_WORDING_HINT,
                     }
                 )
-                success_count += 1
+            success_count += 1
 
         if len(user_id_list) == 1:
             return json.dumps(

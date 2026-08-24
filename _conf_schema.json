@@ -217,6 +217,12 @@
                         "type": "list",
                         "default": []
                     },
+                    "quote_block_keywords": {
+                        "description": "引用消息屏蔽规则",
+                        "hint": "命中被引用消息（纯文本或分享卡片）中的规则时直接屏蔽该请求。格式同屏蔽唤醒规则，留空表示不启用。",
+                        "type": "list",
+                        "default": []
+                    },
                     "require_at_for_wake_prefix": {
                         "description": "唤醒需 @Bot",
                         "hint": "开启后，仅通过唤醒前缀触发的 LLM 请求会被拦截，必须 @Bot 或引用 Bot 消息才放行。",
@@ -967,11 +973,11 @@
                 "description": "黑名单最长时长（秒）",
                 "hint": "仅对 LLM 工具生效。设置为 0 表示允许永久拉黑。"
             },
-            "allow_blacklist_bot_admin": {
-                "type": "bool",
-                "default": false,
-                "description": "允许拉黑 Bot 管理员",
-                "hint": "默认关闭。开启后可拉黑 Bot 管理员，需谨慎操作。"
+            "blacklist_notify_sessions": {
+                "type": "list",
+                "default": [],
+                "description": "拉黑通知会话 (UMO)",
+                "hint": "LLM 工具拉黑成功时向这些会话发送通知。填入完整会话标识，如 aiocqhttp:GroupMessage:123456。留空则不发送通知。"
             },
             "blacklist_output_mode": {
                 "type": "string",
@@ -986,6 +992,18 @@
                 ],
                 "description": "黑名单输出模式",
                 "hint": "列表和详情命令的输出形式。"
+            },
+            "allow_blacklist_level_param": {
+                "type": "bool",
+                "default": false,
+                "description": "允许拉黑工具等级参数生效",
+                "hint": "默认关闭。开启后 LLM 工具传入的拉黑等级参数才会生效。"
+            },
+            "allow_blacklist_bot_admin": {
+                "type": "bool",
+                "default": false,
+                "description": "允许拉黑 Bot 管理员",
+                "hint": "默认关闭。开启后可拉黑 Bot 管理员，需谨慎操作。"
             }
         }
     }

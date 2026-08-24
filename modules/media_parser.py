@@ -1026,6 +1026,8 @@ class MediaFrameProcessor:
                 return True
             else:
                 logger.warning("[媒体处理] 视频转述生成失败，回退到首帧")
+                if asr_text:
+                    append_text_part_to_request(req, f"[语音转写] {asr_text}\n")
                 req.image_urls.append(frames[0])
                 for frame in frames:
                     req._cleanup_paths = req._cleanup_paths or []

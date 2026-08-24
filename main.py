@@ -8,6 +8,7 @@ from astrbot.api.star import Context, Star, StarTools
 from astrbot.api import logger, AstrBotConfig
 import astrbot.api.message_components as Comp
 from astrbot.api.provider import LLMResponse, ProviderRequest
+from astrbot.core.message.message_event_result import MessageChain
 from astrbot.core.utils.session_waiter import session_waiter, SessionController
 from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import (
     AiocqhttpMessageEvent,
@@ -25,6 +26,7 @@ from .modules.media_parser import MediaFrameProcessor as _MediaFrameProcessor
 from .modules.forward_parser import process_forward_record_content
 from .modules.reference_parser import (
     check_self_reply_block,
+    check_quote_keyword_block,
     process_reference_context,
     inject_current_message_image_context,
     inject_current_message_forward_origin_context,
@@ -63,6 +65,7 @@ from .modules.qq_utils import (
     dismiss_group_logic,
     set_group_ban_logic,
 )
+from .modules.qq_utils import RISK_TOOL_IDS, normalize_tool_selection
 from .modules.blacklist import BlacklistManager
 from .modules.runtime_helpers import (
     EffectiveDialogHistory,
@@ -162,6 +165,7 @@ from .modules.dialogue_context import (
     append_notice_context_from_raw,
     inject_active_wake_note_into_request,
     inject_context_into_request,
+    record_wake_judge_reject_context,
     clear_context_records_for_group,
 )
 # ==================== 常量定义 ====================
@@ -354,6 +358,7 @@ class LLMEnhancement(Star):
         self.blacklist = BlacklistManager(
             data_dir=StarTools.get_data_dir("astrbot_plugin_llm_enhancement"),
             get_cfg=self._get_cfg,
+            send_message_cb=self._send_blacklist_notify,
         )
         logger.info("[LLMEnhancement] 插件初始化完成。")
 
@@ -381,6 +386,29 @@ class LLMEnhancement(Star):
     async def initialize(self):
         await self._load_caches_from_kv()
         await self.blacklist.initialize()
+        await self._sync_risk_tool_mounts()
+
+    async def _sync_risk_tool_mounts(self) -> None:
+        """按 enabled_risk_tools 配置卸载未启用的风险工具，避免其出现在 LLM 工具提示词中。"""
+        try:
+            enabled_tools = normalize_tool_selection(
+                self._get_cfg("enabled_risk_tools", [])
+            )
+            tool_manager = self.context.get_llm_tool_manager()
+            removed_tools: list[str] = []
+            for tool_id in RISK_TOOL_IDS:
+                if tool_id in enabled_tools:
+                    continue
+                if tool_manager.get_func(tool_id) is not None:
+                    tool_manager.remove_func(tool_id)
+                    removed_tools.append(tool_id)
+            if removed_tools:
+                logger.debug(
+                    "[LLMEnhancement] 风险工具未启用，已从工具列表卸载: "
+                    + ", ".join(removed_tools)
+                )
+        except Exception as e:
+            logger.warning(f"[LLMEnhancement] 风险工具同步失败: {e}")
 
     def _refresh_config(self):
         """将 object 格式的配置平铺到 self.cfg 中"""
@@ -433,6 +461,12 @@ class LLMEnhancement(Star):
         if key in self.cfg:
             return self.cfg[key]
         return self.config.get(key, default)
+
+    async def _send_blacklist_notify(self, umo: str, text: str) -> None:
+        """向指定会话主动发送拉黑通知（框架封装，支持主动消息的平台）。"""
+        chain = MessageChain()
+        chain.chain = [Comp.Plain(text=text)]
+        await self.context.send_message(umo, chain)
 
     def _get_private_typing_task_key(self, event: AstrMessageEvent) -> str:
         key = str(getattr(event, "unified_msg_origin", "") or "").strip()
@@ -825,14 +859,11 @@ class LLMEnhancement(Star):
         if uid == bid:
             return
 
-        # 1. 内置黑名单拦截（三档：仅LLM/指令+LLM/全消息）
-        blacklist_level = self.blacklist.blacklist_intercept_level()
-        if blacklist_level == "all_messages":
-            if await self.blacklist.intercept_event(event):
-                return
-        elif blacklist_level == "command_and_llm" and command_trigger_event:
-            if await self.blacklist.intercept_event(event):
-                return
+        # 1. 内置黑名单拦截（三档：仅LLM/指令+LLM/全消息，记录级等级覆盖全局配置）
+        if await self.blacklist.intercept_event(
+            event, command_trigger=command_trigger_event
+        ):
+            return
 
         # 仅在群聊环境下检查群黑白名单。
         if gid:
@@ -2615,6 +2646,7 @@ class LLMEnhancement(Star):
         user_name: str = "",
         duration: int = 0,
         reason: str = "",
+        level: str = "",
     ) -> str:
         """
         将指定用户加入黑名单，加入后将忽略对方消息。
@@ -2625,6 +2657,7 @@ class LLMEnhancement(Star):
             user_name (str, optional): 目标用户昵称（可选）。可用于黑名单记录展示。
             duration (int, optional): 拉黑时长（秒）。0 表示按 max_blacklist_duration 处理（其值为 0 时表示永久）；60-600 适合轻度冷却/短时不回应；600-3600 适合明确隔离；86400 及以上用于高风险持续骚扰场景。
             reason (str, optional): 拉黑原因，用于记录与审计。
+            level (str, optional): 拉黑等级。可选值：llm_only（仅拦截 LLM 请求）、command_and_llm（拦截指令与 LLM 请求）、all_messages（拦截所有消息）。不传或传空时使用全局配置。
         """
         return await self.blacklist.tool_block_user(
             event=event,
@@ -2632,6 +2665,7 @@ class LLMEnhancement(Star):
             user_name=user_name,
             duration=duration,
             reason=reason,
+            level=level,
         )
 
     @filter.llm_tool(name="unblock_user")
@@ -3071,6 +3105,20 @@ class LLMEnhancement(Star):
                     reply_seg_for_self_block = seg
                     break
             if reply_seg_for_self_block:
+                blocked_by_quote_keyword, quote_keyword_reason = (
+                    check_quote_keyword_block(
+                        event=event,
+                        reply_seg=reply_seg_for_self_block,
+                        get_cfg=self._get_cfg,
+                    )
+                )
+                if blocked_by_quote_keyword:
+                    logger.debug(
+                        "[LLMEnhancement] on_llm_request 提前拦截：引用消息命中关键词屏蔽。"
+                        f"group={gid or 'private'}, uid={uid}, reason={quote_keyword_reason}",
+                    )
+                    event.stop_event()
+                    return
                 (
                     blocked_by_self_reply,
                     self_reply_block_reason,
@@ -3111,6 +3159,14 @@ class LLMEnhancement(Star):
                     "[LLMEnhancement] on_llm_request 拦截：显式唤醒判定未通过，已取消本次 LLM 请求。"
                     f"group={gid or 'private'}, uid={uid}, reason={wake_reason}, detail={wake_judge_detail}",
                 )
+                if str(wake_judge_detail or "").startswith("model:F"):
+                    record_wake_judge_reject_context(
+                        event=event,
+                        gid=gid,
+                        uid=uid,
+                        msg=str(event.message_str or ""),
+                        get_cfg=self._get_cfg,
+                    )
                 event.stop_event()
                 return
 

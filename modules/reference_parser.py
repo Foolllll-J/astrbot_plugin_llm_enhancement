@@ -29,11 +29,23 @@ from .runtime_helpers import (
     cleanup_paths_later,
     append_text_part_to_request,
     resolve_record_file_path,
+    resolve_provider,
     get_llm_provider,
     _provider_supports_audio_input,
 )
+from .dialogue_context import (
+    _provider_supports_image_input,
+    _resolve_image_input_from_segment_data,
+    select_image_caption_provider,
+    try_get_image_caption,
+)
 from .qq_face import build_message_text_with_qq_faces, has_qq_face_segment
 from .wake_logic import contains_forbidden_wake_word
+
+try:
+    from astrbot.core.utils.quoted_message import extract_quoted_message_images
+except Exception:
+    extract_quoted_message_images = None
 
 
 VIDEO_FILE_EXTENSIONS = {
@@ -656,6 +668,146 @@ async def check_self_reply_block(
     return False, ""
 
 
+def _provider_identity(provider: Any) -> str:
+    provider_cfg = getattr(provider, "provider_config", None)
+    if isinstance(provider_cfg, dict):
+        return str(
+            provider_cfg.get("id")
+            or provider_cfg.get("provider_id")
+            or provider_cfg.get("name")
+            or ""
+        ).strip()
+    return str(
+        getattr(provider, "id", None)
+        or getattr(provider, "provider_id", None)
+        or getattr(provider, "name", None)
+        or ""
+    ).strip()
+
+
+async def _inject_quoted_image_context(
+    *,
+    event: AstrMessageEvent,
+    context: Any,
+    req: ProviderRequest,
+    image_segments: list[dict[str, Any]],
+    fallback_image_refs: Optional[list[str]],
+    get_cfg: Callable[[str, Any], Any],
+) -> tuple[int, int]:
+    """将引用图片注入视觉请求，或用可用视觉 Provider 转成文字。"""
+    segments = list(image_segments or [])
+    for image_ref in fallback_image_refs or []:
+        ref = str(image_ref or "").strip()
+        if ref:
+            segments.append({"type": "image", "data": {"url": ref}})
+    if not segments:
+        return 0, 0
+
+    if not hasattr(req, "image_urls") or req.image_urls is None:
+        req.image_urls = []
+    existing_urls = {
+        str(item).strip() for item in req.image_urls or [] if str(item).strip()
+    }
+
+    current_provider = None
+    request_provider_id = str(getattr(req, "provider_id", "") or "").strip()
+    if request_provider_id:
+        current_provider = resolve_provider(context, request_provider_id)
+    if current_provider is None:
+        current_provider = get_llm_provider(context=context, event=event)
+    if _provider_supports_image_input(current_provider):
+        injected_count = 0
+        for segment in segments:
+            image_input = await _resolve_image_input_from_segment_data(
+                event,
+                segment.get("data") or {},
+            )
+            if not image_input or image_input in existing_urls:
+                continue
+            req.image_urls.append(image_input)
+            existing_urls.add(image_input)
+            injected_count += 1
+        return injected_count, 0
+
+    try:
+        framework_provider_settings = (
+            context.get_config(umo=event.unified_msg_origin).get(
+                "provider_settings",
+                {},
+            )
+            or {}
+        )
+    except Exception:
+        framework_provider_settings = {}
+
+    caption_provider = select_image_caption_provider(
+        get_cfg=get_cfg,
+        provider_by_id_resolver=lambda provider_id: resolve_provider(
+            context,
+            provider_id,
+        ),
+        default_provider_resolver=lambda: get_llm_provider(
+            context=context,
+            event=event,
+        ),
+        framework_provider_settings=framework_provider_settings,
+        provider_candidates_resolver=getattr(context, "get_all_providers", None),
+    )
+    caption_provider_id = _provider_identity(caption_provider)
+    if not caption_provider_id:
+        return 0, 0
+
+    caption_count = 0
+    for segment in segments:
+        caption = await try_get_image_caption(
+            event=event,
+            message_chain=[segment],
+            raw_image_datas=None,
+            get_cfg=get_cfg,
+            provider_by_id_resolver=lambda provider_id: resolve_provider(
+                context,
+                provider_id,
+            ),
+            default_provider_resolver=None,
+            preferred_provider_id=caption_provider_id,
+            allow_default_provider=False,
+            timeout_sec=0,
+            framework_provider_settings=framework_provider_settings,
+            provider_candidates_resolver=getattr(context, "get_all_providers", None),
+        )
+        if not caption:
+            continue
+        caption_text = f"<image_caption>{caption}</image_caption>"
+        if not append_text_part_to_request(req, caption_text, mark_temp=False):
+            req.prompt = f"{(req.prompt or '').strip()}\n\n{caption_text}".strip()
+        caption_count += 1
+    return 0, caption_count
+
+
+async def _inject_quoted_image_fallback(
+    *,
+    event: AstrMessageEvent,
+    context: Any,
+    req: ProviderRequest,
+    reply_seg: Comp.Reply,
+    get_cfg: Callable[[str, Any], Any],
+) -> None:
+    if extract_quoted_message_images is None:
+        return
+    try:
+        fallback_images = await extract_quoted_message_images(event, reply_seg)
+        await _inject_quoted_image_context(
+            event=event,
+            context=context,
+            req=req,
+            image_segments=[],
+            fallback_image_refs=fallback_images,
+            get_cfg=get_cfg,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("引用图片兜底解析失败: %s", exc)
+
+
 async def parse_reply_context(
     event: AstrMessageEvent,
     context: Any,
@@ -669,10 +821,35 @@ async def parse_reply_context(
     result = ReplyParseResult(forward_id=forward_id)
     try:
         client = event.bot
-        original_msg = await client.api.call_action("get_msg", message_id=reply_seg.id)
+        try:
+            original_msg = await client.api.call_action("get_msg", message_id=reply_seg.id)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("获取引用消息失败，尝试图片兜底解析: %s", exc)
+            await _inject_quoted_image_fallback(
+                event=event,
+                context=context,
+                req=req,
+                reply_seg=reply_seg,
+                get_cfg=get_cfg,
+            )
+            return result
         if _is_unavailable_get_msg_payload(original_msg):
+            await _inject_quoted_image_fallback(
+                event=event,
+                context=context,
+                req=req,
+                reply_seg=reply_seg,
+                get_cfg=get_cfg,
+            )
             return result
         if not (original_msg and "message" in original_msg):
+            await _inject_quoted_image_fallback(
+                event=event,
+                context=context,
+                req=req,
+                reply_seg=reply_seg,
+                get_cfg=get_cfg,
+            )
             return result
 
         sender_info = original_msg.get("sender", {})
@@ -689,6 +866,7 @@ async def parse_reply_context(
             return result
 
         quoted_image_labels: list[str] = []
+        quoted_image_segments: list[dict[str, Any]] = []
         quoted_file_descriptions: list[str] = []
         quoted_file_infos: list[str] = []
         quoted_file_parse_failed = False
@@ -734,6 +912,7 @@ async def parse_reply_context(
                 label = _describe_image_segment(seg_data)
                 if label not in quoted_image_labels:
                     quoted_image_labels.append(label)
+                quoted_image_segments.append(segment)
 
             elif seg_type == "record":
                 quoted_record_count += 1
@@ -863,6 +1042,31 @@ async def parse_reply_context(
                     if quoted_url_text:
                         quoted_url_texts.append(quoted_url_text)
 
+        if not quoted_image_segments:
+            for embedded_segment in getattr(reply_seg, "chain", None) or []:
+                if not isinstance(embedded_segment, Comp.Image):
+                    continue
+                image_data = {
+                    key: str(getattr(embedded_segment, key, "") or "").strip()
+                    for key in ("path", "file", "url")
+                }
+                if any(image_data.values()):
+                    quoted_image_segments.append(
+                        {"type": "image", "data": image_data}
+                    )
+                    label = _describe_image_segment(image_data)
+                    if label not in quoted_image_labels:
+                        quoted_image_labels.append(label)
+
+        await _inject_quoted_image_context(
+            event=event,
+            context=context,
+            req=req,
+            image_segments=quoted_image_segments,
+            fallback_image_refs=None,
+            get_cfg=get_cfg,
+        )
+
         if (
             quoted_image_labels
             or quoted_file_descriptions
@@ -961,9 +1165,13 @@ async def process_reference_context(
 
     if (
         is_aiocqhttp_event
-        and event.is_at_or_wake_command
         and (not result.forward_id)
         and result.reply_seg
+        and (
+            event.is_at_or_wake_command
+            or bool(dynamic_batch_msg_ids)
+            or bool(event.get_extra("_llme_dynamic_requeued", default=False))
+        )
     ):
         parsed_reply = await parse_reply_context(
             event=event,

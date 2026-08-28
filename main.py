@@ -1,5 +1,6 @@
 import asyncio
 import json
+import os
 import time
 import random
 from typing import List, Any, Optional
@@ -161,6 +162,7 @@ from .modules.dialogue_context import (
     build_text_context_enrichment,
     build_non_text_context_text,
     build_context_text,
+    snapshot_image_files_for_context,
     append_group_context_message,
     append_notice_context_from_raw,
     inject_active_wake_note_into_request,
@@ -215,7 +217,28 @@ async def _background_context_injection(
     context_injection_max_messages: int,
 ) -> None:
     """后台异步执行上下文注入，不阻塞主消息流程。"""
+    snapshot_paths: list[str] = []
     try:
+        raw_image_datas, snapshot_paths = snapshot_image_files_for_context(
+            message_chain,
+            raw_image_datas=raw_image_datas,
+        )
+        framework_provider_settings = {}
+        try:
+            framework_provider_settings = (
+                self.context.get_config(umo=event.unified_msg_origin).get(
+                    "provider_settings",
+                    {},
+                )
+                or {}
+            )
+        except Exception:
+            framework_provider_settings = {}
+        provider_candidates_resolver = getattr(
+            self.context,
+            "get_all_providers",
+            None,
+        )
         reply_preview = await try_build_reply_preview(event, reply_msg_id)
         parse_options = get_context_non_text_parse_options(self._get_cfg)
         current_msg_id = get_event_msg_id(event) or ""
@@ -239,6 +262,8 @@ async def _background_context_injection(
                     default_provider_resolver=lambda: get_vision_provider(
                         self.context, self._get_cfg, event=event
                     ),
+                    framework_provider_settings=framework_provider_settings,
+                    provider_candidates_resolver=provider_candidates_resolver,
                     emoji_mode=True,
                 )
                 if image_caption:
@@ -269,6 +294,8 @@ async def _background_context_injection(
                     self.context, self._get_cfg, event=event
                 ),
                 emoji_mode=True,
+                framework_provider_settings=framework_provider_settings,
+                provider_candidates_resolver=provider_candidates_resolver,
             )
         if not context_text:
             image_caption = ""
@@ -328,6 +355,13 @@ async def _background_context_injection(
             )
     except Exception as e:
         logger.error(f"[LLMEnhancement] 后台上下文注入失败: {type(e).__name__}: {e}")
+    finally:
+        for snapshot_path in snapshot_paths:
+            try:
+                if os.path.exists(snapshot_path):
+                    os.remove(snapshot_path)
+            except OSError:
+                pass
 
 
 def _flatten_cfg(src: dict, target: dict) -> None:
@@ -3318,6 +3352,11 @@ class LLMEnhancement(Star):
                 ),
                 default_provider_resolver=lambda: self.context.get_using_provider(
                     umo=event.unified_msg_origin,
+                ),
+                provider_candidates_resolver=getattr(
+                    self.context,
+                    "get_all_providers",
+                    None,
                 ),
             )
             if not dynamic_batch_msg_ids:

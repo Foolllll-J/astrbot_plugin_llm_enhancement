@@ -2,10 +2,12 @@ import asyncio
 import datetime
 import json
 import os
+import shutil
 import tempfile
 import time
 import uuid
 from typing import Any, Callable, Optional
+from urllib.parse import unquote
 
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent
@@ -336,35 +338,43 @@ def _compute_active_wake_silence_bonus(
     return max(0.0, min(cap, bonus))
 
 
-def _extract_first_image_file_and_url(message_chain: Any) -> tuple[str, str]:
+def _extract_first_image_file_and_url(message_chain: Any) -> tuple[str, str, str]:
+    """提取第一张图片的 path/file/url，兼容 Reply.chain 中的嵌套图片。"""
     try:
         for seg in message_chain or []:
             if isinstance(seg, Comp.Image):
+                path_val = str(getattr(seg, "path", "") or "").strip()
                 file_val = str(getattr(seg, "file", "") or "").strip()
                 url_val = str(getattr(seg, "url", "") or "").strip()
-                if file_val or url_val:
-                    return file_val, url_val
+                if path_val or file_val or url_val:
+                    return path_val, file_val, url_val
                 try:
                     seg_dict = seg.toDict()
                     if isinstance(seg_dict, dict):
                         data = seg_dict.get("data") or {}
                         if isinstance(data, dict):
+                            path_val = str(data.get("path") or "").strip()
                             file_val = str(data.get("file") or "").strip()
                             url_val = str(data.get("url") or "").strip()
-                            if file_val or url_val:
-                                return file_val, url_val
+                            if path_val or file_val or url_val:
+                                return path_val, file_val, url_val
                 except Exception:
                     pass
             if isinstance(seg, dict) and seg.get("type") == "image":
                 data = seg.get("data") or {}
                 if isinstance(data, dict):
+                    path_val = str(data.get("path") or "").strip()
                     file_val = str(data.get("file") or "").strip()
                     url_val = str(data.get("url") or "").strip()
-                    if file_val or url_val:
-                        return file_val, url_val
+                    if path_val or file_val or url_val:
+                        return path_val, file_val, url_val
+            if isinstance(seg, Comp.Reply) and getattr(seg, "chain", None):
+                nested = _extract_first_image_file_and_url(seg.chain)
+                if any(nested):
+                    return nested
     except Exception:
-        return "", ""
-    return "", ""
+        return "", "", ""
+    return "", "", ""
 
 
 def _build_image_caption_cache_key(image_file: str, image_url: str) -> str:
@@ -450,14 +460,118 @@ def _normalize_local_image_path(path_or_uri: str) -> str:
     if not raw:
         return ""
     if raw.startswith("file://"):
-        candidate = raw[7:]
+        candidate = unquote(raw[7:])
         if candidate.startswith("/") and len(candidate) > 3 and candidate[2] == ":":
             candidate = candidate[1:]
     else:
-        candidate = raw
-    if os.path.exists(candidate):
+        candidate = unquote(raw)
+    if os.path.isfile(candidate):
         return os.path.abspath(candidate)
     return ""
+
+
+def _normalize_image_ref(image_ref: Any) -> str:
+    """只接受有效的本地图片、HTTP 地址或可直接传给 Provider 的 base64。"""
+    value = str(image_ref or "").strip()
+    if not value:
+        return ""
+    local_path = _normalize_local_image_path(value)
+    if local_path:
+        return local_path
+    lower_value = value.lower()
+    if lower_value.startswith(("http://", "https://", "base64://")):
+        return value
+    if lower_value.startswith("data:image/"):
+        comma_index = value.find(",")
+        if comma_index > 0 and ";base64" in value[:comma_index].lower():
+            payload = value[comma_index + 1 :].strip()
+            if payload:
+                return f"base64://{payload}"
+    return ""
+
+
+def _is_local_image_ref(value: Any) -> bool:
+    raw = str(value or "").strip()
+    if not raw:
+        return False
+    return (
+        raw.lower().startswith("file://")
+        or os.path.isabs(raw)
+        or (len(raw) > 2 and raw[1] == ":" and raw[2] in {"\\", "/"})
+    )
+
+
+def _iter_image_segment_data(message_chain: Any):
+    for segment in message_chain or []:
+        if isinstance(segment, Comp.Image):
+            yield {
+                key: str(getattr(segment, key, "") or "").strip()
+                for key in ("path", "file", "url")
+            }
+        elif isinstance(segment, dict) and str(segment.get("type") or "").lower() == "image":
+            data = segment.get("data") or {}
+            if isinstance(data, dict):
+                yield {
+                    key: str(data.get(key) or "").strip()
+                    for key in ("path", "file", "url")
+                }
+        elif isinstance(segment, Comp.Reply) and getattr(segment, "chain", None):
+            yield from _iter_image_segment_data(segment.chain)
+
+
+def snapshot_image_files_for_context(
+    message_chain: Any,
+    raw_image_datas: Optional[list[dict[str, Any]]] = None,
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """在后台注入启动前复制仍存在的图片，避免核心事件清理导致竞态。"""
+    snapshot_datas: list[dict[str, Any]] = []
+    snapshot_paths: list[str] = []
+    seen_paths: set[str] = set()
+    sources: list[dict[str, Any]] = []
+    for image_data in _iter_image_segment_data(message_chain):
+        sources.append(image_data)
+    for image_data in raw_image_datas or []:
+        if isinstance(image_data, dict):
+            sources.append(image_data)
+
+    for image_data in sources:
+        local_path = ""
+        for key in ("path", "file", "url"):
+            local_path = _normalize_local_image_path(image_data.get(key))
+            if local_path:
+                break
+        if not local_path or local_path in seen_paths:
+            continue
+        seen_paths.add(local_path)
+        suffix = os.path.splitext(local_path)[1] or ".img"
+        fd, snapshot_path = tempfile.mkstemp(
+            prefix="llme_context_image_",
+            suffix=suffix,
+        )
+        os.close(fd)
+        try:
+            try:
+                # 同一临时目录通常支持硬链接，能在不复制大文件的情况下跨过核心清理。
+                os.remove(snapshot_path)
+                os.link(local_path, snapshot_path)
+            except OSError:
+                shutil.copyfile(local_path, snapshot_path)
+        except Exception:
+            try:
+                os.remove(snapshot_path)
+            except OSError:
+                pass
+            continue
+        snapshot_paths.append(snapshot_path)
+        snapshot_datas.append(
+            {"path": snapshot_path, "file": snapshot_path, "url": snapshot_path}
+        )
+
+    merged_datas = [
+        data for data in (raw_image_datas or []) if isinstance(data, dict)
+    ]
+    merged_datas.extend(snapshot_datas)
+    return merged_datas, snapshot_paths
 
 
 def _is_emoji_image_data(seg_data: dict[str, Any]) -> bool:
@@ -838,6 +952,110 @@ async def try_build_reply_preview(event: Any, reply_msg_id: str) -> str:
         return ""
 
 
+def _provider_id(provider: Any) -> str:
+    provider_cfg = getattr(provider, "provider_config", None)
+    if isinstance(provider_cfg, dict):
+        return str(
+            provider_cfg.get("id")
+            or provider_cfg.get("provider_id")
+            or provider_cfg.get("name")
+            or ""
+        ).strip()
+    return str(
+        getattr(provider, "id", None)
+        or getattr(provider, "provider_id", None)
+        or getattr(provider, "name", None)
+        or ""
+    ).strip()
+
+
+def _provider_supports_image_input(provider: Any) -> bool:
+    provider_cfg = getattr(provider, "provider_config", None)
+    if not isinstance(provider_cfg, dict):
+        return False
+    modalities = provider_cfg.get("modalities", None)
+    # 与 AstrBot 核心保持一致：空列表表示旧配置/未配置，按支持多模态兼容。
+    if modalities == []:
+        return True
+    return isinstance(modalities, list) and "image" in modalities
+
+
+def _append_provider_candidate(candidates: list[Any], provider: Any) -> None:
+    if provider is None or not hasattr(provider, "text_chat"):
+        return
+    provider_key = _provider_id(provider) or str(id(provider))
+    if any(((_provider_id(item) or str(id(item))) == provider_key) for item in candidates):
+        return
+    candidates.append(provider)
+
+
+def select_image_caption_provider(
+    *,
+    get_cfg: Any,
+    provider_by_id_resolver: Any,
+    default_provider_resolver: Any,
+    preferred_provider_id: str = "",
+    framework_provider_settings: Optional[dict[str, Any]] = None,
+    provider_candidates_resolver: Any = None,
+) -> Any:
+    """按显式配置、框架回退列表和可用 Provider 自动选择视觉 Provider。"""
+    framework_settings = (
+        framework_provider_settings
+        if isinstance(framework_provider_settings, dict)
+        else {}
+    )
+    candidates: list[Any] = []
+    provider_ids: list[str] = []
+
+    def add_provider_id(raw_id: Any) -> None:
+        provider_id = str(raw_id or "").strip()
+        if provider_id and provider_id not in provider_ids:
+            provider_ids.append(provider_id)
+
+    add_provider_id(preferred_provider_id)
+    add_provider_id(
+        get_cfg("context_injection_image_caption_provider_id", "")
+        if callable(get_cfg)
+        else ""
+    )
+    add_provider_id(framework_settings.get("default_image_caption_provider_id", ""))
+    add_provider_id(get_cfg("video_image_provider_id") if callable(get_cfg) else "")
+
+    fallback_ids = framework_settings.get("fallback_chat_models", [])
+    if isinstance(fallback_ids, list):
+        for fallback_id in fallback_ids:
+            add_provider_id(fallback_id)
+
+    for provider_id in provider_ids:
+        try:
+            _append_provider_candidate(
+                candidates,
+                provider_by_id_resolver(provider_id),
+            )
+        except Exception:
+            continue
+
+    if callable(default_provider_resolver):
+        try:
+            _append_provider_candidate(candidates, default_provider_resolver())
+        except Exception:
+            pass
+
+    if callable(provider_candidates_resolver):
+        try:
+            all_providers = provider_candidates_resolver() or []
+            if isinstance(all_providers, (list, tuple)):
+                for provider in all_providers:
+                    _append_provider_candidate(candidates, provider)
+        except Exception:
+            pass
+
+    for provider in candidates:
+        if _provider_supports_image_input(provider):
+            return provider
+    return None
+
+
 async def try_get_image_caption(
     *,
     event: Any = None,
@@ -850,24 +1068,29 @@ async def try_get_image_caption(
     preferred_provider_id: str = "",
     allow_default_provider: bool = True,
     emoji_mode: bool = False,
+    framework_provider_settings: Optional[dict[str, Any]] = None,
+    provider_candidates_resolver: Any = None,
 ) -> str:
     """尝试调用视觉模型为图片生成文字描述，优先使用表情包摘要缓存。"""
     emoji_summary = get_emoji_summary_from_sources(
         message_chain, raw_image_datas=raw_image_datas
     )
-    image_file, image_url = _extract_first_image_file_and_url(message_chain)
+    image_path, image_file, image_url = _extract_first_image_file_and_url(message_chain)
     _raw_cache_datas = raw_image_datas or extract_raw_image_datas_from_event(event)
-    _cache_file, _cache_url = "", ""
+    _cache_file, _cache_url, _cache_path = "", "", ""
     for _d in _raw_cache_datas or []:
         if isinstance(_d, dict):
+            _cache_path = str(_d.get("path") or "").strip()
             _cache_file = str(_d.get("file") or "").strip()
             _cache_url = str(_d.get("url") or "").strip()
-            if _cache_file or _cache_url:
+            if _cache_file or _cache_url or _cache_path:
                 break
-    if not image_file and not image_url:
+    if not image_path and not image_file and not image_url:
+        image_path, image_file, image_url = _cache_path, _cache_file, _cache_url
+    if not image_path and not image_file and not image_url:
         return emoji_summary or ""
     cache_key = _build_image_caption_cache_key(
-        _cache_file or image_file,
+        _cache_file or image_file or _cache_path or image_path,
         _cache_url or image_url,
     )
     _is_emoji = False
@@ -891,17 +1114,16 @@ async def try_get_image_caption(
         f"{'[表情包转述]' if _is_emoji else '[图片转述]'} 转述生成: cache_key={cache_key}"
     )
 
-    provider_id = str(
-        preferred_provider_id
-        or get_cfg(
-            "context_injection_image_caption_provider_id",
-            "",
-        )
-        or "",
-    ).strip()
-    provider = provider_by_id_resolver(provider_id) if provider_id else None
-    if provider is None and allow_default_provider:
-        provider = default_provider_resolver()
+    provider = select_image_caption_provider(
+        get_cfg=get_cfg,
+        provider_by_id_resolver=provider_by_id_resolver,
+        default_provider_resolver=(
+            default_provider_resolver if allow_default_provider else None
+        ),
+        preferred_provider_id=preferred_provider_id,
+        framework_provider_settings=framework_provider_settings,
+        provider_candidates_resolver=provider_candidates_resolver,
+    )
     if not provider or (not hasattr(provider, "text_chat")):
         return emoji_summary or ""
 
@@ -911,41 +1133,27 @@ async def try_get_image_caption(
     if not prompt:
         return emoji_summary or ""
 
-    image_input = _normalize_local_image_path(
-        image_file
-    ) or _normalize_local_image_path(image_url)
-    temp_image_path = ""
+    image_input = await _resolve_image_input_from_segment_data(
+        event,
+        {"path": image_path, "file": image_file, "url": image_url},
+    )
     if not image_input:
-        # 优先通过 OneBot get_image(file) 拉取本地路径，和引用图片链路保持一致。
-        try:
-            file_key = str(image_file or "").strip()
-            bot = getattr(event, "bot", None)
-            api = getattr(bot, "api", None)
-            if file_key and api is not None:
-                image_resp = await api.call_action("get_image", file=file_key)
-                if isinstance(image_resp, dict):
-                    image_input = (
-                        _normalize_local_image_path(
-                            str(image_resp.get("file") or "").strip()
-                        )
-                        or _normalize_local_image_path(
-                            str(image_resp.get("path") or "").strip()
-                        )
-                        or _normalize_local_image_path(
-                            str(image_resp.get("url") or "").strip()
-                        )
-                    )
-        except Exception as e:
-            logger.debug(
-                f"[上下文注入] 图像转述失败(get_image): {type(e).__name__}: {e}"
+        for raw_data in _raw_cache_datas or []:
+            if not isinstance(raw_data, dict):
+                continue
+            image_input = await _resolve_image_input_from_segment_data(
+                event,
+                raw_data,
             )
-
-    if not image_input:
+            if image_input:
+                break
+    temp_image_path = ""
+    if image_input.lower().startswith(("http://", "https://")):
         # 兜底：下载外链到本地临时文件再传给模型。
         try:
             from .media_parser import download_media_to_temp
 
-            source = str(image_url or image_file or "").strip()
+            source = image_input
             if not source:
                 return emoji_summary or ""
             temp_image_path = str(
@@ -1042,48 +1250,76 @@ async def _resolve_image_input_from_segment_data(
     event: Any,
     seg_data: dict[str, Any],
 ) -> str:
+    if not isinstance(seg_data, dict):
+        return ""
+    path_val = str(
+        seg_data.get("path") or seg_data.get("file_path") or ""
+    ).strip()
     file_val = str(seg_data.get("file") or "").strip()
     url_val = str(seg_data.get("url") or "").strip()
 
-    for candidate in (file_val, url_val):
-        if not candidate:
-            continue
-        if candidate.startswith(("file:///", "http://", "https://", "base64://")):
-            return candidate
-        if os.path.exists(candidate):
-            return os.path.abspath(candidate)
+    for candidate in (path_val, file_val, url_val):
+        normalized = _normalize_image_ref(candidate)
+        if normalized:
+            return normalized
 
-    if file_val and isinstance(event, AiocqhttpMessageEvent):
+    # 失效的绝对路径不能作为 OneBot file 参数，也不能交给 aiohttp 当 URL。
+    api_candidates = [
+        candidate
+        for candidate in (file_val, url_val)
+        if candidate and not _is_local_image_ref(candidate)
+    ]
+    if api_candidates and isinstance(event, AiocqhttpMessageEvent):
         bot = getattr(event, "bot", None)
         api = getattr(bot, "api", None) if bot else None
         if api is not None and hasattr(api, "call_action"):
+            actions: list[tuple[str, dict[str, Any]]] = []
+            group_id = ""
             try:
-                image_resp = await api.call_action("get_image", file=file_val)
+                group_id = str(event.get_group_id() or "").strip()
             except Exception:
-                image_resp = None
-            if isinstance(image_resp, dict):
-                for key in ("file", "path", "url"):
-                    candidate = str(image_resp.get(key) or "").strip()
-                    if not candidate:
+                pass
+            for image_ref in api_candidates:
+                actions.extend(
+                    [
+                        ("get_image", {"file": image_ref}),
+                        ("get_image", {"file_id": image_ref}),
+                        ("get_image", {"id": image_ref}),
+                        ("get_image", {"image": image_ref}),
+                        ("get_file", {"file_id": image_ref}),
+                        ("get_file", {"file": image_ref}),
+                    ]
+                )
+                if group_id:
+                    group_value: Any = (
+                        int(group_id) if group_id.isdigit() else group_id
+                    )
+                    actions.append(
+                        (
+                            "get_group_file_url",
+                            {"group_id": group_value, "file_id": image_ref},
+                        )
+                    )
+                actions.append(("get_private_file_url", {"file_id": image_ref}))
+
+            for action, params in actions:
+                try:
+                    image_resp = await api.call_action(action, **params)
+                except Exception:
+                    continue
+                response_dicts = [image_resp]
+                if isinstance(image_resp, dict) and isinstance(
+                    image_resp.get("data"), dict
+                ):
+                    response_dicts.append(image_resp["data"])
+                for response in response_dicts:
+                    if not isinstance(response, dict):
                         continue
-                    if candidate.startswith(
-                        ("file:///", "http://", "https://", "base64://")
-                    ):
-                        return candidate
-                    if os.path.exists(candidate):
-                        return os.path.abspath(candidate)
+                    for key in ("path", "file", "url"):
+                        normalized = _normalize_image_ref(response.get(key))
+                        if normalized:
+                            return normalized
     return ""
-
-
-def _provider_supports_image_input(provider: Any) -> bool:
-    provider_cfg = getattr(provider, "provider_config", None)
-    if not isinstance(provider_cfg, dict):
-        return False
-    modalities = provider_cfg.get("modalities", [])
-    if not isinstance(modalities, list):
-        return False
-    return "image" in modalities
-
 
 async def inject_merged_images_by_provider(
     *,
@@ -1095,6 +1331,7 @@ async def inject_merged_images_by_provider(
     framework_provider_settings: Optional[dict[str, Any]] = None,
     provider_by_id_resolver: Any,
     default_provider_resolver: Any,
+    provider_candidates_resolver: Any = None,
 ) -> dict[str, Any]:
     """将合并消息中的图片补入 ProviderRequest 的 image_urls，或降级为文字描述。返回注入结果统计。"""
     batch_msg_ids = [
@@ -1152,12 +1389,17 @@ async def inject_merged_images_by_provider(
         if isinstance(framework_provider_settings, dict)
         else {}
     )
-    caption_provider_id = str(
-        provider_settings.get("default_image_caption_provider_id", "") or "",
-    ).strip()
-    if not caption_provider_id:
+    caption_provider = select_image_caption_provider(
+        get_cfg=get_cfg,
+        provider_by_id_resolver=provider_by_id_resolver,
+        default_provider_resolver=default_provider_resolver,
+        framework_provider_settings=provider_settings,
+        provider_candidates_resolver=provider_candidates_resolver,
+    )
+    caption_provider_id = _provider_id(caption_provider)
+    if caption_provider is None:
         logger.debug(
-            "[LLMEnhancement] 当前 Provider 不支持视觉，且未配置图像转述模型，跳过合并图片注入："
+            "[LLMEnhancement] 当前 Provider 不支持视觉，且没有可用的图像转述 Provider，跳过合并图片注入："
             f"group={getattr(event, 'get_group_id', lambda: None)() or 'private'}, "
             f"uid={getattr(event, 'get_sender_id', lambda: None)()}, image_count={len(image_segments)}",
         )
@@ -1175,6 +1417,8 @@ async def inject_merged_images_by_provider(
             preferred_provider_id=caption_provider_id,
             allow_default_provider=False,
             timeout_sec=0,
+            framework_provider_settings=provider_settings,
+            provider_candidates_resolver=provider_candidates_resolver,
         )
         if not caption:
             continue
@@ -1308,6 +1552,8 @@ async def build_non_text_context_text(
     provider_by_id_resolver: Any,
     default_provider_resolver: Any,
     emoji_mode: bool = False,
+    framework_provider_settings: Optional[dict[str, Any]] = None,
+    provider_candidates_resolver: Any = None,
 ) -> str:
     """为非文本消息（图片、语音等）构建用于上下文注入的文字描述。"""
     parts: list[str] = []
@@ -1333,6 +1579,8 @@ async def build_non_text_context_text(
             provider_by_id_resolver=provider_by_id_resolver,
             default_provider_resolver=default_provider_resolver,
             emoji_mode=emoji_mode,
+            framework_provider_settings=framework_provider_settings,
+            provider_candidates_resolver=provider_candidates_resolver,
         )
         if image_caption:
             image_label = get_image_component_label(

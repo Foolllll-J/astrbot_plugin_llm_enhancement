@@ -380,16 +380,29 @@ async def napcat_resolve_file_url(
 
 async def download_media_to_temp(url: str, size_mb_limit: int) -> Optional[str]:
     """下载媒体到临时文件。若已是本地文件则直接返回。"""
-    if os.path.isfile(url):
-        return url
+    source = str(url or "").strip()
+    if not source:
+        return None
+    if os.path.isfile(source):
+        return source
+    if source.lower().startswith("file://"):
+        local_path = source[7:]
+        if local_path.startswith("/") and len(local_path) > 3 and local_path[2] == ":":
+            local_path = local_path[1:]
+        if os.path.isfile(local_path):
+            return os.path.abspath(local_path)
+        return None
+    # 绝对路径/文件 ID 不是可下载的 URL。调用方应先通过 OneBot 解析文件 ID。
+    if not source.lower().startswith(("http://", "https://")):
+        return None
     max_bytes = size_mb_limit * 1024 * 1024
 
     try:
         async with aiohttp.ClientSession() as sess:
-            async with sess.get(url, timeout=60) as resp:
+            async with sess.get(source, timeout=60) as resp:
                 if resp.status != 200:
                     logger.warning(
-                        f"[媒体处理] 下载失败: HTTP {resp.status} (URL: {url})"
+                        f"[媒体处理] 下载失败: HTTP {resp.status} (URL: {source})"
                     )
                     return None
 

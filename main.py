@@ -1008,7 +1008,10 @@ class LLMEnhancement(Star):
             event.is_at_or_wake_command = False
 
         # 4. 唤醒条件判断
-        direct_wake = bool(event.is_at_or_wake_command)
+        # 保留核心唤醒阶段的原始状态。后续的前缀/主动唤醒逻辑可能会修改
+        # direct_wake，但概率唤醒不能因此重新接管一个原本已被显式唤醒的消息。
+        initial_direct_wake = bool(event.is_at_or_wake_command)
+        direct_wake = initial_direct_wake
         wake = direct_wake
         reason = "at_or_cmd" if direct_wake else ""
 
@@ -1085,11 +1088,12 @@ class LLMEnhancement(Star):
                     f" group={gid}, uid={uid}",
                 )
             ordinary_group_msg = (
-                (not direct_wake)
+                (not initial_direct_wake)
                 and (not command_trigger_event)
                 and (not addressed_to_bot)
                 and (not at_all)
                 and (not is_bot_msg)
+                and (not prefix_wake_blocked)
             )
             wake_extend_window = float(self._get_cfg("wake_extend_window", 0) or 0)
             ref_ts = float(g.last_response_ts or 0.0)
@@ -1393,6 +1397,7 @@ class LLMEnhancement(Star):
             and (not wake)
             and (not skip_active_wake_for_bot)
             and (not _skip_wake_for_congestion)
+            and (not prefix_wake_blocked)
         ):
             matched_mention = evaluate_mention_wake(
                 msg, self._get_cfg("mention_wake"), gid=gid, uid=uid
@@ -1402,7 +1407,12 @@ class LLMEnhancement(Star):
                 reason = f"提及唤醒({matched_mention})"
 
         # 唤醒延长 (仅群聊)
-        if gid and not wake and (not _skip_wake_for_congestion):
+        if (
+            gid
+            and not wake
+            and (not _skip_wake_for_congestion)
+            and (not prefix_wake_blocked)
+        ):
             wake, wake_reason = await evaluate_wake_extend(
                 event=event,
                 msg=msg,
@@ -1427,6 +1437,7 @@ class LLMEnhancement(Star):
             and (not wake)
             and (not skip_active_wake_for_bot)
             and (not _skip_wake_for_congestion)
+            and (not prefix_wake_blocked)
         ):
             relevant_wake = float(self._get_cfg("relevant_wake") or 0.0)
             if relevant_wake:
@@ -1453,6 +1464,7 @@ class LLMEnhancement(Star):
             and (not wake)
             and (not skip_active_wake_for_bot)
             and (not _skip_wake_for_congestion)
+            and (not prefix_wake_blocked)
         ):
             ask_wake = float(self._get_cfg("ask_wake") or 0.0)
             if ask_wake:
@@ -1466,8 +1478,11 @@ class LLMEnhancement(Star):
         if (
             gid
             and (not wake)
+            and (not initial_direct_wake)
+            and (not command_trigger_event)
             and (not skip_active_wake_for_bot)
             and (not _skip_wake_for_congestion)
+            and (not prefix_wake_blocked)
         ):
             bored_wake = float(self._get_cfg("bored_wake") or 0.0)
             if bored_wake:
@@ -1481,8 +1496,11 @@ class LLMEnhancement(Star):
         if (
             gid
             and (not wake)
+            and (not initial_direct_wake)
+            and (not command_trigger_event)
             and (not skip_active_wake_for_bot)
             and (not _skip_wake_for_congestion)
+            and (not prefix_wake_blocked)
         ):
             # 动态合并进行中时跳过概率唤醒。
             _prob_wake_blocked_by_merge = (

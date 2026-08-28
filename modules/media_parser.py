@@ -11,6 +11,7 @@ import aiohttp
 from pathlib import Path
 from enum import Enum
 from typing import List, Optional, Any, Dict, Tuple
+from urllib.parse import urlsplit
 
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent
@@ -125,8 +126,12 @@ def extract_videos_from_chain(chain: List[object]) -> List[str]:
     def _looks_like_video(name_or_url: str) -> bool:
         if not isinstance(name_or_url, str) or not name_or_url:
             return False
-        s = name_or_url.lower()
-        return any(s.endswith(ext) for ext in video_exts)
+        # URL 可能带查询参数；只根据路径后缀判断，不能把本地绝对路径本身当作视频依据。
+        try:
+            candidate = urlsplit(name_or_url).path or name_or_url
+        except ValueError:
+            candidate = name_or_url
+        return candidate.lower().endswith(video_exts)
 
     for seg in chain:
         try:
@@ -151,7 +156,7 @@ def extract_videos_from_chain(chain: List[object]) -> List[str]:
                     elif (
                         isinstance(f, str)
                         and f
-                        and (_looks_like_video(f) or os.path.isabs(f))
+                        and _looks_like_video(f)
                     ):
                         cand = f
                     elif isinstance(n, str) and n and _looks_like_video(n):
@@ -178,7 +183,7 @@ def extract_videos_from_chain(chain: List[object]) -> List[str]:
                 elif (
                     isinstance(f, str)
                     and f
-                    and (_looks_like_video(f) or os.path.isabs(f))
+                    and _looks_like_video(f)
                 ):
                     cand = f
                 elif isinstance(n, str) and n and _looks_like_video(n):
@@ -446,7 +451,7 @@ async def download_media_to_temp(url: str, size_mb_limit: int) -> Optional[str]:
 
 
 def probe_duration_sec(ffmpeg_path: str, video_path: str) -> Optional[float]:
-    """探测视频时长。"""
+    """确认存在视频流并探测媒体时长。"""
     # 优先使用与 ffmpeg 同目录的 ffprobe。
     ffprobe_path = None
     if ffmpeg_path:
@@ -469,7 +474,7 @@ def probe_duration_sec(ffmpeg_path: str, video_path: str) -> Optional[float]:
         "-v",
         "error",
         "-show_entries",
-        "format=duration",
+        "format=duration:stream=codec_type",
         "-of",
         "json",
         video_path,
@@ -478,6 +483,12 @@ def probe_duration_sec(ffmpeg_path: str, video_path: str) -> Optional[float]:
         res = _safe_subprocess_run(cmd)
         if res.returncode == 0:
             data = json.loads(res.stdout)
+            streams = data.get("streams") or []
+            if not any(
+                isinstance(stream, dict) and stream.get("codec_type") == "video"
+                for stream in streams
+            ):
+                return None
             return float(data.get("format", {}).get("duration", 0))
     except Exception:
         pass
@@ -1786,36 +1797,18 @@ async def detect_media_scenario(
         ctx.scenario = MediaScenario.GIF_ANIMATED
         return ctx
 
-    suffix = Path(first_path).suffix.lower()
-    is_from_video_source = bool(
-        video_sources and len(video_sources) > 0 and ctx.media_path == video_sources[0]
-    )
-    is_video_format = (
-        suffix in [".mp4", ".mov", ".avi", ".mkv", ".webm", ".flv", ".wmv", ".m4v"]
-        or is_from_video_source
-    )
-    if not is_video_format:
-        try:
-            with open(first_path, "rb") as f:
-                header = f.read(32)
-                if b"ftyp" in header or b"matroska" in header or b"fLaC" in header:
-                    is_video_format = True
-        except Exception:
-            pass
-
-    if is_video_format:
-        if not bool(get_cfg("video_parse_enable", True)):
-            logger.debug("[媒体处理] 视频解析已关闭，跳过: %s", first_path)
-            ctx.scenario = MediaScenario.NONE
-            return ctx
-        ctx.duration = await _probe_duration_helper(get_cfg, first_path)
-        if ctx.duration <= 0:
-            ctx.scenario = MediaScenario.NONE
-            return ctx
-        ctx.scenario = MediaScenario.VIDEO
+    # 到这里的来源可能是明确的 Video 组件，也可能是带视频后缀的 File 组件。
+    # 无论来源类型如何，都必须由 ffprobe 确认实际存在视频流；不能仅凭绝对路径、
+    # 容器魔数或 video_sources 列表成员身份强行升级为视频。
+    if not bool(get_cfg("video_parse_enable", True)):
+        logger.debug("[媒体处理] 视频解析已关闭，跳过: %s", first_path)
+        ctx.scenario = MediaScenario.NONE
         return ctx
-
-    ctx.scenario = MediaScenario.NONE
+    ctx.duration = await _probe_duration_helper(get_cfg, first_path)
+    if ctx.duration <= 0:
+        ctx.scenario = MediaScenario.NONE
+        return ctx
+    ctx.scenario = MediaScenario.VIDEO
     return ctx
 
 

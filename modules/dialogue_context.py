@@ -1090,8 +1090,11 @@ async def try_get_image_caption(
     if not image_path and not image_file and not image_url:
         return emoji_summary or ""
     cache_key = _build_image_caption_cache_key(
-        _cache_file or image_file or _cache_path or image_path,
-        _cache_url or image_url,
+        # 当合并消息逐张调用时，message_chain 中的标识属于当前图片。
+        # 只有当前组件没有标识时，才使用事件级原始数据作为兜底；不能
+        # 始终优先使用事件中第一张图片，否则后续图片会复用第一张的缓存。
+        image_file or image_path,
+        image_url,
     )
     _is_emoji = False
     if emoji_mode:

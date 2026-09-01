@@ -1781,13 +1781,14 @@ class LLMEnhancement(Star):
         additional_components: List[Any] = collect_additional_components_from_snapshots(
             preselected_snapshots
         )
+        blocked_forbidden_word: Optional[str] = None
 
         @session_waiter(timeout=wait_timeout_sec, record_history_chains=False)
         async def collect_messages(
             controller: SessionController,
             followup_event: AstrMessageEvent,
         ):
-            nonlocal message_buffer, additional_components
+            nonlocal message_buffer, additional_components, blocked_forbidden_word
             if member.cancel_merge:
                 controller.stop()
                 return
@@ -1887,6 +1888,19 @@ class LLMEnhancement(Star):
                     )
                 return
 
+            if not followup_event.is_admin():
+                forbidden_word = contains_forbidden_wake_word(
+                    followup_event.message_str or "",
+                    self._get_cfg("wake_forbidden_words"),
+                    gid=gid,
+                    uid=followup_event.get_sender_id(),
+                )
+                if forbidden_word:
+                    blocked_forbidden_word = forbidden_word
+                    followup_event.stop_event()
+                    controller.stop()
+                    return
+
             if is_duplicate_followup_message(message_buffer, followup_event, uid):
                 followup_event.stop_event()
                 return
@@ -1934,6 +1948,14 @@ class LLMEnhancement(Star):
             async with member.lock:
                 member.in_merging = False  # 合并结束
                 member.merge_start_ts = 0.0
+
+        if blocked_forbidden_word:
+            logger.debug(
+                "[LLMEnhancement] 硬等待合并拦截：后续消息命中屏蔽词。"
+                f"group={gid or 'private'}, uid={uid}, word={blocked_forbidden_word}",
+            )
+            event.stop_event()
+            return []
 
         # 无论是否超时，如果已取消，直接返回。
         if member.cancel_merge:
@@ -3151,16 +3173,29 @@ class LLMEnhancement(Star):
             force_dynamic_followup = bool(
                 event.get_extra("_llme_force_dynamic_followup", default=False)
             )
-            reply_seg_for_self_block = None
-            for seg in all_components:
-                if isinstance(seg, Comp.Reply):
-                    reply_seg_for_self_block = seg
-                    break
-            if reply_seg_for_self_block:
+            if not event.is_admin():
+                forbidden_word = contains_forbidden_wake_word(
+                    event.message_str or "",
+                    self._get_cfg("wake_forbidden_words"),
+                    gid=gid,
+                    uid=uid,
+                )
+                if forbidden_word:
+                    logger.debug(
+                        "[LLMEnhancement] on_llm_request 合并后兜底拦截：命中屏蔽词。"
+                        f"group={gid}, uid={uid}, word={forbidden_word}",
+                    )
+                    event.stop_event()
+                    return
+
+            reply_segments_for_block = [
+                seg for seg in all_components if isinstance(seg, Comp.Reply)
+            ]
+            for reply_seg in reply_segments_for_block:
                 blocked_by_quote_keyword, quote_keyword_reason = (
                     check_quote_keyword_block(
                         event=event,
-                        reply_seg=reply_seg_for_self_block,
+                        reply_seg=reply_seg,
                         get_cfg=self._get_cfg,
                     )
                 )
@@ -3171,6 +3206,11 @@ class LLMEnhancement(Star):
                     )
                     event.stop_event()
                     return
+
+            reply_seg_for_self_block = (
+                reply_segments_for_block[0] if reply_segments_for_block else None
+            )
+            if reply_seg_for_self_block:
                 (
                     blocked_by_self_reply,
                     self_reply_block_reason,

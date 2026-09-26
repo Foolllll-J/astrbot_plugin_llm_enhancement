@@ -999,11 +999,11 @@
                 "description": "允许拉黑工具等级参数生效",
                 "hint": "默认关闭。开启后 LLM 工具传入的拉黑等级参数才会生效。"
             },
-            "allow_blacklist_bot_admin": {
-                "type": "bool",
-                "default": false,
-                "description": "允许拉黑 Bot 管理员",
-                "hint": "默认关闭。开启后可拉黑 Bot 管理员，需谨慎操作。"
+            "protected_blacklist_user_ids": {
+                "type": "list",
+                "default": [],
+                "description": "禁止拉黑的用户 ID",
+                "hint": "列表中的用户 ID 不允许通过命令或 LLM 工具拉黑。每项填写一个完整用户 ID。"
             }
         }
     }

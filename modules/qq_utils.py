@@ -1,3 +1,4 @@
+import asyncio
 import base64
 import json
 import hashlib
@@ -1590,41 +1591,77 @@ def _get_aiocqhttp_client(event: AstrMessageEvent) -> Any:
     return getattr(platform, "bot", None)
 
 
-async def _is_llbot_backend(event: AstrMessageEvent) -> bool:
-    if not isinstance(event, AiocqhttpMessageEvent):
-        return False
-    client = getattr(event, "bot", None)
-    api = getattr(client, "api", None) if client else None
-    if api is None or not hasattr(api, "call_action"):
-        return False
+_BACKEND_LLBOT = "llbot"
+_BACKEND_SNOWLUMA = "snowluma"
+_BACKEND_OTHER = "other"
+_BACKEND_TYPES = {_BACKEND_LLBOT, _BACKEND_SNOWLUMA, _BACKEND_OTHER}
+_BACKEND_DETECTION_LOCK = asyncio.Lock()
 
-    cached = getattr(client, "_llm_enhancement_is_llbot", None)
-    if isinstance(cached, bool):
+
+async def _get_backend_type(event: AstrMessageEvent) -> str:
+    """懒检测 QQ OneBot 协议端，返回 llbot/snowluma/other。"""
+    client = _get_aiocqhttp_client(event)
+    if client is None:
+        return _BACKEND_OTHER
+
+    cached = getattr(client, "_llm_enhancement_backend_type", None)
+    if cached in _BACKEND_TYPES:
         return cached
 
-    try:
-        version_info = await api.call_action("get_version_info")
-        app_name = None
-        if isinstance(version_info, dict):
-            app_name = version_info.get("app_name")
-            if app_name is None and isinstance(version_info.get("data"), dict):
-                app_name = version_info["data"].get("app_name")
-        is_llbot = app_name == "LLOneBot"
-    except Exception:
-        logger.debug(
-            "[LLMEnhancement] 懒检测调用 get_version_info 失败。",
-            exc_info=True,
-        )
-        return False
+    api = getattr(client, "api", None) if client else None
+    if api is None or not hasattr(api, "call_action"):
+        return _BACKEND_OTHER
 
-    try:
-        setattr(client, "_llm_enhancement_is_llbot", is_llbot)
-    except Exception:
+    async with _BACKEND_DETECTION_LOCK:
+        cached = getattr(client, "_llm_enhancement_backend_type", None)
+        if cached in _BACKEND_TYPES:
+            return cached
+
+        try:
+            version_info = await api.call_action("get_version_info")
+            app_name = None
+            if isinstance(version_info, dict):
+                app_name = version_info.get("app_name")
+                if app_name is None and isinstance(version_info.get("data"), dict):
+                    app_name = version_info["data"].get("app_name")
+
+            normalized_name = str(app_name or "").strip().lower()
+            if normalized_name == "llonebot":
+                backend_type = _BACKEND_LLBOT
+            elif normalized_name == "snowluma":
+                backend_type = _BACKEND_SNOWLUMA
+            else:
+                backend_type = _BACKEND_OTHER
+        except Exception:
+            logger.debug(
+                "[LLMEnhancement] 懒检测调用 get_version_info 失败。",
+                exc_info=True,
+            )
+            return _BACKEND_OTHER
+
+        try:
+            setattr(client, "_llm_enhancement_backend_type", backend_type)
+            # 保留旧缓存字段，避免其他旧代码读取时失去兼容性。
+            setattr(
+                client,
+                "_llm_enhancement_is_llbot",
+                backend_type == _BACKEND_LLBOT,
+            )
+        except Exception:
+            logger.debug(
+                "[LLMEnhancement] 缓存懒检测结果失败。",
+                exc_info=True,
+            )
         logger.debug(
-            "[LLMEnhancement] 缓存懒检测结果失败。",
-            exc_info=True,
+            f"[LLMEnhancement] 懒检测协议端完成："
+            f"app_name={app_name or 'unknown'}, backend={backend_type}"
         )
-    return is_llbot
+        return backend_type
+
+
+async def _is_llbot_backend(event: AstrMessageEvent) -> bool:
+    """兼容旧调用方：仅判断当前协议端是否为 LLOneBot。"""
+    return await _get_backend_type(event) == _BACKEND_LLBOT
 
 
 async def show_private_input_status(event: AstrMessageEvent) -> bool:
@@ -1854,7 +1891,7 @@ HISTORY_CONTENT_MAX_CHARS_TOTAL = 6000
 def _extract_history_messages(raw_result: Any) -> List[Dict[str, Any]]:
     """
     解析历史消息结果。
-    按当前 NapCat 场景仅处理两种返回：
+    兼容各协议端常见的两种返回：
     - 直接 list
     - dict 且包含顶层 messages
     """
@@ -2557,14 +2594,27 @@ async def get_group_msg_history_internal(
         if _get_aiocqhttp_client(event) is None:
             return None
 
-        page_size = max(1, min(int(count or 50), 50))
-        params: Dict[str, Any] = {
-            "group_id": str(target_group_id),
-            "count": page_size,
-        }
         seq_text = str(message_seq or "").strip()
-        if seq_text:
-            params["message_seq"] = seq_text
+        backend_type = await _get_backend_type(event)
+        page_size = max(1, min(int(count or 50), 50))
+        if backend_type == _BACKEND_SNOWLUMA:
+            # SnowLuma 的 message_id 是有符号整数，不能继续使用 message_seq。
+            anchor_id = _safe_int(seq_text) if seq_text else 0
+            if anchor_id is None:
+                raise ValueError(f"SnowLuma 历史消息游标不是有效整数: {seq_text}")
+            params: Dict[str, Any] = {
+                "group_id": int(target_group_id),
+                "message_id": anchor_id,
+                "count": page_size,
+                "reverse_order": True,
+            }
+        else:
+            params = {
+                "group_id": str(target_group_id),
+                "count": page_size,
+            }
+            if seq_text:
+                params["message_seq"] = seq_text
 
         raw_result = await _call_action(event, "get_group_msg_history", **params)
         messages = _extract_history_messages(raw_result)
@@ -2588,14 +2638,27 @@ async def get_friend_msg_history_internal(
         if _get_aiocqhttp_client(event) is None:
             return None
 
-        page_size = max(1, min(int(count or 50), 50))
-        params: Dict[str, Any] = {
-            "user_id": _coerce_numeric_id(target_user_id),
-            "count": page_size,
-        }
         seq_text = str(message_seq or "").strip()
-        if seq_text:
-            params["message_seq"] = seq_text
+        backend_type = await _get_backend_type(event)
+        page_size = max(1, min(int(count or 50), 50))
+        if backend_type == _BACKEND_SNOWLUMA:
+            # SnowLuma 的 message_id 是有符号整数，不能继续使用 message_seq。
+            anchor_id = _safe_int(seq_text) if seq_text else 0
+            if anchor_id is None:
+                raise ValueError(f"SnowLuma 历史消息游标不是有效整数: {seq_text}")
+            params: Dict[str, Any] = {
+                "user_id": int(target_user_id),
+                "message_id": anchor_id,
+                "count": page_size,
+                "reverse_order": True,
+            }
+        else:
+            params = {
+                "user_id": _coerce_numeric_id(target_user_id),
+                "count": page_size,
+            }
+            if seq_text:
+                params["message_seq"] = seq_text
 
         raw_result = await _call_action(event, "get_friend_msg_history", **params)
         messages = _extract_history_messages(raw_result)
@@ -4004,10 +4067,14 @@ async def send_group_notice_logic(
         if disabled_resp:
             return disabled_resp
 
+        pinned_flag = _to_bool(pinned, default=False)
+        backend_type = await _get_backend_type(event)
         params: Dict[str, Any] = {
             "group_id": int(target_group_id),
             "content": content_text,
-            "pinned": _to_bool(pinned, default=False),
+            "pinned": int(pinned_flag)
+            if backend_type == _BACKEND_SNOWLUMA
+            else pinned_flag,
         }
         await _call_action(
             event,
@@ -4019,7 +4086,7 @@ async def send_group_notice_logic(
             "已发送群公告。",
             group_id=str(target_group_id),
             content=content_text,
-            pinned=_to_bool(pinned, default=False),
+            pinned=pinned_flag,
         )
     except Exception as e:
         return _json_error("发送群公告失败。", error=str(e))

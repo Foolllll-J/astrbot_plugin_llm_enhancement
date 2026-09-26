@@ -34,7 +34,7 @@ _FONT_CACHE: dict[int, object] = {}
 BLACKLIST_WORDING_HINT = (
     "向用户转述时请使用“拉黑/解除拉黑”表述，不要使用“解封/解禁”表述。"
 )
-BOT_ADMIN_BLOCK_MESSAGE = "这个人是管理员，我不能把他拉黑。"
+PROTECTED_USER_BLOCK_MESSAGE = "该用户 ID 在禁止拉黑名单中，不能拉黑。"
 BLACKLIST_LEVEL_LABELS = {
     "llm_only": "LLM 请求",
     "command_and_llm": "指令与 LLM 请求",
@@ -488,8 +488,15 @@ class BlacklistManager:
     def max_blacklist_duration(self) -> int:
         return max(0, int(self._get_cfg("max_blacklist_duration", 86400)))
 
-    def allow_blacklist_bot_admin(self) -> bool:
-        return bool(self._get_cfg("allow_blacklist_bot_admin", False))
+    def protected_blacklist_user_ids(self) -> set[str]:
+        raw_ids = self._get_cfg("protected_blacklist_user_ids", []) or []
+        if not isinstance(raw_ids, (list, tuple, set)):
+            return set()
+        return {
+            str(uid).strip()
+            for uid in raw_ids
+            if uid is not None and str(uid).strip()
+        }
 
     def allow_blacklist_level_param(self) -> bool:
         return bool(self._get_cfg("allow_blacklist_level_param", False))
@@ -534,35 +541,6 @@ class BlacklistManager:
     def _should_render_image(self) -> bool:
         mode = self._cfg_str("blacklist_output_mode", "image").lower()
         return mode != "text"
-
-    def _get_bot_admin_ids(self) -> set[str]:
-        try:
-            from astrbot.core import astrbot_config
-
-            raw_admin_ids = astrbot_config.get("admins_id", [])
-        except Exception:
-            return set()
-
-        if not isinstance(raw_admin_ids, (list, tuple, set)):
-            return set()
-
-        admin_ids: set[str] = set()
-        for admin_id in raw_admin_ids:
-            text = str(admin_id or "").strip()
-            if text:
-                admin_ids.add(text)
-        return admin_ids
-
-    def _is_target_bot_admin(
-        self, event: AstrMessageEvent, target_user_id: str
-    ) -> bool:
-        target_id = str(target_user_id or "").strip()
-        if not target_id:
-            return False
-        sender_id = str(event.get_sender_id() or "").strip()
-        if target_id == sender_id and bool(event.is_admin()):
-            return True
-        return target_id in self._get_bot_admin_ids()
 
     async def initialize(self) -> None:
         self._data_dir.mkdir(parents=True, exist_ok=True)
@@ -1148,11 +1126,10 @@ class BlacklistManager:
 
         success_items: list[tuple[str, str]] = []
         fail_messages: list[str] = []
+        protected_ids = self.protected_blacklist_user_ids()
         for tid, tname in zip(ids, names):
-            if (not self.allow_blacklist_bot_admin()) and self._is_target_bot_admin(
-                event, tid
-            ):
-                fail_messages.append(f"{_fmt_user(tid, tname)} 是 Bot 管理员")
+            if tid in protected_ids:
+                fail_messages.append(f"{_fmt_user(tid, tname)} 在禁止拉黑名单中")
                 continue
 
             ok = await self._db.add_user(
@@ -1317,6 +1294,7 @@ class BlacklistManager:
         success_count = 0
         fail_count = 0
         notify_users: list[tuple[str, str]] = []
+        protected_ids = self.protected_blacklist_user_ids()
 
         for target_user_id in user_id_list:
             target_user_id = str(target_user_id or "").strip()
@@ -1333,16 +1311,13 @@ class BlacklistManager:
 
             is_self_defense = target_user_id == sender_id
 
-            # Bot 管理员检查
-            if (not self.allow_blacklist_bot_admin()) and self._is_target_bot_admin(
-                event, target_user_id
-            ):
+            if target_user_id in protected_ids:
                 fail_count += 1
                 results.append(
                     {
                         "user_id": target_user_id,
                         "success": False,
-                        "error": BOT_ADMIN_BLOCK_MESSAGE,
+                        "error": PROTECTED_USER_BLOCK_MESSAGE,
                     }
                 )
                 continue

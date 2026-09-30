@@ -1,7 +1,7 @@
 name: astrbot_plugin_llm_enhancement
 display_name: LLM 综合增强
 desc: 增强 LLM 表现，集成智能唤醒、请求编排、媒体解析、上下文注入、黑名单拦截与 QQ 工具调用能力。
-version: v1.2.1
+version: v1.2.2
 author: Foolllll
 repo: https://github.com/Foolllll-J/astrbot_plugin_llm_enhancement
 social_link: https://github.com/Foolllll-J
